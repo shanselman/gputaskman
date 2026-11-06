@@ -107,13 +107,14 @@ class Snapshot:
     nv: DeviceTelemetry | None  # legacy name; may contain telemetry from either provider
     driver: str
     cuda: str
-    vram_total: int
+    vram_total: int | None
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux) | wsl (device-wide only) | metal (macOS)
+    backend: str = "wddm"  # wddm | nvml | amdgpu | wsl | metal
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
+    process_status: str = ""  # Linux AMD: scan completeness and access limitations
 
     @property
     def host_data(self) -> bool:
@@ -121,6 +122,8 @@ class Snapshot:
 
     @property
     def attributed(self) -> int | None:
+        if self.backend == "amdgpu":
+            return None  # DRM resident client references are not additive private ownership
         if any("dedicated" not in p.gpu.available for p in self.procs):
             return None
         return int(sum(p.gpu.dedicated for p in self.procs))
@@ -145,7 +148,7 @@ def select_adapter(adapters: list[Adapter], gpu_index: int) -> Adapter | None:
 def ordered_adapters(adapters: list[Adapter]) -> list[Adapter]:
     """List all hardware adapters; retain NVIDIA-first ordering for existing users."""
     return sorted((a for a in adapters if not a.software),
-                  key=lambda a: (a.vendor_id != VENDOR_NVIDIA, -a.dedicated_vram, a.luid))
+                  key=lambda a: (a.vendor_id != VENDOR_NVIDIA, -(a.dedicated_vram or 0), a.luid))
 
 
 def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index: int,
@@ -177,6 +180,9 @@ class Collector:
         self.adapters = [a for a in enumerate_adapters() if not a.software]
         self.adapter = select_adapter(self.adapters, gpu_index)
         self.counters = GpuCounters()
+        amd = getattr(self.counters, "amdgpu", None)
+        if amd is not None:
+            amd.scan_budget = None if scan_budget is None else min(0.05, scan_budget)
         self.nvml = Nvml()
         self.amdsmi = AmdSmi(self.adapter, self.adapters)
         self.adl = Adl(self.adapter, self.adapters)
@@ -226,16 +232,25 @@ class Collector:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
             if self.adapter and self.adapter.vendor_id == 0x1002:
-                nv = self.adl.sample() or self.amdsmi.sample()
+                amd = getattr(self.counters, "amdgpu", None)
+                nv = (amd.telemetry.get(luid) if amd is not None else None) or self.adl.sample() or self.amdsmi.sample()
+                if nv and nv.source == "AMD sysfs":
+                    nv.index = self.gpu_index
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
+        if nv and nv.source == "AMD sysfs":
+            total = nv.mem_total  # preserve an unavailable total and a measured zero
 
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
             driver=self._mac_driver or (self.amdsmi.driver if nv and nv.source == "AMD SMI"
+                                        else self.counters.amdgpu.driver if nv and nv.source == "AMD sysfs"
                                         else self.nvml.driver if nv and nv.source == "NVML" else ""),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
             vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
-            shared_used=int(a.shared) if a and a.shared is not None else None, backend=BACKEND,
+            shared_used=int(a.shared) if a and a.shared is not None else None,
+            backend="amdgpu" if nv and nv.source == "AMD sysfs" else BACKEND,
+            process_status=(self.counters.amdgpu.process_reader.status
+                            if nv and nv.source == "AMD sysfs" else ""),
         )
 
         snap.host_status = self.host_status

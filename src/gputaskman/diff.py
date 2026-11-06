@@ -13,7 +13,8 @@ from .llm import gb
 
 MiB = 1 << 20
 NOISE = 16 * MiB  # smaller per-process moves are allocator and compositor churn, not a model loading
-MEASURED = ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes")
+MEASURED = ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes",
+            "drm_resident_vram_bytes", "drm_resident_gtt_bytes")
 DEVICE = (("vram_used", "dedicated used"), ("shared_used", "shared used"),
           ("attributed", "attributed to processes"), ("unattributed", "unattributed"))
 SEGMENT_ORDER = ("weights", "kv", "compute", "runtime", "unknown")
@@ -138,6 +139,8 @@ def _proc(b: dict | None, a: dict | None, how: str) -> dict:
 
 def _size(p: dict) -> int:
     v = p["measured"]["vram_bytes"]
+    if v["before"] is None and v["after"] is None:
+        v = p["measured"]["drm_resident_vram_bytes"]
     if v["delta"] is not None:
         return abs(v["delta"])
     return v["after"] if v["after"] is not None else v["before"] or 0
@@ -210,10 +213,15 @@ def to_text(d: dict) -> str:
         out.append(f"{label:<26}{_gb(c['before']):>11}{_gb(c['after']):>11}{_signed(c['delta']):>11}")
 
     procs = [p for p in d["processes"] if _changed(p)]
-    out += ["", f"{'PROCESSES (dedicated)':<22}{'PID':>14}  {'MATCH':<11}{'BEFORE':>11}{'AFTER':>11}"
-                f"{'CHANGE':>11}{'SHARED +/-':>11}"]
+    drm = d["backend"] == "amdgpu"
+    label, secondary = ("PROCESSES (DRM refs)", "GTT +/-") if drm else ("PROCESSES (dedicated)", "SHARED +/-")
+    if drm:
+        out += ["", "DRM resident client references may repeat shared buffers; they are not additive private VRAM."]
+    out += ["", f"{label:<22}{'PID':>14}  {'MATCH':<11}{'BEFORE':>11}{'AFTER':>11}"
+                f"{'CHANGE':>11}{secondary:>11}"]
     for p in procs:
-        v, s = p["measured"]["vram_bytes"], p["measured"]["shared_bytes"]
+        v = p["measured"]["drm_resident_vram_bytes" if drm else "vram_bytes"]
+        s = p["measured"]["drm_resident_gtt_bytes" if drm else "shared_bytes"]
         before = "not listed" if p["match"] == "new" else _gb(v["before"])
         after = "not listed" if p["match"] == "gone" else _gb(v["after"])
         out.append(f"{(p['name'] or '?')[:21]:<22}{_pid(p):>14}  {p['match']:<11}{before:>11}{after:>11}"

@@ -20,7 +20,7 @@ from textual.worker import get_current_worker
 from .collector import BACKEND, Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
-from .report import METAL_NOTE, WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
+from .report import AMDGPU_NOTE, METAL_NOTE, WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -59,7 +59,7 @@ HELP_MD = """\
 
 | Layer | Source | Works for |
 |---|---|---|
-| **Device** telemetry | NVML, AMD ADL, or optional AMD SMI | availability varies by GPU and driver |
+| **Device** telemetry | NVML, AMD ADL/SMI, or Linux amdgpu sysfs | availability varies by GPU and driver |
 | **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl) | workloads visible to WDDM |
 | **Which runtime** (CUDA, HIP, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
 | **Which model file** | memory-mapped files + command line | llama.cpp, stable-diffusion.cpp, LM Studio, Ollama |
@@ -77,7 +77,12 @@ Cloud-hosted models are outside this monitor's scope. DLLs identify runtimes, no
 GGUF kind is missing. It does not confirm the kind, GPU residency, or execution. Installed
 candidates remain unproven; engine activity is measured per process, not per model.
 
-**Linux / WSL:** on native Linux, per-process VRAM and SM/encoder/decoder load come from NVML
+**AMD Linux:** sysfs supplies device measurements; DRM fdinfo supplies local client rows and engine rates.
+Row VRAM is resident client references and can repeat shared buffers, so it is not summed into attribution.
+Shared client handles and inaccessible counters show n/a; GPU% needs two samples.
+APU VRAM is the reserved region, not all GPU-accessible RAM; SoC power can include CPU consumption.
+
+**NVIDIA Linux / WSL:** on native Linux, per-process VRAM and SM/encoder/decoder load come from NVML
 (no spill or commit counters exist there, so those columns stay blank). Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
@@ -328,9 +333,10 @@ class GpuTaskManager(App):
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
         vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
-        vram.append_text(stacked_bar(parts, s.vram_total, width))
+        vram.append_text(stacked_bar(parts, s.vram_total or 0, width))
         used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
-        vram.append(f" {used_label} / {gb(s.vram_total)}", style="bold")
+        total_label = gb(s.vram_total) if s.vram_total is not None else "N/A"
+        vram.append(f" {used_label} / {total_label}", style="bold")
         legend = Text("     ")
         for k, v in order[:7]:
             legend.append("■ ", style=KIND_STYLE.get(k, "white"))
@@ -338,7 +344,7 @@ class GpuTaskManager(App):
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
             legend.append(f"unattributed {gb(other)}  ")
-        if s.vram_used is not None:
+        if s.vram_used is not None and s.vram_total is not None:
             legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
         if s.shared_used is not None and s.shared_used > 64 << 20:
             legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")
@@ -348,6 +354,10 @@ class GpuTaskManager(App):
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
             legend.append("\n     " + METAL_NOTE, style="grey62")
+        if s.backend == "amdgpu":
+            legend.append("\n     " + AMDGPU_NOTE, style="grey62")
+            if s.process_status:
+                legend.append("\n     DRM process scan: " + s.process_status, style="grey62")
 
         lines = [head, vram, legend]
         if nv and s.backend == "metal":
@@ -522,6 +532,11 @@ class GpuTaskManager(App):
             hdr.append("   runtime ", style="grey62")
             hdr.append(" ".join(r.detail.runtimes), style="cyan")
         out.append(hdr)
+        if s.backend == "amdgpu":
+            out.append(Text("VRAM: DRM resident client references, including shared buffers; not private ownership. "
+                            "Shared client handles and unavailable measurements are n/a.", style="grey62"))
+            if r.gpu.drm_gtt is not None:
+                out.append(Text(f"DRM resident GTT references: {gb(r.gpu.drm_gtt)} (not WDDM spill).", style="grey62"))
         if not r.host and r.gpu.attributed and r.gpu.inferred_by:
             out.append(Text(inferred_note(r.gpu), style="grey62"))
         if not r.host and not r.gpu.attributed:

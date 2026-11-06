@@ -812,6 +812,39 @@ class ChartTests(unittest.TestCase):
 
 
 class UiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_linux_amd_drm_process_view(self):
+        s = snapshot()
+        s.adapter = Adapter(0x3000, "AMD test GPU", 0x1002, 16 * GiB, 0, False)
+        s.backend = "amdgpu"
+        g = ProcGpu(attributed=False, available={"engine"}, drm_vram=512 << 20, drm_gtt=128 << 20,
+                    engines={"compute": 42})
+        s.procs = [ProcRow(10, "gpu-client", "app", g, ProcDetail(10, "gpu-client"))]
+        s.nv = NvDevice(index=0, source="AMD sysfs", util_gpu=0, gfx_clock=600)
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 42)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                self.assertEqual(app.query_one("#procs").row_count, 1)
+                self.assertEqual(app.query_one("#procs").get_cell("10", "VRAM").plain, "512 MB")
+                self.assertEqual(app.query_one("#procs").get_cell("10", "GPU%").plain, "42")
+                output = io.StringIO()
+                Console(file=output, width=180).print(app.render_device(s))
+                self.assertIn("resident client references", output.getvalue())
+                self.assertIn("AMD gfx 0%", output.getvalue())
+                self.assertIsNone(s.attributed)
+                data = to_dict(s)["processes"][0]
+                self.assertEqual(data["drm_resident_vram_bytes"], 512 << 20)
+                self.assertEqual(data["drm_resident_gtt_bytes"], 128 << 20)
+                self.assertIsNone(data["vram_bytes"])
+                self.assertIsNone(data["vram_inferred_bytes"])
+                s.vram_total = None
+                app.apply(s)
+                await pilot.pause()
+                self.assertIsNone(to_dict(s)["vram_total"])
+                self.assertIn("/ N/A", to_text(s))
+
     def setUp(self):
         # These snapshots are NVIDIA/WDDM ones: render them with that backend's charts on every OS (macOS too).
         backend = patch("gputaskman.app.BACKEND", "wddm")

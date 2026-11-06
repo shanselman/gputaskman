@@ -60,6 +60,20 @@ class MatchTests(unittest.TestCase):
 
 
 class DiffTests(unittest.TestCase):
+    def test_drm_references_are_compared_without_becoming_private_attribution(self):
+        b = {**proc(1, "gpu-client"), "drm_resident_vram_bytes": 100 * MiB,
+             "drm_resident_gtt_bytes": 0}
+        a = {**b, "drm_resident_vram_bytes": 200 * MiB}
+        d = diff(snap([b], used=500 * MiB, attributed=None, backend="amdgpu"),
+                 snap([a], used=550 * MiB, attributed=None, backend="amdgpu"))
+        self.assertEqual(d["processes"][0]["measured"]["drm_resident_vram_bytes"]["delta"], 100 * MiB)
+        self.assertIsNone(d["processes"][0]["measured"]["vram_bytes"]["delta"])
+        self.assertIsNone(d["device"]["attributed"]["delta"])
+        self.assertIsNone(d["device"]["unattributed"]["delta"])
+        self.assertIn("PROCESSES (DRM refs)", to_text(d))
+        self.assertIn("+100 MB", to_text(d))
+        self.assertIn("not additive private VRAM", to_text(d))
+
     def test_measured_runtime_and_mapped_evidence_stay_separate(self):
         before = snap([proc(1, "dwm.exe", vram=2 * GiB),
                        proc(2, "llama-server", vram=5 * GiB, ports=[8080], llm=llm(4096, GiB // 2))],

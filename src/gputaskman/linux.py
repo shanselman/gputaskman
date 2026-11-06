@@ -69,13 +69,15 @@ def _nvml_devices() -> list[tuple[int, object]]:
 
 
 def enumerate_adapters() -> list[Adapter]:
+    from .amdgpu import enumerate_adapters as amd_adapters
+
+    out = amd_adapters() if not is_wsl() else []
     if N is None:
-        return []
+        return out
     try:
         N.nvmlInit()
     except Exception:
-        return []
-    out = []
+        return out
     try:
         for key, h in _nvml_devices():
             try:
@@ -208,6 +210,9 @@ class LinuxCounters:
 
     def __init__(self) -> None:
         self.wsl = is_wsl()
+        from .amdgpu import AmdGpuCounters
+
+        self.amdgpu = AmdGpuCounters() if not self.wsl else None
         self.ok = False
         self._devices: list[tuple[int, object]] = []
         self._last_ts: dict[int, int] = {}
@@ -287,7 +292,16 @@ class LinuxCounters:
             for key, _ in self._devices:
                 for pid in users:
                     procs[key][pid] = ProcGpu(attributed=False)
+        if self.amdgpu is not None:
+            adapters.update(self.amdgpu.sample())
+            for key, per in self.amdgpu.process_reader.sample(self.amdgpu.scan_budget).items():
+                procs[key] = per
         return procs, adapters
+
+    def warm_up(self, timeout: float = 0) -> None:
+        """Prime AMD cumulative engine counters before the CLI's sampling interval."""
+        if self.amdgpu is not None:
+            self.amdgpu.process_reader.sample(self.amdgpu.scan_budget)
 
     def _resolve_namespaces(self, procs: dict[int, dict[int, ProcGpu]]) -> None:
         """Re-key NVML's PIDs to local ones. In the host PID namespace (bare metal, --pid=host) they already

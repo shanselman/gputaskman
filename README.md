@@ -2,7 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with NVIDIA support on Linux and WSL (see [Linux and WSL](#linux-and-wsl)) and
+Windows + NVIDIA/AMD, with NVIDIA support on Linux and WSL and AMD device telemetry on Linux
+(see [Linux and WSL](#linux-and-wsl)), and
 macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
@@ -93,7 +94,88 @@ If an alternate package index makes `--locked` report a stale lockfile on an unc
 `uv run --frozen gputaskman` uses the checked-in lockfile without re-resolving it. `--frozen`
 skips the consistency check, so do not use it after changing dependencies.
 
+## NixOS
+
+With flakes enabled, run directly from this checkout:
+
+```bash
+nix run path:.
+nix run path:. -- --list-gpus
+nix run path:. -- --once
+nix run path:. -- --json
+```
+
+Build both `gputaskman` and its `gtm` alias with `nix build path:.` (executables are in
+`result/bin/`). The flake provides packages for `x86_64-linux` and `aarch64-linux`; `flake.lock`
+pins nixpkgs. Dependencies come from nixpkgs, independently of `uv.lock`. No pip installation,
+virtual environment, CUDA Toolkit, or ROCm installation is needed. GPU drivers remain supplied by
+the host, never bundled with the package. NVIDIA's nixpkgs Python binding finds NVML through
+`/run/opengl-driver/lib`; AMD uses kernel sysfs and DRM fdinfo interfaces directly.
+
+For source development and tests:
+
+```bash
+nix develop path:.
+python -m gputaskman --once
+python -m unittest discover -s tests -q
+```
+
+`nix flake check path:.` builds the package and runs the same hardware-independent tests.
+For a flake-based NixOS configuration, add this repository as a `gputaskman` input, then include
+`inputs.gputaskman.packages.${pkgs.stdenv.hostPlatform.system}.default` in
+`environment.systemPackages`. Enable your GPU's normal NixOS driver configuration first.
+
 ## Linux and WSL
+
+### AMD on native Linux
+
+**AMD Linux** measures device VRAM total/usage, GPU/memory activity and available temperature,
+SoC power and clocks from `amdgpu` sysfs files. The process table reads local DRM clients from
+`/proc/<pid>/fdinfo`, paired by PCI address and deduplicated by DRM client ID. It shows process
+names, runtimes, resident VRAM client references and engine utilization from two cumulative
+engine-time samples. Duplicate descriptors in one process are counted once; a client handle
+shared by multiple visible PIDs is listed for each with unavailable per-PID counters.
+
+**Row VRAM includes shared buffer references.** It is useful for finding which processes hold
+GPU memory, but it is not private ownership and must not be summed against the device total.
+JSON keeps it in `drm_resident_vram_bytes`, with GTT references in `drm_resident_gtt_bytes`,
+separate from `vram_bytes`, which remains `null`; device `attributed` also remains `null`.
+`memory_source` and `engine_source` describe these measurements. GTT references are not WDDM
+spill, so Spill/Paged stay unavailable. `gputaskman diff` compares these measured reference
+counts separately without turning them into private attribution. Model naming can use the usual
+process evidence; DRM references are not used as a private-memory budget for weight/KV-cache breakdowns.
+
+Missing or unreadable counters stay `null`/`N/A`; measured zero stays zero. Engine availability
+is independent of memory availability and a new client needs two samples. The AMD driver omits
+zero cumulative engine counters; omitted engines are treated as zero only after engine support
+has been observed on the same PCI device. Unsupported or malformed counters remain unavailable.
+Only accessible local processes can be inspected; protected processes and processes outside this
+PID namespace may be missing. `process_status` reports scan completeness and access limitations.
+The TUI bounds DRM discovery to 50 ms per refresh and rotates through PIDs if that budget is
+exhausted; partial scans show only scanned processes, with unavailable per-PID counters. One-shot
+collection scans without this budget and primes engine counters before the sampling interval.
+
+On APUs, VRAM describes the driver's reserved region, not all system RAM the GPU can access;
+SoC power can include CPU consumption. `backend: "amdgpu"`, `device.source: "AMD sysfs"`, and
+`backend_note` identify this mode and its limits in JSON.
+
+Live check: x86_64 NixOS 26.05, Linux 6.18.59 with its in-tree `amdgpu` driver, AMD PCI devices
+`1002:7590` at `0000:03:00.0` and `1002:164e` at `0000:0e:00.0`. On the existing desktop workload,
+the first device reported 17,095,983,104 bytes total and 570,486,784 bytes used, with available
+activity, temperature, power and clocks. The second reported a 512 MiB reserved VRAM region;
+unsupported memory activity and memory clock stayed `null`. Both were discovered by PCI address.
+These are read-only sensor smoke checks, not independent calibration or a controlled allocation
+test. A subsequent DRM check listed six accessible desktop processes on the discrete GPU and
+two on the integrated GPU, with resident references and available engine rates. Other users'
+protected processes were reported as inaccessible. Private allocation ownership, controlled
+allocation changes, and ARM64 execution have **not been validated**.
+
+The implementation follows the kernel's
+[amdgpu sensor documentation](https://docs.kernel.org/gpu/amdgpu/thermal.html),
+[DRM client statistics specification](https://docs.kernel.org/gpu/drm-usage-stats.html), and
+[amdgpu's zero-engine omission](https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c).
+
+### NVIDIA on Linux and WSL
 
 Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
 `gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
@@ -114,6 +196,8 @@ uv run --locked gputaskman
 ```
 
 What can be measured depends on where it runs, and the UI says which mode it is in.
+The following table describes NVIDIA; see [AMD on native Linux](#amd-on-native-linux) for
+AMD device telemetry and its limits. AMD support works on NixOS and other distributions using `amdgpu`.
 
 | | Native Linux | WSL, interop on (default) | WSL, interop off or `--no-host` |
 |---|---|---|---|
@@ -372,8 +456,8 @@ but a runtime DLL or filename alone does not prove which allocation contains whi
 
 | Question | Evidence | Confidence / limitation |
 |---|---|---|
-| How full and busy is the card? | WDDM adapter counters and NVML or AMD ADL/SMI | Measured; driver support varies by metric |
-| Which process uses GPU memory? | WDDM process counters; NVML on Linux | Measured accounting, not a resource ownership graph |
+| How full and busy is the card? | WDDM adapter counters, NVML, AMD ADL/SMI, or Linux amdgpu sysfs | Measured; driver support varies by metric |
+| Which process uses GPU memory? | WDDM process counters; NVML or AMD DRM clients on Linux | AMD rows show resident client references including shared buffers, not additive private ownership |
 | Which WSL process uses GPU memory? | Windows host counters for `vmwp.exe`, matched to Linux processes | Exact VM total; per-process owner inferred (`*`) or guessed (`?`) |
 | Which engines are active? | WDDM engine counters | CUDA can appear on the **3D** engine |
 | Which runtime is loaded? | Mapped DLL names | Detection, not proof that every library is doing GPU work |
@@ -504,6 +588,8 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
+| Linux AMD: amdgpu sysfs device sensors | 0.407 ms/sample for both AMD adapters on the NixOS machine above (1,000 samples, Python 3.14); 0.125 ms on a synthetic single-adapter fixture | Every refresh; about a dozen small read-only files per adapter |
+| Linux AMD: DRM process discovery + fdinfo counters | 9.146 ms average, 10.547 ms maximum (100 samples, eight visible GPU processes on the same desktop) | Every refresh; 50 ms budget in the TUI, complete scan for one-shot output; never reads process memory |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).
@@ -627,6 +713,7 @@ downloads are bundled in this repository.
 |---|---|
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
+| `amdgpu.py` | Linux AMD PCI discovery, sysfs device telemetry, and bounded DRM client/engine collection; resident client references kept separate from private attribution |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |

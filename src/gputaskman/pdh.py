@@ -84,11 +84,17 @@ class ProcGpu:
     # owner is inferred; kept apart from `dedicated` so it isn't counted twice next to the WSL VM row.
     inferred: float | None = None
     inferred_by: str = ""  # "consistent" (candidates agree on bytes) | "order" (heuristic owner)
+    # Linux DRM: resident client references, which may include shared buffers.
+    # Displayable measurements, never additive private process ownership.
+    drm_vram: int | None = None
+    drm_gtt: int | None = None
 
     @property
     def shown_vram(self) -> float | None:
         """Measured or inferred bytes for display and priority, not for summing adapter totals."""
-        return (self.dedicated if "dedicated" in self.available else None) if self.attributed else self.inferred
+        if self.attributed:
+            return self.dedicated if "dedicated" in self.available else None
+        return self.drm_vram if self.drm_vram is not None else self.inferred
 
     @property
     def paged_out(self) -> float:

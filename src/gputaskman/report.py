@@ -61,6 +61,12 @@ METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows 
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
 
+AMDGPU_NOTE = ("AMD Linux: device measurements from amdgpu sysfs; unavailable sensors are N/A. "
+               "Rows show local DRM clients: VRAM is resident client references and may repeat shared buffers; "
+               "it is not summed into process attribution. GPU% is measured from client engine-time deltas. "
+               "Shared client handles, inaccessible counters and initial engine samples show n/a. "
+               "On APUs, VRAM is the driver's reserved region, not all GPU-accessible system RAM.")
+
 
 def to_dict(s: Snapshot) -> dict:
     nv = dataclasses.asdict(s.nv) if s.nv else None
@@ -82,6 +88,11 @@ def to_dict(s: Snapshot) -> dict:
             "model_files": [dataclasses.asdict(m) for m in p.detail.models],
             "installed_models": [dataclasses.asdict(m) for m in p.detail.candidates],
         }
+        if s.backend == "amdgpu":
+            item.update(drm_resident_vram_bytes=p.gpu.drm_vram,
+                        drm_resident_gtt_bytes=p.gpu.drm_gtt,
+                        memory_source="DRM fdinfo resident client references (shared buffers may repeat)",
+                        engine_source="DRM fdinfo engine-time deltas" if engines else None)
         if p.handy:
             item["handy"] = dataclasses.asdict(p.handy)
         if p.llm:
@@ -105,7 +116,10 @@ def to_dict(s: Snapshot) -> dict:
         "taken": s.taken, "gpu": s.adapter.name if s.adapter else None, "driver": s.driver, "cuda": s.cuda,
         "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
         "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
-        "attributed": s.attributed, "backend": s.backend, "host_status": s.host_status or None,
+        "attributed": s.attributed,
+        "backend": s.backend, "host_status": s.host_status or None,
+        "backend_note": AMDGPU_NOTE if s.backend == "amdgpu" else None,
+        "process_status": s.process_status or None,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
     }
 
@@ -128,12 +142,17 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(f"{name}{info}  {nv.driver_model if nv else ''}")
         used = gb(s.vram_used) if s.vram_used is not None else "N/A"
         shared = gb(s.shared_used) if s.shared_used is not None else "N/A"
-        memory = f"VRAM {used} / {gb(s.vram_total)}"
+        total = gb(s.vram_total) if s.vram_total is not None else "N/A"
+        memory = f"VRAM {used} / {total}"
         if s.backend == "wddm" or s.host_data:
             memory += f"   shared (in system RAM) {shared}"
         out.append(memory)
     if s.backend == "wsl":
         out.append(wsl_note(s))
+    if s.backend == "amdgpu":
+        out.append(AMDGPU_NOTE)
+        if s.process_status:
+            out.append("DRM process scan: " + s.process_status)
     if nv and s.backend != "metal":
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None

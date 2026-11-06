@@ -41,7 +41,7 @@ class Adapter:
     luid: int
     name: str
     vendor_id: int
-    dedicated_vram: int
+    dedicated_vram: int | None
     shared_system: int
     software: bool
     pci_address: tuple[int, int, int] | None = None

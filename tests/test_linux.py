@@ -115,6 +115,7 @@ class LinuxCountersTests(unittest.TestCase):
     def setUp(self):
         # Same PID namespace (bare metal): NVML's PIDs are local processes holding an NVIDIA device.
         for p in (patch.object(linux, "nvidia_holders", return_value={100, 101, 200, 300, 555}),
+                  patch("gputaskman.amdgpu.devices", return_value={}),
                   patch.object(linux, "in_child_pid_namespace", return_value=False)):
             p.start()
             self.addCleanup(p.stop)
