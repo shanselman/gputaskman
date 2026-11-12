@@ -186,6 +186,28 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertIsNone(provider.sample())
         provider.close()
 
+    def test_amdsmi_prefers_memory_usage_over_uninitialized_rocm_wsl_vram_usage(self):
+        amd = Adapter(1, "AMD Radeon RX 7900 XTX", 0x1002, 24 * GiB, 0, False, (3, 0, 0))
+        api = SimpleNamespace(
+            amdsmi_init=lambda: None, amdsmi_shut_down=lambda: None,
+            amdsmi_get_processor_handles=lambda: ["h0"],
+            amdsmi_get_gpu_device_bdf=lambda h: "0000:03:00.0",
+            amdsmi_get_gpu_driver_info=lambda h: {"driver_version": "26.20.15.07"},
+            AmdSmiMemoryType=SimpleNamespace(VRAM=1),
+            amdsmi_get_gpu_memory_total=lambda h, t: 24 * GiB,
+            amdsmi_get_gpu_memory_usage=lambda h, t: 4 * GiB,
+            amdsmi_get_gpu_vram_usage=lambda h: {"vram_total": 24576, "vram_used": 446623},
+            amdsmi_get_gpu_activity=lambda h: {"gfx_activity": 21, "umc_activity": 0},
+            amdsmi_get_power_info=lambda h: {"socket_power": "N/A", "power_limit": 0},
+            amdsmi_get_gpu_metrics_info=lambda h: {"current_socket_power": 38, "average_socket_power": 11},
+            amdsmi_get_power_cap_info=lambda h, i: {"power_cap": 430_000_000},
+        )
+        provider = AmdSmi(amd, [amd], api)
+        sample = provider.sample()
+        self.assertEqual((sample.mem_total, sample.mem_used), (24 * GiB, 4 * GiB))
+        self.assertEqual((sample.power_w, sample.power_limit_w, sample.power_kind), (38, 430.0, "socket"))
+        provider.close()
+
     def test_mixed_vendor_adapters_are_selectable(self):
         amd = Adapter(2, "AMD GPU", 0x1002, 24 * GiB, 0, False)
         nvidia = Adapter(1, "NVIDIA GPU", 0x10DE, 8 * GiB, 0, False)

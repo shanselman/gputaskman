@@ -371,13 +371,15 @@ class Collector:
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
+        used = int(a.dedicated) if a and a.dedicated is not None else (
+            int(nv.mem_used) if BACKEND != "wddm" and nv and nv.mem_used is not None else None)
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
             driver=self._mac_driver or (self.amdsmi.driver if nv and nv.source == "AMD SMI"
                                         else self.nvml.driver if nv and nv.source == "NVML"
                                         else f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else ""),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
-            vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
+            vram_used=used,
             shared_used=int(a.shared) if a and a.shared is not None else None, backend=self.backend,
             shared_is_spill=not (integrated_intel or (self.drm_card is not None and self.drm_card.integrated)),
         )
@@ -539,9 +541,13 @@ class Collector:
         snap.procs = host_rows[:at] + snap.procs + host_rows[at:]
 
     def _attribute(self, snap: Snapshot, luid: int, contexts: list[float]) -> None:
+        from .linux import dxg_pids
+
         linux = [r for r in snap.procs if not r.host and not r.gpu.attributed]
-        # This monitor holds a (0-byte) context too, through NVML.
-        holders = [(r.pid, r.detail.create_time) for r in linux] + [(os.getpid(), self._own_start)]
+        # This monitor holds a (0-byte) context too through NVML; AMD SMI only holds one if /dev/dxg stays open.
+        holders = [(r.pid, r.detail.create_time) for r in linux]
+        if not (snap.adapter and snap.adapter.vendor_id == VENDOR_AMD) or os.getpid() in dxg_pids():
+            holders.append((os.getpid(), self._own_start))
         guesses, reason = self.tracker.update(luid, contexts, holders)
         snap.wsl_split = reason
         for r in linux:

@@ -155,7 +155,7 @@ Ascend container and PID-namespace behavior is not validated.
 
 | | Native Linux | WSL, interop on (default) | WSL, interop off or `--no-host` |
 |---|---|---|---|
-| Device totals, load, temperature, power, clocks | NVML | NVML | NVML |
+| Device totals, load, temperature, power, clocks | NVML / DRM | NVML / AMD SMI | NVML / AMD SMI |
 | Per-process VRAM | NVML, measured (in a container: owner matched, `*` or `?`) | Matched from the Windows host, marked `*` or `?` | `n/a` |
 | Per-process GPU load | NVML (SM, encoder, decoder) | `n/a` for Linux processes | `n/a` |
 | Spill / Paged | Not available (blank) | Windows rows only | Not available |
@@ -316,11 +316,14 @@ through the same PDH array API as the Windows backend and streams them back once
 - **Linux rows** get a size by matching `vmwp.exe`'s GPU contexts to Linux processes (below).
 
 The first host sample takes about 2.5 s; the TUI shows `starting` until then, and `--once` waits
-for it. The host adapter is paired with the NVML device by memory usage, because WSL's adapter
+for it. The host adapter is paired with the NVML or AMD SMI device by memory usage, because WSL's adapter
 LUIDs differ from the host's. An ambiguous pairing shows `unmatched` instead of guessing. With other
 Hyper-V VMs or Windows Sandbox running, the row is labeled `VM worker` because it cannot be tied
 to WSL alone. `--no-host` turns the host stream off; without interop you get device-wide numbers
-and a list of the Linux processes that hold `/dev/dxg`, with VRAM shown as `n/a`.
+and a list of the Linux processes that hold `/dev/dxg`, with VRAM shown as `n/a`. On AMD GPUs in WSL,
+device discovery and telemetry use ROCm's `amdsmi` Python bindings (`/opt/rocm-wsl/share/amd_smi` or
+`/opt/rocm/share/amd_smi`), reading VRAM via `amdsmi_get_gpu_memory_total` / `amdsmi_get_gpu_memory_usage`
+(since `amdsmi_get_gpu_vram_usage` in `rocm-wsl` leaves `vram_used` uninitialized).
 
 ### How WSL per-process VRAM is matched
 

@@ -69,10 +69,13 @@ def _nvml_devices() -> list[tuple[int, object]]:
 
 
 def enumerate_adapters() -> list[Adapter]:
-    """NVIDIA GPUs through NVML, plus (native Linux only) AMD and Intel GPUs through DRM,
-    and Huawei Ascend NPUs through npu-smi."""
+    """NVIDIA GPUs through NVML, plus AMD GPUs through AMD SMI in WSL (or DRM on native Linux),
+    Intel GPUs through DRM, and Huawei Ascend NPUs through npu-smi."""
     out = _nvml_adapters()
-    if not is_wsl():
+    if is_wsl():
+        seen = {a.luid for a in out}
+        out += [a for a in _amdsmi_adapters() if a.luid not in seen]
+    else:
         from . import drm
 
         seen = {a.luid for a in out}
@@ -82,6 +85,42 @@ def enumerate_adapters() -> list[Adapter]:
 
         seen |= {a.luid for a in out}
         out += [a for a in ascend.cached_chips_adapters() if a.luid not in seen]
+    return out
+
+
+def _amdsmi_adapters() -> list[Adapter]:
+    from .amdsmi import _bdf, _import_amdsmi, _read_vram_bytes
+    from .dxgi import VENDOR_AMD
+
+    api = _import_amdsmi()
+    if api is None:
+        return []
+    try:
+        api.amdsmi_init()
+    except Exception:
+        return []
+    out = []
+    try:
+        for i, h in enumerate(api.amdsmi_get_processor_handles()):
+            try:
+                bdf = str(api.amdsmi_get_gpu_device_bdf(h))
+                key = pci_key(bdf) if bdf else i + 1
+                pci_addr = _bdf(bdf)
+            except Exception:
+                key, pci_addr = i + 1, None
+            try:
+                asic = api.amdsmi_get_gpu_asic_info(h) or {}
+                name = str(asic.get("market_name") or "AMD GPU")
+            except Exception:
+                name = "AMD GPU"
+            total, _ = _read_vram_bytes(api, h)
+            out.append(Adapter(luid=key, name=name, vendor_id=VENDOR_AMD, dedicated_vram=total or 0,
+                               shared_system=0, software=False, pci_address=pci_addr))
+    finally:
+        try:
+            api.amdsmi_shut_down()
+        except Exception:
+            pass
     return out
 
 
@@ -243,13 +282,18 @@ class LinuxCounters:
             self.drm = drm if drm.ok else None
         # A Collector attaches an Ascend provider only when an Ascend chip is selected.
         self.ascend = None
+        self._wsl_keys = [a.luid for a in _amdsmi_adapters()] if self.wsl else []
+        self._nvml_ok = False
         if N is None:
+            self.ok = bool(self._wsl_keys)
             return
         try:
             N.nvmlInit()
         except Exception:
+            self.ok = bool(self._wsl_keys)
             return
         self.ok = True
+        self._nvml_ok = True
         try:
             self._devices = _nvml_devices()
         except Exception:
@@ -309,10 +353,12 @@ class LinuxCounters:
                 g.engines["decode"] += float(s.decUtil)
         if not self.wsl:
             self._resolve_namespaces(procs)
-        if self.wsl and self._devices:
+        if self.wsl and (self._devices or self._wsl_keys):
             users = dxg_pids(exclude={os.getpid()})
             # WSL does not say which GPU a process uses; with one GPU (the common case) that's unambiguous.
-            for key, _ in self._devices:
+            keys = [key for key, _ in self._devices]
+            keys += [k for k in self._wsl_keys if k not in keys]
+            for key in keys:
                 for pid in users:
                     procs[key][pid] = ProcGpu(attributed=False)
         if self.drm is not None:
@@ -363,9 +409,10 @@ class LinuxCounters:
             self.drm.close()
         if self.ascend is not None:
             self.ascend.close()
-        if self.ok:
+        if self._nvml_ok:
             try:
                 N.nvmlShutdown()
             except Exception:
                 pass
-            self.ok = False
+            self._nvml_ok = False
+        self.ok = False
