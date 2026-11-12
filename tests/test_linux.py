@@ -11,19 +11,22 @@ from gputaskman.nvml import NvDevice
 from gputaskman.gguf import GgufInfo
 from gputaskman.llm import LlmView, build_view
 from gputaskman.pdh import ProcGpu
-from gputaskman.procinfo import ProcDetail, _lib_name, _match_runtimes, classify
+from gputaskman.procinfo import MappedModel, ProcDetail, _lib_name, _match_runtimes, classify
 from gputaskman.report import to_dict, to_text
 
 GiB = 1 << 30
 _no_drm = patch("gputaskman.drm.cards", return_value=[])  # keep the test machine's real AMD GPUs out of NVML tests
+_no_ascend = patch("gputaskman.ascend.probe", return_value=[])  # and its real Ascend NPUs out too
 
 
 def setUpModule() -> None:
     _no_drm.start()
+    _no_ascend.start()
 
 
 def tearDownModule() -> None:
     _no_drm.stop()
+    _no_ascend.stop()
 
 NOT_AVAILABLE = (1 << 64) - 1  # NVML_VALUE_NOT_AVAILABLE as an unsigned long long
 
@@ -373,10 +376,8 @@ class UnattributedReportTests(unittest.TestCase):
 
     def test_llm_view_does_not_claim_cpu_inference_when_vram_is_unknown(self):
         d = ProcDetail(4242, "llama-server", cmdline=["llama-server", "-c", "4096"])
-        d.models = [SimpleNamespace(path="/m/x.gguf", gguf=True, sources=["mapped"], store_name=None,
-                                    kind="", kind_hint="", size=GiB)]
-        with patch("gputaskman.llm.dataclasses.replace", side_effect=lambda m, **kw: m), \
-                patch("gputaskman.llm.read_gguf", return_value=GgufInfo(path="/m/x.gguf", file_size=GiB, version=3)):
+        d.models = [MappedModel("/m/x.gguf", GiB, 0, True)]
+        with patch("gputaskman.llm.read_gguf", return_value=GgufInfo(path="/m/x.gguf", file_size=GiB, version=3)):
             known = build_view(d, 0, 0, None)
             unknown = build_view(d, 0, 0, None, attributed=False)
         self.assertTrue(any("CPU inference" in n for n in known.notes))

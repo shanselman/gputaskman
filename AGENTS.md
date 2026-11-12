@@ -22,10 +22,13 @@ these rules:
    counter is the reference total. On Linux amdgpu (`drm.py`), a process gets bytes only when all its
    DRM clients are provably private (one holder, render node, every `drm-shared-*` is 0); never
    compute resident minus shared, since the two count by different placements.
-4. **Model evidence has a ladder:** `api` > `mapped` > `cmdline` > `installed`. App settings mean
+4. **Model evidence has a ladder:** `api` > `mapped` > `cmdline` > `path-arg` > `installed`. App settings mean
    *selected*. Log events are *timestamped history*, not current residency. Model-store folders only
    supply friendly names. Name-based hints (`kind_hint`, the `decision?` category) never change the
-   evidence or the KV-cache math.
+   evidence or the KV-cache math. A `path-arg` alone is informational: no process classification,
+   API probing, full GGUF-header reads or weights/KV estimates. It never counts toward *confirmed*;
+   only `api`, `mapped` and `cmdline` can corroborate each other. Keep fallback discovery bounded
+   and exclude the same secret-flag values the inspector redacts.
 5. **Markers mean what they say.** `*` means only one explanation fits, or every explanation gives
    exactly the same bytes (near-equal is not enough). `?` is a heuristic owner. Caches, such as WSL
    foreign-context sizes in `~/.cache/gputaskman/`, only rank candidates and never prove ownership.

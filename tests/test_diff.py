@@ -116,6 +116,19 @@ class PidReuseTests(unittest.TestCase):
 
 
 class DiffTests(unittest.TestCase):
+    def test_path_argument_discovery_does_not_change_measured_memory(self):
+        before = snap([proc(1, "custom-server", vram=GiB)], used=GiB, attributed=GiB)
+        after = snap([proc(1, "custom-server", vram=GiB)], used=GiB, attributed=GiB)
+        after["processes"][0]["model_files"] = [
+            {"path": "custom.gguf", "sources": ["path-arg"], "resident": None}]
+        result = diff(before, after)
+        process = result["processes"][0]
+        self.assertEqual(process["model_files"]["added"], [{"path": "custom.gguf", "sources": ["path-arg"]}])
+        self.assertEqual(process["measured"]["vram_bytes"]["delta"], 0)
+        self.assertEqual(result["device"]["vram_used"]["delta"], 0)
+        self.assertIn("[path-arg]", to_text(result))
+        self.assertIn("not what is resident in GPU memory", to_text(result))
+
     def test_measured_runtime_and_mapped_evidence_stay_separate(self):
         before = snap([proc(1, "dwm.exe", vram=2 * GiB),
                        proc(2, "llama-server", vram=5 * GiB, ports=[8080], llm=llm(4096, GiB // 2))],

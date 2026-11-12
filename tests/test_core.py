@@ -7,6 +7,7 @@ import ctypes
 import io
 import json
 import os
+import stat
 from types import SimpleNamespace
 import tempfile
 import threading
@@ -24,7 +25,7 @@ from gputaskman.amdsmi import AmdSmi
 from gputaskman.adl import Adl, _Metrics
 from gputaskman.app import GpuTaskManager, spark, stacked_bar
 from gputaskman.cli import main
-from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, select_nv_device
+from gputaskman.collector import Collector, ProcRow, Snapshot, _llm_wanted, select_adapter, select_nv_device
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
@@ -34,8 +35,10 @@ from gputaskman.llm import (LlmView, ServerInfo, ServerProber, _get, api_key, bu
                             redact_cmdline)
 from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
-from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
-                                _models_from_cmdline, classify, file_key, installed_models, make_model)
+from gputaskman.procinfo import (AI_KINDS, AMBIGUOUS_EXTS, MODEL_EXTS, PATH_ARG_CANDIDATES, PATH_ARG_TOKENS,
+                                MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
+                                _models_from_cmdline, _models_from_path_args, classify, file_key, installed_models,
+                                make_model)
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import ollama_names, store_name
 from tools.capture_screenshots import for_publication
@@ -274,6 +277,24 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(c.nvml.sample.called, swept)
                 self.assertIs(s.nv, expected)
 
+    def test_intel_windows_uses_wddm_adapter_engine_activity(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "Intel Arc B580", 0x8086, 12 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {1: {}}, {1: AdapterGpu(util_gpu=41.6)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertEqual((s.nv.source, s.nv.util_gpu), ("Windows WDDM", 42))
+        self.assertIsNone(s.nv.temp)
+        self.assertIsNone(s.nv.power_w)
+        self.assertIn("GPU 42%", to_text(s))
+        self.assertEqual(to_dict(s)["device"]["util_gpu"], 42)
+
     def test_lost_nvml_telemetry_is_explained_not_silent(self):
         c = Collector.__new__(Collector)
         c.adapter = Adapter(1, "RTX 3060", 0x10DE, 12 * GiB, 0, False, (5, 0, 0))
@@ -348,6 +369,20 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(gpu.dedicated, 0)
         self.assertEqual(gpu.gpu_pct, 10)
         self.assertFalse(gpu.paged_available)
+
+    def test_wddm_adapter_utilization_uses_busiest_combined_engine(self):
+        counters = GpuCounters.__new__(GpuCounters)
+        counters._query = None
+        data = {"engine": [
+            ("pid_42_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 35.0),
+            ("pid_43_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 40.0),
+            ("pid_43_luid_0x0_0x1_phys_0_eng_1_engtype_Copy", 80.0),
+            ("pid_44_luid_0x0_0x1_phys_0_eng_2_engtype_Compute", 120.0),
+        ]}
+        with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])), \
+                patch("gputaskman.pdh._pdh", SimpleNamespace(PdhCollectQueryData=lambda query: 0)):
+            _, adapters = counters.sample()
+        self.assertEqual(adapters[1].util_gpu, 100.0)
 
     def test_missing_process_counters_are_not_reported_as_zero(self):
         s = snapshot()
@@ -552,6 +587,285 @@ class HandyTests(unittest.TestCase):
         self.assertIn("Handy last log (loaded): model.gguf", s.procs[0].inside)
         self.assertIn("not current GPU residency", to_text(s))
         self.assertEqual(to_dict(s)["processes"][0]["handy"]["last_event"], "loaded")
+
+
+class PathArgumentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.path = self.root / "custom model.GGUF"
+        self.path.write_bytes(b"GGUF" + bytes(20))
+
+    def detail(self, *args):
+        return ProcDetail(123, "custom-server", exe=str(self.root / "custom-server"),
+                          cmdline=["custom-server", *map(str, args)])
+
+    def scan(self, detail, maps=()):
+        with patch("gputaskman.procinfo._memory_maps", return_value=list(maps)):
+            ProcInspector().scan(detail)
+
+    def test_unknown_flags_assignments_and_positional_paths_are_informational(self):
+        for args in (["--native", self.path], [f"--native={self.path}"], [self.path], ["--", self.path]):
+            with self.subTest(args=args):
+                detail = self.detail(*args)
+                before = classify(detail, {})
+                with patch("gputaskman.procinfo.read_gguf") as header, \
+                        patch("gputaskman.procinfo.installed_models") as installed:
+                    self.scan(detail)
+                header.assert_not_called()
+                installed.assert_not_called()
+                self.assertEqual(len(detail.models), 1)
+                m = detail.models[0]
+                self.assertEqual((m.path, m.sources, m.gguf), (str(self.path), ["path-arg"], True))
+                self.assertEqual((m.kind, m.kind_hint, m.resident), ("", "", None))
+                self.assertEqual(m.evidence, "path-arg (not proven loaded)")
+                self.assertFalse(detail.is_ai)
+                self.assertEqual(classify(detail, {}), before)
+                self.assertEqual(detail.runtimes, [])
+                for kind in ("app", "compute", "AI"):
+                    row = ProcRow(123, detail.name, kind, ProcGpu(dedicated=GiB, shared=0), detail)
+                    self.assertFalse(_llm_wanted(row, True))
+                detail.runtimes = ["CUDA"]
+                self.assertEqual(classify(detail, {}), "compute")
+
+    def test_regular_file_and_all_extension_size_boundaries(self):
+        for ext in sorted(MODEL_EXTS - {".gguf"}):
+            threshold = (64 if ext in AMBIGUOUS_EXTS else 4) * MiB
+            for size, accepted in ((threshold - 1, False), (threshold, True)):
+                with self.subTest(ext=ext, size=size), \
+                        patch("gputaskman.procinfo.os.stat",
+                              return_value=SimpleNamespace(st_mode=stat.S_IFREG, st_size=size)), \
+                        patch("gputaskman.procinfo.store_name", return_value=None), \
+                        patch("gputaskman.procinfo.is_gguf") as magic:
+                    found = _models_from_path_args(self.detail(self.root / ("model" + ext)))
+                    self.assertEqual(bool(found), accepted)
+                    magic.assert_not_called()
+        for ext in AMBIGUOUS_EXTS:
+            with self.subTest(store_ext=ext), \
+                    patch("gputaskman.procinfo.os.stat",
+                          return_value=SimpleNamespace(st_mode=stat.S_IFREG, st_size=1)), \
+                    patch("gputaskman.procinfo.store_name", return_value="org/model"):
+                found = _models_from_path_args(self.detail(self.root / ("model" + ext)))
+                self.assertEqual(found[0].store_name, "org/model")
+                self.assertEqual(found[0].sources, ["path-arg"])
+
+    def test_invalid_magic_is_rejected_even_above_the_size_gate(self):
+        for contents in (b"", b"G", b"GGU", b"NOPE"):
+            self.path.write_bytes(contents)
+            with self.subTest(contents=contents), open(self.path, "ab") as f:
+                if contents == b"NOPE":
+                    f.truncate(4 * MiB)
+            self.assertEqual(_models_from_path_args(self.detail(self.path)), [])
+
+    def test_paths_are_resolved_against_target_cwd_not_monitor_cwd(self):
+        other = self.root / "other.GGUF"
+        other.write_bytes(b"GGUF")
+        with patch("gputaskman.procinfo.psutil.Process") as process:
+            process.return_value.cwd.return_value = str(self.root)
+            found = _models_from_path_args(self.detail(self.path.name, other.name))
+            process.assert_called_once_with(123)
+            process.return_value.cwd.assert_called_once_with()
+        self.assertEqual([m.path for m in found], [str(self.path), str(other)])
+        for cwd in ("", "relative"):
+            with patch("gputaskman.procinfo.psutil.Process") as process:
+                process.return_value.cwd.return_value = cwd
+                self.assertEqual(_models_from_path_args(self.detail(self.path.name)), [])
+        with patch("gputaskman.procinfo.psutil.Process") as process:
+            process.return_value.cwd.side_effect = PermissionError("protected")
+            found = _models_from_path_args(self.detail(self.path.name, other.name, self.path))
+            process.return_value.cwd.assert_called_once_with()
+            self.assertEqual([m.path for m in found], [str(self.path)])
+
+    def test_nonfiles_and_invalid_paths_are_skipped_before_opening(self):
+        folder = self.root / "folder.gguf"
+        folder.mkdir()
+        for path in (folder, self.root / "missing.gguf"):
+            with patch("gputaskman.procinfo.is_gguf") as magic:
+                self.assertEqual(_models_from_path_args(self.detail(path)), [])
+                magic.assert_not_called()
+        for path in ("bad\0.gguf", "https://example.test/model.gguf", "/proc/model.gguf",
+                     "/dev/model.gguf", "/sys/model.gguf", "[model.gguf", "settings.json"):
+            with self.subTest(path=path), patch("gputaskman.procinfo.os.stat") as probe:
+                self.assertEqual(_models_from_path_args(self.detail(path)), [])
+                probe.assert_not_called()
+        with patch("gputaskman.procinfo.sys.platform", "darwin"), \
+                patch("gputaskman.procinfo.os.stat") as probe:
+            self.assertEqual(_models_from_path_args(self.detail("/System/model.gguf")), [])
+            self.assertEqual(_models_from_path_args(self.detail("/Users/x/Library/Containers/model.gguf")), [])
+            probe.assert_not_called()
+        for mode in (stat.S_IFIFO, stat.S_IFCHR, stat.S_IFSOCK):
+            with patch("gputaskman.procinfo.os.stat", return_value=SimpleNamespace(st_mode=mode)), \
+                    patch("gputaskman.procinfo.is_gguf") as magic:
+                self.assertEqual(_models_from_path_args(self.detail(self.path)), [])
+                magic.assert_not_called()
+        for error in (FileNotFoundError(), PermissionError(), ValueError("invalid path")):
+            with patch("gputaskman.procinfo.os.stat", side_effect=error):
+                self.assertEqual(_models_from_path_args(self.detail(self.path)), [])
+        with patch("gputaskman.gguf.open", side_effect=PermissionError()):
+            self.assertEqual(_models_from_path_args(self.detail(self.path)), [])
+
+    def test_token_and_attempt_limits_include_unsuccessful_candidates(self):
+        self.assertEqual(len(_models_from_path_args(
+            self.detail(*(["noop"] * (PATH_ARG_TOKENS - 1)), self.path))), 1)
+        self.assertEqual(_models_from_path_args(
+            self.detail(*(["noop"] * PATH_ARG_TOKENS), self.path)), [])
+        missing = [self.root / f"{i}.gguf" for i in range(PATH_ARG_CANDIDATES)]
+        with patch("gputaskman.procinfo.os.stat", wraps=os.stat) as probe:
+            self.assertEqual(_models_from_path_args(self.detail(*missing, self.path)), [])
+            self.assertEqual(probe.call_count, PATH_ARG_CANDIDATES)
+        found = _models_from_path_args(self.detail(*missing[:-1], self.path))
+        self.assertEqual([m.path for m in found], [str(self.path)])
+        with patch("gputaskman.procinfo.os.stat", wraps=os.stat) as probe:
+            self.assertEqual(len(_models_from_path_args(self.detail(*([self.path] * PATH_ARG_TOKENS)))), 1)
+            self.assertEqual(probe.call_count, 1)
+
+    def test_known_model_operands_and_secrets_are_not_fallback_candidates(self):
+        for flag in ("-m", "--model", "--mmproj", "-md", "--model-draft", "--lora",
+                     "--api-key", "--api-key-file"):
+            for args in ([flag, self.path], [f"{flag}={self.path}"]):
+                with self.subTest(args=args), patch("gputaskman.procinfo.os.stat") as probe:
+                    self.assertEqual(_models_from_path_args(self.detail(*args)), [])
+                    probe.assert_not_called()
+        with patch("gputaskman.procinfo.os.stat") as probe:
+            self.assertEqual(_models_from_path_args(self.detail("--", "--api-key", self.path)), [])
+            self.assertEqual(_models_from_path_args(self.detail("--model", "--api-key", self.path)), [])
+            self.assertEqual(_models_from_path_args(self.detail("--model", f"--api-key-file={self.path}")), [])
+            self.assertEqual(_models_from_path_args(self.detail("--diffusion-model", self.path,
+                                                                "--vae", self.path, f"--llm={self.path}")), [])
+            probe.assert_not_called()
+        detail = self.detail("--api-key", self.path, f"--api-key-file={self.path}")
+        self.scan(detail)
+        self.assertEqual(detail.models, [])
+        self.assertNotIn(str(self.path), " ".join(redact_cmdline(detail.cmdline)))
+        # argv[0] may itself name a model-like executable; it is not an argument.
+        self.assertEqual(_models_from_path_args(ProcDetail(123, cmdline=[str(self.path)])), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX resolves .. after following directory symlinks")
+    def test_symlink_parent_traversal_is_not_rewritten_to_another_file(self):
+        base, target = self.root / "base", self.root / "target"
+        base.mkdir()
+        (target / "inner").mkdir(parents=True)
+        (target / "model.gguf").write_bytes(b"GGUF")
+        (base / "model.gguf").write_bytes(b"NOPE")
+        (base / "link").symlink_to(target / "inner", target_is_directory=True)
+        path = base / "link" / ".." / "model.gguf"
+        found = _models_from_path_args(self.detail(path, base / "model.gguf"))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(file_key(found[0].path), file_key(str(target / "model.gguf")))
+
+    def test_aliases_merge_without_fabricating_confirmation(self):
+        alias = self.root / "alias.gguf"
+        try:
+            os.link(self.path, alias)
+        except OSError as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        for args, maps, expected in (
+                (["--native", self.path, alias, self.path], [], ["path-arg"]),
+                (["--native", alias], [SimpleNamespace(path=str(self.path), rss=42)], ["mapped", "path-arg"]),
+                (["--model", self.path, "--native", alias], [], ["cmdline", "path-arg"])):
+            detail = self.detail(*args)
+            self.scan(detail, maps)
+            self.assertEqual(len(detail.models), 1)
+            self.assertEqual(detail.models[0].sources, expected)
+            self.assertNotIn("confirmed", detail.models[0].evidence)
+            if maps:
+                self.assertEqual(detail.models[0].resident, 42)
+        self.assertEqual(MappedModel("m", 1, None, False, ["api", "path-arg"]).evidence, "reported (api)")
+        self.assertEqual(MappedModel("m", 1, 0, False, ["api", "mapped", "path-arg"]).evidence,
+                         "confirmed (api+mapped)")
+
+    def test_weak_paths_do_not_suppress_installed_candidates_for_ai_runtimes(self):
+        detail = self.detail("--native", self.path)
+        with patch("gputaskman.procinfo.installed_models", return_value=[]) as installed:
+            self.scan(detail, [SimpleNamespace(path="onnxruntime.dll", rss=0)])
+            installed.assert_called_once_with(detail.exe)
+        self.assertTrue(detail.is_ai)
+        self.assertFalse(_llm_wanted(ProcRow(123, detail.name, "AI", ProcGpu(dedicated=GiB), detail), True))
+
+    def test_collection_adds_the_filename_without_probing_or_changing_memory(self):
+        detail = self.detail("--native", self.path)
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {1: {123: ProcGpu(dedicated=8 * GiB, shared=0)}},
+            {1: AdapterGpu(dedicated=8 * GiB, shared=0)})
+        c.inspector, c.prober = ProcInspector(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"), \
+                patch.object(c.inspector, "get", return_value=detail), \
+                patch("gputaskman.procinfo._memory_maps", return_value=[]), \
+                patch("gputaskman.procinfo.read_gguf") as header:
+            s = c.sample()
+        c.prober.get.assert_not_called()
+        header.assert_not_called()
+        self.assertEqual((s.attributed, s.vram_used), (8 * GiB, 8 * GiB))
+        self.assertEqual(s.procs[0].kind, "app")
+        self.assertIsNone(s.procs[0].llm)
+        self.assertIn(self.path.name, s.procs[0].inside)
+
+    def test_weak_files_are_excluded_from_header_math_and_name_only_api_pairing(self):
+        weak = MappedModel(str(self.path), GiB, None, True, ["path-arg"], "org/model")
+        detail = self.detail()
+        detail.models = [weak]
+        for server in (None, ServerInfo("ollama", "http://local", models=[{"name": "org/model"}]),
+                       ServerInfo("lmstudio", "http://local", models=[{"name": "org/model"}])):
+            with self.subTest(server=server), patch("gputaskman.llm.read_gguf") as header:
+                view = build_view(detail, GiB, 0, server)
+                header.assert_not_called()
+                self.assertEqual(view.models, [])
+                self.assertEqual(view.other_files[0].sources, ["path-arg"])
+                self.assertIsNone(view.kv_per_token)
+                self.assertFalse(any(s.kind in ("weights", "kv") for s in view.segments))
+        weak.kind, weak.kind_hint = "LLM", "decision model"
+        self.assertEqual(classify(detail, {}), "app")  # never infer process kind from a weak entry
+
+    def test_exact_api_identity_upgrades_only_the_view_copy(self):
+        detail = self.detail("--native", self.path)
+        self.scan(detail)
+        server = ServerInfo("llama-server", "http://local", model_path=str(self.path), n_ctx=4096)
+        with patch("gputaskman.llm.read_gguf", return_value=gguf("qwen3", block_count=1, context_length=4096)):
+            view = build_view(detail, GiB, 0, server)
+        self.assertEqual(view.files[0].sources, ["path-arg", "api"])
+        self.assertEqual(view.files[0].evidence, "reported (api)")
+        self.assertEqual(detail.models[0].sources, ["path-arg"])
+
+    def test_mixed_files_keep_stronger_selection_and_estimates(self):
+        strong = MappedModel("real.gguf", 1000, 0, True, ["cmdline"], kind="LLM")
+        weak = MappedModel(str(self.path), GiB, None, True, ["path-arg"])
+        detail = self.detail()
+        detail.models = [weak, strong]
+        model = gguf("qwen3", block_count=1, context_length=4096)
+        with patch("gputaskman.llm.read_gguf", return_value=model) as header:
+            view = build_view(detail, GiB, 0, None)
+            header.assert_called_once_with("real.gguf")
+        self.assertEqual(view.files, [strong])
+        self.assertEqual(view.other_files, [weak])
+        self.assertTrue(ProcRow(123, detail.name, "LLM", ProcGpu(), detail).inside.startswith("real.gguf"))
+
+    def test_table_text_json_and_screenshot_redaction_preserve_uncertainty(self):
+        detail = self.detail("--native", self.path)
+        self.scan(detail)
+        s = snapshot()
+        s.procs[0].detail, s.procs[0].llm, s.procs[0].kind = detail, None, "compute"
+        before = to_dict(s)
+        self.assertIn("path-arg (unproven): custom model.GGUF", s.procs[0].inside)
+        self.assertIn("path-arg (not proven loaded)", to_text(s))
+        data = to_dict(s)["processes"][0]
+        self.assertEqual(data["model_files"][0]["sources"], ["path-arg"])
+        self.assertIsNone(data["model_files"][0]["resident"])
+        self.assertNotIn("llm", data)
+        public = for_publication(s)
+        self.assertEqual(public.procs[0].detail.models[0].path, self.path.name)
+        detail.models = []
+        after = to_dict(s)
+        for key in ("attributed", "vram_used", "shared_used"):
+            self.assertEqual(before[key], after[key])
+        for key in ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes", "engines"):
+            self.assertEqual(before["processes"][0][key], after["processes"][0][key])
 
 
 class ModelTests(unittest.TestCase):
@@ -1108,6 +1422,37 @@ class ChartTests(unittest.TestCase):
         self.assertTrue(any(span.style == colors["Mem activity"] for span in metrics.spans))
 
 
+class LlmWantedTests(unittest.TestCase):
+    """The LLM-breakdown gate: what measured memory a row needs on spill vs integrated GPUs."""
+
+    def _row(self, kind="LLM", models=("m.gguf",), diffusion=False, available=("dedicated", "shared")):
+        return SimpleNamespace(
+            kind=kind,
+            detail=ProcDetail(123, cmdline=["--diffusion-model"] if diffusion else [],
+                              models=[MappedModel(m, 1, 0, True) for m in models]),
+            gpu=SimpleNamespace(available=set(available)),
+        )
+
+    def test_spill_backend_needs_both_counters(self):
+        self.assertTrue(_llm_wanted(self._row(), True))
+        row = self._row(available=("dedicated",))
+        self.assertFalse(_llm_wanted(row, True))  # discrete card without a spill counter: no breakdown
+        row = self._row(available=("shared",))
+        self.assertFalse(_llm_wanted(row, True))
+
+    def test_integrated_gpu_needs_only_dedicated(self):
+        # An integrated GPU has no spill counter; a provably private client's memory suffices.
+        self.assertTrue(_llm_wanted(self._row(available=("dedicated",)), False))
+        row = self._row(available=set())
+        self.assertFalse(_llm_wanted(row, False))
+
+    def test_non_ai_and_diffusion_rows_are_out(self):
+        self.assertFalse(_llm_wanted(self._row(kind="3D/game"), False))
+        self.assertFalse(_llm_wanted(self._row(diffusion=True), True))
+        # Kind LLM alone still wants a view when its counters are measured.
+        self.assertTrue(_llm_wanted(self._row(kind="LLM", models=()), True))
+
+
 class UiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         # These snapshots are NVIDIA/WDDM ones: render them with that backend's charts on every OS (macOS too).
@@ -1620,6 +1965,22 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                         text = " ".join(ET.fromstring(app.export_screenshot()).itertext()).replace("\u00a0", " ")
                         self.assertIn("likely decision model (name)", text)
                         self.assertIn("in use (mapped)", text)
+
+    async def test_path_argument_is_explicit_without_an_llm_view(self):
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.BACKEND", "wddm"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(220, 50)) as pilot:
+                s = snapshot()
+                detail = ProcDetail(10, "custom-server", models=[
+                    MappedModel("custom.gguf", 5 * GiB, None, True, ["path-arg"])])
+                s.procs[0] = ProcRow(10, detail.name, "compute", ProcGpu(dedicated=8 * GiB), detail)
+                app.apply(s)
+                await pilot.pause()
+                self.assertEqual(app.query_one("#procs").get_row("10")[2].plain, "compute")
+                text = " ".join(ET.fromstring(app.export_screenshot()).itertext()).replace("\u00a0", " ")
+                self.assertIn("path-arg (unproven): custom.gguf", text)
+                self.assertIn("path-arg (not proven loaded)", text)
+                self.assertNotIn("on GPU (est)", text)
 
     async def test_navigation_sort_pause_and_help(self):
         with patch.object(GpuTaskManager, "poll"):

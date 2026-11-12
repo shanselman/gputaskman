@@ -12,7 +12,7 @@ import psutil
 
 from .amdsmi import AmdSmi, _bdf
 from .adl import Adl
-from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, Adapter
+from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, Adapter
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
@@ -85,6 +85,9 @@ class ProcRow:
                 return f"Handy last log ({self.handy.last_event}): {self.handy.last_model.rsplit('/', 1)[-1]}"
             if self.handy.selected_model:
                 return f"Handy selected (not load proof): {self.handy.selected_model.rsplit('/', 1)[-1]}"
+        if self.llm and self.llm.server and self.llm.server.kind == "vllm" and self.llm.server.models:
+            source = "parent API" if self.llm.server_source == "parent" else "API"
+            return f"reported ({source}): " + ", ".join(m["name"] for m in self.llm.server.models)
         if self.llm and self.llm.models:
             parts = []
             for i, g in enumerate(self.llm.models):
@@ -94,8 +97,10 @@ class ProcRow:
                     parts.append(f"{self.llm.label(i)} {g.params_label} {g.quant}")
             return ", ".join(parts)
         if self.detail.models:
-            return ", ".join((m.store_name or os.path.basename(m.path)) +
-                             (f" ({m.kind_label})" if m.kind_hint else "") for m in self.detail.models[:2])
+            models = sorted(self.detail.models, key=lambda m: not m.has_model_evidence)
+            return ", ".join(("" if m.has_model_evidence else "path-arg (unproven): ") +
+                             (m.store_name or os.path.basename(m.path)) +
+                             (f" ({m.kind_label})" if m.kind_hint else "") for m in models[:2])
         if self.detail.candidates:
             return "installed (unproven): " + ", ".join(
                 f"{m.store_name or os.path.basename(m.path)} {gb(m.size)}" +
@@ -123,14 +128,16 @@ class Snapshot:
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD or Intel) | wsl (device-wide only) | metal (macOS)
-    process_status: str = ""  # drm backend only: what the DRM process scan couldn't cover; empty when it saw everything
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD/Intel) | ascend (Huawei NPU) | wsl (device-wide only) | metal (macOS)
+    process_status: str = ""  # amdgpu only: what the DRM process scan couldn't cover; empty when it saw everything
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
     shared_is_spill: bool = True
-    counter_status: str = ""  # Windows counter availability or adapter matching problem
+    counter_status: str = ""  # Windows counter availability or adapter matching problem;
+    # Intel DRM privilege explanation (needs root) when its load/video/power are N/A
     counter_adapter_matched: bool | None = None  # Windows PDH LUID matched the selected DXGI adapter
+    process_memory_available: bool = True
     nv_lost: bool = False  # NVML faulted for this GPU after a disable/re-enable; restart restores it
     @property
     def host_data(self) -> bool:
@@ -138,7 +145,8 @@ class Snapshot:
 
     @property
     def attributed(self) -> int | None:
-        if self.counter_adapter_matched is False or any("dedicated" not in p.gpu.available for p in self.procs):
+        if not self.process_memory_available or self.counter_adapter_matched is False or any(
+                "dedicated" not in p.gpu.available for p in self.procs):
             return None
         return int(sum(p.gpu.dedicated for p in self.procs))
 
@@ -175,6 +183,9 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
             from .linux import pci_key
             matches = [d for d in devices if d.pci_bus and pci_key(d.pci_bus) == adapter.luid]
             return matches[0] if len(matches) == 1 else None
+        if isinstance(adapter, TccAdapter):
+            matches = [d for d in devices if adapter.matches_pci(d.pci_bus) and d.driver_model == "TCC"]
+            return matches[0] if len(matches) == 1 else None
         if adapter.pci_address is None:
             return None
         if adapters is not None and sum(a.pci_address == adapter.pci_address for a in adapters) != 1:
@@ -187,14 +198,29 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
     return matches[0] if len(matches) == 1 else None
 
 
+def _llm_wanted(row, shared_is_spill: bool) -> bool:
+    """Whether a process row gets an LLM breakdown: an AI-kind process with models (or kind LLM),
+    not diffusion, and with measured GPU memory. Where spilled system memory is a counter of its own
+    (WDDM, discrete DRM cards) both the dedicated and shared counters must be present; on an integrated
+    GPU system memory is the memory and there is no spill counter, so dedicated alone suffices."""
+    if row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.has_model_evidence or row.kind == "LLM"):
+        return False
+    need = {"dedicated", "shared"} if shared_is_spill else {"dedicated"}
+    return need <= row.gpu.available
+
+
 class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
     drm_card = None  # the selected GPU's AMD or Intel card, when it is one (drm.DrmCard)
+    ascend = None  # AscendCounters, when LinuxCounters owns one
+    ascend_chip = None  # the selected GPU's Ascend chip, when it is one (ascend.AscendChip)
 
     @property
     def backend(self) -> str:
+        if BACKEND == "nvml" and self.adapter and self.adapter.vendor_id == VENDOR_HUAWEI:
+            return "ascend"  # Huawei NPU: npu-smi is the source, not NVML/DRM
         return "drm" if self.drm_card is not None else BACKEND
 
     def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True,
@@ -222,13 +248,27 @@ class Collector:
         # partial and get their fdinfo-derived used-memory stamp), processes from DRM fdinfo.
         drm = getattr(self.counters, "drm", None)
         if drm is not None and self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
-            self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)
+            self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid
+                                  and c.vendor_id == self.adapter.vendor_id), None)
         if drm is not None and self.drm_card is None:
             self.counters.drm = None  # an NVIDIA GPU is shown: don't walk every process's fds for nothing
         elif drm is not None:
-            drm.start()  # engine baseline over every process
+            drm.start(self.drm_card)  # process baseline plus device counters for the selected GPU only
             if scan_budget is None:
                 drm.scan_budget = None  # one-shot output sees every process
+        # Huawei Ascend NPU (no DRM): one selected chip and its owned watch process.
+        self.ascend_chip = None
+        self.ascend = None
+        if BACKEND == "nvml" and self.adapter and self.adapter.vendor_id == VENDOR_HUAWEI:
+            from dataclasses import replace
+            from .ascend import AscendCounters, cached_chips, chip_adapter_key
+
+            chip = next((c for c in cached_chips()
+                         if chip_adapter_key(c.pdev, c.chip) == self.adapter.luid), None)
+            if chip is not None:
+                self.ascend_chip = replace(chip)
+                self.ascend = AscendCounters(chips=[self.ascend_chip])
+                self.counters.ascend = self.ascend
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
@@ -248,8 +288,43 @@ class Collector:
         self._own_start = time.time()  # our NVML context is created now, not when the process started
         self._host_restarted = time.time()
 
-    def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
+    def _parent_ports(self, pid: int, depth: int = 2, *, vllm: bool = False) -> list[int]:
         d = self.inspector.get(pid)
+        if vllm:
+            d.parents = []
+            candidates = []
+            try:
+                p = psutil.Process(pid)
+                if not d.create_time or p.create_time() != d.create_time or d.vllm_ambiguous:
+                    return []
+                child_start = d.create_time
+                seen = {pid}
+                for _ in range(depth):
+                    p = p.parent()
+                    if p is None:
+                        break
+                    parent = self.inspector.get(p.pid)
+                    if p.pid in seen or not parent.create_time or parent.create_time != p.create_time():
+                        return []
+                    if parent.create_time > child_start:
+                        return []
+                    if not parent.vllm_role:
+                        break
+                    if parent.vllm_ambiguous:
+                        return []
+                    seen.add(p.pid)
+                    d.parents.append(p.pid)
+                    child_start = parent.create_time
+                    ports = self.inspector.exclusive_ports(p.pid)
+                    if parent.ports and set(parent.ports) != set(ports):
+                        return []  # a shared listener cannot identify a server
+                    if parent.vllm_role == "worker" and ports:
+                        return []
+                    if parent.vllm_role == "server":
+                        candidates.extend(ports)
+                return candidates if len(candidates) == 1 else []
+            except (psutil.Error, OSError):
+                return []
         if d.parents is None:
             d.parents = []
             try:
@@ -274,9 +349,16 @@ class Collector:
             from .drm import read_device
 
             nv = read_device(self.drm_card, self.gpu_index)
+        elif self.ascend_chip is not None:
+            nv = self.ascend.read_device(self.ascend_chip, self.gpu_index)
         elif self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
             # NVML can't describe this GPU, and a sweep of every NVIDIA device costs ~60 ms per device.
-            nv = (self.adl.sample() or self.amdsmi.sample()) if self.adapter.vendor_id == VENDOR_AMD else None
+            if self.adapter.vendor_id == VENDOR_AMD:
+                nv = self.adl.sample() or self.amdsmi.sample()
+            elif self.adapter.vendor_id == VENDOR_INTEL and BACKEND == "wddm" and a and a.util_gpu is not None:
+                nv = DeviceTelemetry(index=self.gpu_index, source="Windows WDDM", util_gpu=round(a.util_gpu))
+            else:
+                nv = None
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
@@ -315,8 +397,19 @@ class Collector:
                 snap.counter_status = " ".join(filter(None, (
                     snap.counter_status, "NVIDIA telemetry stopped after this GPU was re-enabled; "
                                          "restart gputaskman to restore it.")))
+            snap.counter_status = " ".join(filter(None, (snap.counter_status, self.adapter.identity_status)))
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
+            if self.drm_card.intel and nv is not None:
+                from .drm import intel_counter_status
+
+                snap.counter_status = intel_counter_status(self.drm_card, nv)
+        if self.ascend is not None:
+            snap.process_memory_available = self.ascend.process_available
+            snap.counter_status = self.ascend.status
+        elif self.backend == "ascend":
+            snap.process_memory_available = False
+            snap.counter_status = "Ascend chip unavailable: npu-smi could not match the selected adapter"
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
         live.sort(key=lambda x: -(x[1].shown_vram or 0))
         for pid, g in live:
@@ -352,25 +445,41 @@ class Collector:
                 continue
             if os.path.basename(row.detail.exe).lower() in ("handy.exe", "handy"):
                 row.handy = inspect_handy(row.detail.create_time)
-            if (row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM")
-                    or not {"dedicated", "shared"} <= row.gpu.available):
+            if not _llm_wanted(row, snap.shared_is_spill):
                 continue
             ports = self.inspector.exclusive_ports(row.pid)
             key = api_key(row.detail.cmdline)
-            own = self.prober.get(ports, key)
-            host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
+            vllm = bool(row.detail.vllm_role)
+            kind = "vllm" if vllm else None
+            own_origin = ("process", row.pid, row.detail.create_time)
+            if vllm and (row.detail.vllm_ambiguous or len(ports) > 1 or
+                         set(ports) != set(row.detail.ports)):
+                ports = []
+                parent_ports = []
+            else:
+                parent_ports = self._parent_ports(row.pid, vllm=vllm)
+            if vllm and ports and parent_ports:
+                ports, parent_ports = [], []  # two possible server processes: do not pick one
+            parent_origin = ("parent", tuple((pid, self.inspector.get(pid).create_time)
+                                            for pid in row.detail.parents or []))
+            own = self.prober.get(ports, key, kind=kind, origin=own_origin)
+            host = self.prober.get(parent_ports, kind=kind, origin=parent_origin)
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
-            held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else row.gpu.shared)
+            held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else (row.gpu.shared or 0))
             row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
-                                 attributed=row.gpu.shown_vram is not None)
-            locked = None if own else self.prober.locked_port(ports)
+                                 attributed=row.gpu.shown_vram is not None,
+                                 server_source="process" if own else "parent" if host else None)
+            locked = None if own else self.prober.locked_port(ports, key, kind=kind, origin=own_origin)
             if locked:
                 why = ("rejected the key from the launch arguments" if key else
                        "wants an API key, and none was found in the launch arguments (keys from LLAMA_API_KEY "
                        "or --api-key-file are not read)")
                 row.llm.notes.append(f"Local API on port {locked} {why}. Server details are skipped.")
+            if not host and self.prober.locked_port(parent_ports, kind=kind, origin=parent_origin):
+                row.llm.notes.append("Parent-process API locked (401). Parent probes never send the worker's "
+                                     "API key; parent server details are skipped.")
 
         self.inspector.prune(set(procs))
         return snap

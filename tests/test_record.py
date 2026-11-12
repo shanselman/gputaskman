@@ -25,7 +25,7 @@ from gputaskman.dxgi import Adapter
 from gputaskman.host import HostProc, HostSample
 from gputaskman.host import to_dict as host_to_dict
 from gputaskman.pdh import ProcGpu
-from gputaskman.procinfo import ProcDetail
+from gputaskman.procinfo import MappedModel, ProcDetail
 from gputaskman.report import dump, to_dict, to_json_dict
 
 GiB = 1 << 30
@@ -180,6 +180,18 @@ class RunTests(unittest.TestCase):
 
 
 class MakeSampleTests(unittest.TestCase):
+    def test_path_argument_provenance_and_unknown_residency_survive_recording(self):
+        s = snapshot()
+        s.procs[0].detail.models = [MappedModel("custom.gguf", GiB, None, True, ["path-arg"])]
+        clock, output = Clock(), io.StringIO()
+        sample = record.make_sample(lambda: s)
+        record.run(sample, output, interval=1, duration=1, clock=clock, sleep=clock.sleep)
+        data = json.loads(output.getvalue())
+        self.assertEqual(data, json.loads(dump(s, True)))
+        self.assertEqual(data["processes"][0]["model_files"][0]["sources"], ["path-arg"])
+        self.assertIsNone(data["processes"][0]["model_files"][0]["resident"])
+        self.assertNotIn("llm", data["processes"][0])
+
     def test_a_record_is_the_object_json_prints(self):
         sample = record.make_sample(snapshot, host_sample)
         self.assertEqual(json.loads(json.dumps(sample(), default=str)),

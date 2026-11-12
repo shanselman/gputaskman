@@ -10,11 +10,15 @@ counter, and have no per-process or device-wide memory sysfs beyond a discrete c
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
+import platform
 import re
+import struct
 import time
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 from .dxgi import VENDORS, Adapter
@@ -61,9 +65,11 @@ class DrmCard:
     # BAR) window, an estimate of the card's memory; 0 means unknown (an integrated GPU, or a discrete card
     # whose window is under 1 GiB). Per-process bytes still come from fdinfo.
     intel: bool = False
-    # Intel only: used local memory, stamped in each DrmCounters.sample() as the sum of the card's
-    # clients' local bytes (shared buffers can double-count); None = no readable client, unknown.
+    # Intel only: used memory, stamped in each DrmCounters.sample() as the sum of the card's
+    # clients' resident bytes (local bytes on a discrete card, system bytes on an integrated one;
+    # shared buffers can double-count); None = no readable client, unknown.
     vram_used: int | None = None
+    pmu_state: dict = field(default_factory=dict, repr=False)
 
 
 def _read(path: str) -> str | None:
@@ -157,6 +163,13 @@ def parse_fdinfo(text: str) -> dict | None:
         # system0 includes buffers placed there on purpose, not only memory that spilled from local0.
         # There is no separate CPU-only region. These are i915's names; xe calls them vram0/gtt/system, so
         # its memory stays unknown until validated.
+        has_local = any("local0" in key for key in fields)
+        if fields["drm-driver"] == "i915" and not has_local:
+            # An integrated GPU has no local0 region at all, so there is no shared-local0 to require:
+            # the gate needs only the system0 region the device has. xe keeps the old gate (unknown keys).
+            required_shared = ("drm-shared-system0",)
+        else:
+            required_shared = ("drm-shared-local0", "drm-shared-system0")
         return {
             "driver": fields["drm-driver"],
             "client_id": client_id,
@@ -164,7 +177,7 @@ def parse_fdinfo(text: str) -> dict | None:
             # The shared-buffer gate needs every shared region present and parseable: any ambiguity keeps
             # the gate closed (None) instead of risking shared buffers being charged as private.
             "shared": (sum(shared_values) if shared_keys and None not in shared_values
-                       and all(k in fields for k in ("drm-shared-local0", "drm-shared-system0")) else None),
+                       and all(k in fields for k in required_shared) else None),
             "vram": intel_resident("drm-resident-local0", "drm-resident-stolen-local0"),
             "gtt": intel_resident("drm-resident-system0", "drm-resident-stolen-system0"),
             "cpu": None,
@@ -373,6 +386,38 @@ def _hwmon_temp(hwmon: str) -> int | None:
     return _milli(os.path.join(hwmon, "temp1_input"))
 
 
+def _cpu_package_temp(hwmon_root: str = "/sys/class/hwmon") -> int | None:
+    """The CPU package temperature from coretemp, for an integrated GPU with no sensor of its own.
+
+    The CPU and GPU share a die, so this is a stand-in, never presented as the GPU's own reading
+    (callers set temp_kind). Prefers "Package id 0"; None when coretemp or its package sensor is missing.
+    """
+    try:
+        hwmons = sorted(os.listdir(hwmon_root))
+    except OSError:
+        return None
+    fallback = None
+    for hwmon in hwmons:
+        path = os.path.join(hwmon_root, hwmon)
+        if _read(os.path.join(path, "name")) != "coretemp":
+            continue
+        try:
+            names = sorted(os.listdir(path))
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith("temp") and name.endswith("_label"):
+                label = _read(os.path.join(path, name))
+                value = _milli(os.path.join(path, f"{name[:-len('_label')]}_input"))
+                if value is None:
+                    continue  # torn or unparseable reading: try the other sensors
+                if label == "Package id 0":
+                    return value
+                if label is not None and label.startswith("Package id") and fallback is None:
+                    fallback = value
+    return fallback
+
+
 def _hwmon_clock(hwmon: str, label: str) -> int | None:
     try:
         names = sorted(os.listdir(hwmon))
@@ -386,6 +431,39 @@ def _hwmon_clock(hwmon: str, label: str) -> int | None:
 
 
 _PCIE_GEN = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
+
+
+# Active i915/xe throttle reasons, in a fixed order: each throttle_reason_* sysfs node holds 1 while
+# that limit holds the GPU back, 0 otherwise. An unreadable or unparseable node is skipped (unknown,
+# not inactive), so a partial read never reports "no throttling".
+_INTEL_THROTTLE = (
+    ("throttle_reason_pl1", "PL1"),
+    ("throttle_reason_pl2", "PL2"),
+    ("throttle_reason_pl4", "PL4"),
+    ("throttle_reason_prochot", "PROCHOT"),
+    ("throttle_reason_ratl", "RATL"),
+    ("throttle_reason_thermal", "thermal"),
+    ("throttle_reason_vr_tdc", "VR-TDC"),
+    ("throttle_reason_vr_thermalert", "VR-therm"),
+)
+
+
+def _intel_throttle(gt: str) -> list[str] | None:
+    """Names of the limits currently throttling an Intel GPU; empty when none is active.
+
+    _int already turns an unreadable or unparseable node into None, so those are skipped. None when no
+    node was readable at all: unknown, not "no throttling" (an empty list means readable and idle).
+    """
+    seen = False
+    active = []
+    for node, label in _INTEL_THROTTLE:
+        value = _int(os.path.join(gt, node))
+        if value is None:
+            continue
+        seen = True
+        if value:
+            active.append(label)
+    return active if seen else None
 
 
 def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
@@ -432,12 +510,26 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
     if card.intel:
         # The gt nodes hang off the DRM card itself (/sys/class/drm/cardN/gt/gt0), not the PCI device.
         gt = os.path.join(os.path.dirname(d), "gt", "gt0")
+        act = _int(os.path.join(gt, "rps_act_freq_mhz"))
         cur = _int(os.path.join(gt, "rps_cur_freq_mhz"))
+        # rps_act_freq_mhz is the actual frequency; rps_cur_freq_mhz is what the driver last requested
+        # (per the kernel's intel_gt_sysfs_pm.c). The actual one can read 0 while the GPU idles in RC6,
+        # which is a real reading, not a missing one; fall back to the requested one on kernels without it.
+        dev.sm_clock = act if act is not None else cur
         if cur is not None:
-            # rps_cur_freq_mhz is the frequency the driver last requested (rps_act_freq_mhz is the actual one,
-            # per the kernel's intel_gt_sysfs_pm.c); hwmon has no sclk on Intel. Not displayed yet.
+            # hwmon has no sclk on Intel; keep the requested frequency too, for the JSON.
             dev.gfx_clock = cur
         dev.sm_clock_max = _int(os.path.join(gt, "rps_RP0_freq_mhz"))
+        dev.throttle = _intel_throttle(gt)
+        util, video = _intel_pmu_rates(card)
+        dev.util_gpu = util
+        dev.video = video
+        if dev.power_w is None and card.integrated:
+            # No hwmon energy either: RAPL's uncore zone is the integrated GPU's power.
+            # A discrete card keeps N/A here (uncore is not its power).
+            dev.power_w = _intel_rapl_w()
+            if dev.power_w is not None:
+                dev.power_kind = "RAPL uncore"
         # sysfs current_link_* on i915/xe can report the power-on default instead of the live link
         # (2.5 GT/s x1 shown while a measured DMA transfer ran at ~19 GB/s), so both stay unset:
         # unknown beats a confidently wrong number.
@@ -452,6 +544,14 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
             except (ValueError, IndexError):
                 pass
         dev.pcie_width = _int(os.path.join(d, "current_link_width"))
+    if card.intel and card.integrated and dev.temp is None:
+        # No GPU temperature sensor (an integrated GPU has no hwmon of its own): the CPU package shares
+        # the die, so its temperature stands in, labelled as such (temp_kind), never presented as the
+        # GPU's own reading. A discrete card keeps N/A: the package is not its temperature.
+        package = _cpu_package_temp()
+        if package is not None:
+            dev.temp = package
+            dev.temp_kind = "CPU package"
     return dev
 
 
@@ -474,6 +574,237 @@ def _intel_power_w(hwmon: str) -> float | None:
 
 
 _INTEL_ENERGY_STATE: dict[str, tuple[int, float]] = {}  # hwmon path -> (last uJ, last read time); per card
+
+
+# Whole-GPU load and power for Intel (i915) need privileges a normal user lacks, so they live apart
+# from the sysfs readings above: the i915 performance counters (engine busy time) via perf_event_open
+# and GPU power via RAPL's uncore energy zone. File descriptors stay open for the process's life and
+# are closed by DrmCounters.close(); the previous readings sit beside them. A card whose counters can
+# never be opened records why ("denied", "missing" or "shared") instead of retrying a failing syscall
+# every refresh; RAPL failures are cached the same way. See intel_counter_status for what each means.
+_PERF_NR = {"x86_64": 298, "aarch64": 241}  # __NR_perf_event_open
+_INTEL_RAPL_PREV: dict[str, tuple[int, float]] = {}  # energy_uj path -> (last uJ, last read time)
+_INTEL_RAPL_FAIL: str | None = None  # why the uncore zone can't be read: denied, missing, or None
+
+
+def _perf_open(pmu_type: int, config: int, cpu: int) -> tuple[int | None, str | None]:
+    """One system-wide perf counter fd, or (None, reason). The explicit c_long wrappers matter: plain
+    ints would cross the variadic call boundary as 32-bit values. Loading libc lazily (and catching
+    its absence) keeps importing this module safe where syscall(2) doesn't exist."""
+    nr = _PERF_NR.get(platform.machine())
+    if nr is None:
+        return None, "missing"  # unsupported architecture: unknown, not denied
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+    except (OSError, AttributeError):
+        return None, "missing"  # no syscall export (e.g. Windows): the counters don't exist here
+    syscall.restype = ctypes.c_long
+    attr = ctypes.create_string_buffer(64)  # PERF_ATTR_SIZE_VER0: type/size/config is all counting needs
+    struct.pack_into("IIQ", attr, 0, pmu_type, 64, config)
+    fd = syscall(ctypes.c_long(nr), attr, ctypes.c_long(-1),
+                 ctypes.c_long(cpu), ctypes.c_long(-1), ctypes.c_ulong(0))
+    if fd >= 0:
+        return fd, None
+    err = ctypes.get_errno()
+    return None, ("denied" if err in (errno.EACCES, errno.EPERM) else "missing")
+
+
+def _intel_pmu_path(card: DrmCard, root: str = "/sys/bus/event_source/devices") -> str | None:
+    """Bind the PCI-named discrete PMU, or the legacy integrated i915 PMU; never use i915 for xe."""
+    if card.driver != "i915":
+        return None
+    discrete = os.path.join(root, "i915_" + card.pdev.replace(":", "_"))
+    if os.path.isdir(discrete):
+        return discrete
+    integrated = os.path.join(root, "i915")
+    return integrated if card.integrated and os.path.isdir(integrated) else None
+
+
+def _intel_pmu_spec(pmu_root: str | None) -> tuple[int, int, dict[str, int]] | None:
+    """(PMU type, CPU, {engine instance: config}); None if any busy counter can't be decoded."""
+    if pmu_root is None:
+        return None
+    root = pmu_root
+    pmu_type = _int(os.path.join(root, "type"))
+    mask = _read(os.path.join(root, "cpumask"))
+    if pmu_type is None or not mask:
+        return None
+    try:
+        cpu = int(re.split(r"[-,]", mask.strip())[0], 0)
+    except ValueError:
+        return None
+    try:
+        events = sorted(os.listdir(os.path.join(root, "events")))
+    except OSError:
+        return None
+    configs = {}
+    for event in events:
+        if not event.endswith("-busy"):
+            continue
+        value = _read(os.path.join(root, "events", event))
+        if not value or "=" not in value:
+            return None
+        try:
+            configs[event[:-len("-busy")]] = int(value.split("=", 1)[1].strip(), 16)
+        except ValueError:
+            return None
+    return (pmu_type, cpu, configs) if configs else None
+
+
+def _read_counter(fd: int) -> int | None:
+    """One 64-bit perf counter value; None when it can't be read."""
+    try:
+        return struct.unpack("Q", os.read(fd, 8))[0]
+    except (OSError, struct.error):
+        return None
+
+
+def _intel_pmu_rates(card: DrmCard, now: int | None = None) -> tuple[float | None, float | None]:
+    """Whole-GPU busy % (busiest engine) and video-engine busy % for an Intel card; (None, None) when
+    unreadable. The first sample only arms the baseline (a rate needs an interval); a counter stepping
+    back re-arms it instead of reporting a negative load."""
+    if now is None:
+        now = time.monotonic_ns()
+    state = card.pmu_state
+    if not state:
+        state.update(fds={}, prev={}, fail=None)
+        spec = _intel_pmu_spec(_intel_pmu_path(card))
+        if spec is None:
+            state["fail"] = "missing"
+            return None, None
+        pmu_type, cpu, configs = spec
+        for kind, config in configs.items():
+            fd, fail = _perf_open(pmu_type, config, cpu)
+            if fd is None:
+                for open_fd in state["fds"].values():
+                    try:
+                        os.close(open_fd)
+                    except OSError:
+                        pass
+                state["fds"] = {}
+                state["fail"] = fail
+                return None, None
+            state["fds"][kind] = fd
+        if not state["fds"]:
+            state["fail"] = "missing"
+            return None, None
+    if state["fail"] or not state["fds"]:
+        return None, None
+    busy: dict[str, float] = {}
+    for kind, fd in state["fds"].items():
+        value = _read_counter(fd)
+        if value is None:
+            for open_fd in state["fds"].values():
+                try:
+                    os.close(open_fd)
+                except OSError:
+                    pass
+            state.clear()  # transient: a fresh attempt next sample
+            return None, None
+        prev = state["prev"].get(kind)
+        state["prev"][kind] = (value, now)
+        if prev is None:
+            continue  # first sample arms the baseline
+        delta, elapsed = value - prev[0], now - prev[1]
+        if elapsed <= 0 or delta < 0:
+            continue  # torn read or stepped-back counter: unknown, not a negative load
+        # An engine can't be busier than the wall clock it ran against; clamp the skew instead of
+        # displaying an impossible load, like the per-process path does.
+        busy[kind] = min(100.0, delta * 100.0 / elapsed)
+    if not busy:
+        return None, None
+    video_engines = [k for k in state["fds"] if k.startswith(("vcs", "vecs"))]
+    video = (max((busy[k] for k in video_engines), default=None)
+             if all(k in busy for k in video_engines) else None)
+    util = max(busy.values()) if len(busy) == len(state["fds"]) else None
+    return util, video
+
+
+def _intel_rapl_zone(powercap_root: str = "/sys/class/powercap") -> tuple[str, int | None] | None:
+    """(energy_uj path, max range or None) of the first package's uncore zone; None when absent."""
+    try:
+        roots = sorted(os.listdir(powercap_root))
+    except OSError:
+        return None
+    for root in roots:
+        if not re.fullmatch(r"intel-rapl:\d+", root):
+            continue
+        package = os.path.join(powercap_root, root)
+        try:
+            children = sorted(os.listdir(package))
+        except OSError:
+            continue
+        for child in children:
+            zone = os.path.join(package, child)
+            if _read(os.path.join(zone, "name")) == "uncore":
+                energy = os.path.join(zone, "energy_uj")
+                if os.path.exists(energy):
+                    return energy, _int(os.path.join(zone, "max_energy_range_uj"))
+    return None
+
+
+def _intel_rapl_w(now: float | None = None) -> float | None:
+    """GPU (uncore) power in watts from RAPL's cumulative energy counter; None when unreadable.
+
+    The first sample only arms the baseline. A stepped-back counter (reset, suspend) re-arms it
+    instead of reporting a spike, like the PMU path. Denied and missing failures are cached: the
+    zone won't appear mid-run."""
+    global _INTEL_RAPL_FAIL
+    if _INTEL_RAPL_FAIL is not None:
+        return None
+    if now is None:
+        now = time.perf_counter()
+    zone = _intel_rapl_zone()
+    if zone is None:
+        _INTEL_RAPL_FAIL = "missing"
+        return None
+    energy_path, _max_range = zone
+    try:
+        with open(energy_path, encoding="utf-8") as f:
+            energy = int(f.read().strip())
+    except OSError as err:
+        _INTEL_RAPL_FAIL = "denied" if err.errno in (errno.EACCES, errno.EPERM) else "missing"
+        return None
+    except ValueError:
+        _INTEL_RAPL_FAIL = "missing"  # readable but unparseable: a broken counter, not denial
+        return None
+    prev = _INTEL_RAPL_PREV.get(energy_path)
+    _INTEL_RAPL_PREV[energy_path] = (energy, now)
+    if prev is None:
+        return None
+    delta, seconds = energy - prev[0], now - prev[1]
+    if seconds <= 0 or delta < 0:
+        return None
+    return delta / 1e6 / seconds
+
+
+def intel_counter_status(card: DrmCard, nv=None) -> str:
+    """Why Intel whole-GPU load, video load or power are N/A, for Snapshot.counter_status; "" when
+    all present (or not Intel). Unknown stays explained, never a bare blank. The nv reading tells
+    which source actually served power, so a working hwmon sensor is never blamed on RAPL."""
+    if not card.intel:
+        return ""
+    pmu_fail = card.pmu_state.get("fail")
+    if pmu_fail is None and _INTEL_RAPL_FAIL is None:
+        return ""
+    parts = []
+    if pmu_fail == "denied":
+        para = _read("/proc/sys/kernel/perf_event_paranoid") or "?"
+        parts.append(f"GPU and video load need perf privileges this user lacks (perf_event_paranoid={para})")
+    elif pmu_fail == "missing":
+        parts.append("no readable supported i915 performance counters for this GPU")
+    elif pmu_fail == "shared":
+        parts.append("performance counters can't attribute load with multiple Intel GPUs")
+    hwmon_power = nv is not None and nv.power_kind == "Board"
+    if card.integrated and not hwmon_power:
+        if _INTEL_RAPL_FAIL == "denied":
+            parts.append("GPU power needs root (RAPL energy is root-only)")
+        elif _INTEL_RAPL_FAIL == "missing":
+            parts.append("no RAPL uncore zone found")
+    if not parts:
+        return ""
+    return "Intel device metrics unavailable: " + "; ".join(parts) + ". N/A is unknown, not zero."
 
 
 def _vcn_major(device: str) -> int:
@@ -549,13 +880,28 @@ class DrmCounters:
         self.partial = False  # the last scan ran out of budget, so a DRM client's holders may not all be known
         self.scan_budget: float | None = SCAN_BUDGET
 
-    def start(self) -> None:
+    def start(self, selected: DrmCard | None = None) -> None:
         """Take the engine baseline over every process, like the WDDM counters do at startup."""
         if not self.ok:
             return
         budget, self.scan_budget = self.scan_budget, None
         self.sample()
         self.scan_budget = budget
+        intel_cards = [c for c in self.cards if c.intel]
+        selected_intel = [c for c in intel_cards if selected is None or c is selected]
+        for card in selected_intel:
+            if card.integrated:
+                _intel_rapl_w()  # arm the power baseline; RAPL is package-global, unaffected by sharing
+        pmu_paths = {card.sysfs: _intel_pmu_path(card) for card in intel_cards}
+        for card in selected_intel:
+            path = pmu_paths[card.sysfs]
+            if path is not None and list(pmu_paths.values()).count(path) > 1:
+                # Only a genuinely shared PMU is ambiguous; discrete PMUs are named by PCI address.
+                card.pmu_state.update(fds={}, prev={}, fail="shared")
+                continue
+            # Arm the load baseline too: --once sleeps a second after Collector init,
+            # so its single sample is already a rate over a real interval.
+            _intel_pmu_rates(card)
 
     def _adapters(self) -> dict[int, AdapterGpu]:
         out: dict[int, AdapterGpu] = {}
@@ -577,19 +923,24 @@ class DrmCounters:
         return out
 
     def _stamp_intel_memory(self, clients: dict[tuple, list]) -> None:
-        """Intel cards expose no device-wide memory sysfs: used local memory is the sum of the card's
-        clients' resident local bytes, counted once per client even when several processes share it
+        """Intel cards expose no device-wide memory sysfs: used memory is the sum of the card's
+        clients' resident bytes, counted once per client even when several processes share it
         (buffers shared between clients can double-count, and clients that can't be inspected are missing;
         report.INTEL_MEMORY_NOTE says so). With no readable client the sum is None -- unknown, not 0."""
         for card in self.cards:
             if not card.intel:
                 continue
-            used = [c[1]["vram"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
-            card.vram_used = sum(used) if used and None not in used else None
-            if any(v is not None for v in used):
+            local = [c[1]["vram"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
+            card.vram_used = sum(local) if local and None not in local else None
+            if any(v is not None for v in local):
                 # A client reports local memory, so the card has some: discrete, whatever its BAR window says
                 # (a card without resizable BAR has a small window and no known total).
                 card.integrated = False
+            elif card.integrated:
+                # No local memory on an integrated GPU: its memory is the system memory its clients sit in.
+                # Sum that instead, with the same double-count caveat (an over-estimate, never a device reading).
+                gtt = [c[1]["gtt"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
+                card.vram_used = sum(gtt) if gtt and None not in gtt else None
 
     def _start_time(self, pid: int) -> str | None:
         """Field 22 of /proc/<pid>/stat: tells a reused pid from the process cached under it."""
@@ -723,6 +1074,7 @@ class DrmCounters:
 
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         by_pdev = {c.pdev: c.key for c in self.cards}
+        by_key = {c.key: c for c in self.cards}
         unified = {c.pdev for c in self.cards if c.unified_video}
         intel_pdevs = {c.pdev for c in self.cards if c.intel}
         procs: dict[int, dict[int, ProcGpu]] = {c.key: {} for c in self.cards}
@@ -757,6 +1109,12 @@ class DrmCounters:
             infos = [c[1] for _k, c in held]
             vram = [i["vram"] for i in infos]
             gtt = [i["gtt"] for i in infos]
+            # An integrated Intel GPU has no local memory: system0 is its memory, not spill and not
+            # dedicated VRAM, so there is no shared (spill) counter for it. The bytes it holds are charged
+            # as the process's GPU memory in the VRAM column when provably private (below).
+            integrated_intel = by_key[key].intel and by_key[key].integrated
+            if integrated_intel:
+                proc.available.discard("shared")
             # Every buffer this process can reach, shared ones included: a reference, never summed (rule 1).
             complete = pid not in incomplete  # otherwise any sum would be a partial total that looks whole
             proc.resident_vram = float(sum(vram)) if complete and None not in vram else None
@@ -776,7 +1134,8 @@ class DrmCounters:
                 reason = REASON_SHARED_BUFFERS
             elif not all(c[2] for _k, c in held):
                 reason = REASON_PRIMARY
-            elif proc.resident_vram is None or proc.resident_gtt is None:
+            elif proc.resident_gtt is None or (proc.resident_vram is None and not integrated_intel):
+                # No local memory on an integrated GPU, so only the system figure has to be known.
                 reason = REASON_LEGACY
             elif self.partial:
                 reason = REASON_PARTIAL_SCAN
@@ -784,6 +1143,11 @@ class DrmCounters:
             if reason:
                 proc.attributed = False
                 proc.available -= {"dedicated", "shared"}
+            elif integrated_intel:
+                # Unified memory: the same system bytes are the charge (vram_bytes) and the reachable
+                # reference (gtt_resident_bytes). Both are measured and labelled; diff.py compares
+                # per-field and never sums them.
+                proc.dedicated = proc.resident_gtt
             else:
                 proc.dedicated = proc.resident_vram
                 proc.shared = proc.resident_gtt
@@ -813,4 +1177,11 @@ class DrmCounters:
         return procs, adapters
 
     def close(self) -> None:
-        """No handles are held."""
+        """Close this collector's Intel PMU file descriptors, leaving other collectors alone."""
+        for card in self.cards:
+            for fd in card.pmu_state.get("fds", {}).values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            card.pmu_state.clear()

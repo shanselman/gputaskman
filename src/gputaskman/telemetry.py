@@ -18,7 +18,9 @@ class DeviceTelemetry:
     util_mem: float | None = None
     enc: float | None = None
     dec: float | None = None
+    video: float | None = None  # video-engine busy % (unified decode+encode on Intel; enc/dec stay unset)
     temp: float | None = None
+    temp_kind: str = ""  # where a fallback temperature comes from ("CPU package"), else its own sensor
     power_w: float | None = None
     power_kind: str = ""
     power_limit_w: float | None = None
@@ -33,6 +35,6 @@ class DeviceTelemetry:
     pcie_tx_kbs: int | None = None
     pcie_gen: int | None = None
     pcie_width: int | None = None
-    throttle: list[str] = field(default_factory=list)
+    throttle: list[str] | None = field(default_factory=list)  # None = unreadable (unknown), [] = readable and idle
     compute_cap: str = ""
     source: str = "NVML"

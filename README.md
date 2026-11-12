@@ -2,7 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD and Intel on native Linux; see
+Windows with NVIDIA/AMD telemetry and Intel WDDM activity, plus Linux and WSL support (NVIDIA
+everywhere, AMD and Intel on native Linux; see
 [Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
@@ -66,7 +67,7 @@ and an installer are not part of this initial distribution. Each ZIP includes li
 
 ## Clone and run
 
-Use **64-bit Windows 10/11**, an **NVIDIA or AMD GPU with a current WDDM driver**, and a terminal
+Use **64-bit Windows 10/11** with a current WDDM driver and a terminal
 (Windows Terminal is recommended). Live workload checks have included an RTX 4080 SUPER and an
 RTX Spark N1X on Windows ARM64. CUDA workloads are supported on ARM64 with a compatible NVIDIA
 driver and ARM64 CUDA runtime.
@@ -75,6 +76,11 @@ AMD live check: Radeon 860M Graphics on Windows 11 Enterprise build 26300, AMD d
 During desktop/browser activity, WDDM reported per-process VRAM and AMD ADL reported GPU utilization,
 clocks, and ASIC power; temperature, memory activity, and PCIe readings were unavailable. Vulkan/ROCm
 workloads were not tested on this machine.
+
+Intel Arc on Windows can use WDDM's per-process memory and engine counters. When those counters are
+available, the device GPU activity is the busiest WDDM engine after combining its process counters.
+Intel temperature, power, clocks, and memory activity are not currently available on Windows.
+Arc B580 behavior is covered by mocked counters but has not been validated on Intel hardware.
 
 Install [Git for Windows](https://git-scm.com/downloads/win) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. With WinGet:
@@ -118,8 +124,8 @@ skips the consistency check, so do not use it after changing dependencies.
 
 Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
 `gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
-or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver or an Intel GPU on `i915`), and work
-natively, in containers, and in WSL:
+or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver, an Intel GPU on `i915`,
+or a Huawei Ascend 310P with `npu-smi`). NVIDIA works natively, in containers, and in WSL:
 
 ```bash
 tar -xzf gputaskman-VERSION-linux-x64.tar.gz
@@ -136,6 +142,13 @@ uv run --locked gputaskman
 ```
 
 What can be measured depends on where it runs, and the UI says which mode it is in.
+
+On native Linux, Ascend chips are listed individually. Their device memory and per-process memory
+come from `npu-smi`; AI-core and memory-bandwidth activity come from its watch stream, not
+per-process engine counters. Memory refreshes every 10 seconds, and a failed refresh or stale watch
+is reported as unavailable. The contributor reported testing an Atlas 300I Duo with a vLLM
+workload; driver version and these subsequent fixes have not been independently validated on hardware.
+Ascend container and PID-namespace behavior is not validated.
 
 | | Native Linux | WSL, interop on (default) | WSL, interop off or `--no-host` |
 |---|---|---|---|
@@ -245,16 +258,23 @@ covered by unit tests only and **not yet validated on AMD hardware**.
 
 | | Source |
 |---|---|
-| Device temperature, power, GT clock | `hwmon` and `gt/gt0` under `/sys/class/drm/card*`. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first |
+| Device temperature, power, GT clock, throttle, load and video | `hwmon`, `gt/gt0`, the i915 performance counters and RAPL's uncore zone. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first: the hwmon counter on a discrete card, the uncore RAPL zone on an integrated GPU (root-only). Without a GPU temperature sensor, an integrated GPU falls back to the CPU package sensor (`coretemp`), labelled as shared with the CPU. The GT clock is the actual frequency (`rps_act_freq_mhz`, the requested one as fallback); throttle reasons come from `throttle_reason_*`. GPU % is the busiest engine's busy share from the performance counters and video is the video engine's share (unified decode+encode, so `enc`/`dec` stay unset); both need root (`perf_event_paranoid=2` here blocks normal users), otherwise `N/A` with a reason |
 | Device VRAM total | The size of the local-memory PCI window (`resource2`), an **estimate**: kernel-owned memory is missing from the sysfs view, resizable BAR rounds to a power of two, and a partial window can be smaller than the card, so the total can differ from the card's memory. A window under 1 GiB (an integrated GPU, or a discrete card without resizable BAR) shows `N/A` (`null` in JSON). Free memory is never shown for Intel |
-| Device VRAM used | The sum of its clients' resident local memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice, and kernel-owned memory and processes gputaskman can't inspect are missing. The UI, `--once`, `--json` (`memory_note`) and `gputaskman diff` all say so. `n/a` when any client's local memory is unknown |
+| Device VRAM used | The sum of its clients' resident memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice, and kernel-owned memory and processes gputaskman can't inspect are missing. Local memory on a discrete card, system memory on an integrated GPU. The UI, `--once`, `--json` (`memory_note`) and `gputaskman diff` all say so. `n/a` when any client's memory is unknown |
 | Integrated or discrete | An iGPU has no `local0`, so a card with a local-memory window of 1 GiB or more is discrete, and so is any card whose fdinfo reports local memory, even when its window is smaller |
-| Per-process VRAM and SPILL | `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions (the firmware-reserved part of each), under the same private-client rules as AMD. `system0` is memory the GPU's buffers currently sit in, including buffers placed there on purpose, so SPILL here (like AMD's GTT) is where they are, not proof they were pushed out of VRAM. Both `drm-shared-local0` and `drm-shared-system0` must be present to charge a process, so an integrated GPU (no `local0`) shows `n/a` (`legacy`). A region value that can't be parsed makes that figure `n/a`, not a smaller number |
+| Per-process VRAM and SPILL | `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions (the firmware-reserved part of each), under the same private-client rules as AMD. On an integrated GPU there is no local memory: a provably private client's `system0` bytes are its GPU memory in the VRAM column, and SPILL stays `N/A` (system memory is its memory, not spill). On a discrete card `system0` is memory the GPU's buffers currently sit in, including buffers placed there on purpose, so SPILL there (like AMD's GTT) is where they are, not proof they were pushed out of VRAM. The shared gate needs only the regions the device has, so a discrete card with a missing `drm-shared-local0` still shows `n/a` (`legacy`), while an integrated client with shared buffers shows `n/a` (`shared_buffers`). A region value that can't be parsed makes that figure `n/a`, not a smaller number |
 | Per-process engine load (3d, compute, copy, video) | `drm-engine-render`, `-compute`, `-copy`, `-video`, `-video-enhance` busy time, sampled twice. `n/a` where the driver reports none (before Gen 8). A class with several identical engines (`drm-engine-capacity-*`, such as video on an Arc) is not divided by its capacity, so one busy engine reads 100% |
 
-Device GPU load, memory bandwidth, and the PCIe link are `n/a`: i915 has no device-wide busy counter, and its
-sysfs link fields can report the power-on default instead of the live link. The GT clock is read but not shown yet, and
-what is read (`rps_cur_freq_mhz`) is the frequency the driver last *requested*; the kernel's actual frequency is `rps_act_freq_mhz`.
+Device memory bandwidth and the PCIe link are `n/a`: i915 has no device-wide bandwidth counter, and its
+sysfs link fields can report the power-on default instead of the live link. Device GPU load and video load
+come from the i915 performance counters and need root; power comes from RAPL's uncore zone on an integrated
+GPU and needs root too.
+The load readings sample every exposed `*-busy` engine instance, including compute and additional
+video/copy engines, and use the busiest instance rather than averaging across idle engines. Discrete
+PMUs are matched by PCI address (`i915_<PCI BDF>`); the legacy `i915` PMU is used only for an integrated
+card. If multiple cards resolve to the same PMU, their load stays `N/A` with an attribution reason.
+Each collector opens device counters only for its selected GPU and owns those handles and baselines;
+closing one does not reset another collector's readings.
 `xe` cards are detected, but its fdinfo uses other keys (`drm-cycles-*`, `drm-resident-vram0`/`-gtt`), so its
 per-process rows show `n/a` until they are decoded on hardware.
 
@@ -263,6 +283,21 @@ BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and sel
 per-process VRAM and engine load, and the TUI rendered both. The fdinfo formats of both drivers, taken from the kernel
 sources, are covered by unit tests. **Not validated on hardware:** `xe`, Arc cards without resizable BAR, and
 multi-GPU systems other than that pair.
+
+Live check on an integrated GPU (ASUS Vivobook 14 X1404VA, Intel Core 3 100U Xe-LP, `i915`, kernel 7.3.1, Mesa 26.2.5):
+the card is found and named, the header shows the actual GT clock (`GT 300/1250 MHz`) with no throttle reasons active,
+and a headless `vkmark` run shows as a 3D/game Vulkan row at 82% GPU. Per-process memory stays `n/a`
+(`shared_buffers`): the compositor imports every window, so no client is provably private. The `gtt_resident_bytes`
+reference and the engine percentages are still measured.
+
+Live check of the root-only readings on the same machine (`intel_gpu_top` from intel-gpu-tools as reference,
+`perf_event_paranoid=2`): under `vkmark` load the header's GPU % reads 48-95% against `intel_gpu_top` Render
+51-92% across scenes, and power reads 0.4 W idle against its 0.4 W (under load 9.0 W against 6.5-6.8 W in a
+nearby window; scenes vary, and uncore is approximate while the CPU is active). A VA-API `ffmpeg` decode loop
+drives the video engine to 99.9% on both (`intel_gpu_top` Video 99.4-99.9%). Without root the three stay `N/A`
+with a reason, while the GT clock, throttle and per-process rows keep working.
+Per-PCI PMU selection and compute/secondary-engine coverage are regression-tested with synthetic
+counters, **not yet validated on hardware**; the live check above covers only the Vivobook's exercised engines.
 
 **WSL** is different, because Windows owns the GPU. Linux cannot see how much VRAM its own
 processes use: `nvidia-smi` lists no processes, NVML's per-process samples carry *Windows* PIDs
@@ -508,7 +543,8 @@ Under multi-GPU WSL, host attribution is disabled with a reason rather than risk
 two devices by memory usage; Linux processes are listed once with GPU `?`, because `/dev/dxg`
 does not identify their GPU. `--gpu N` retains the existing single-device host matching.
 
-`--list-gpus` lists selectable hardware adapters with their vendor and LUID. `--gpu N` selects
+`--list-gpus` lists selectable non-software DXGI adapters on Windows (including root-enumerated
+display adapters), or hardware adapters on other platforms, with their vendor and adapter key. `--gpu N` selects
 one of these adapters: NVIDIA adapters are listed first, followed by other vendors, with each
 group ordered by dedicated memory. An out-of-range
 index is rejected rather than silently selecting another device. Compute-only devices such as an
@@ -540,6 +576,20 @@ against a WDDM GPU (RTX 4080 SUPER, NVIDIA 630.20: adapter VRAM matched
 `nvidia-smi` to the MiB with and without a 1 GiB CUDA allocation, and every per-process number stayed
 `n/a`, as NVML documents for WDDM). It is **not validated on TCC hardware**, so per-process VRAM on a
 real TCC card is expected, not confirmed.
+
+On Windows, each exact DXGI LUID is also resolved through `DisplayConfigGetDeviceInfo` to its
+PnP device interface, including inactive displays, then read through SetupAPI. A `ROOT\DISPLAY`
+instance uses its PnP friendly name (device description as fallback) and is labelled `ROOT display
+adapter` in `--list-gpus`, rather than inheriting the physical GPU's DXGI name or vendor label.
+It stays selectable at the same index, is not paired with PCI telemetry, and still needs matching
+LUID counters to show usage. A missing PnP name gives an explicit root-display label; a failed
+identity lookup retains the DXGI description with a reason in the list, text, TUI and JSON
+`counter_status`. JSON `adapter.device_instance_id` records the resolved instance (empty if unknown);
+`adapter.identity_status` records lookup limitations. Physical adapter names and ordering are unchanged.
+The StarDesk inactive virtual-display case is covered by mocked API regressions, **not yet validated
+with StarDesk installed**. Read-only live checks on Windows 11 build 28000, NVIDIA RTX Spark N1X,
+driver 32.0.16.2114 confirmed its physical PCI identity and unchanged display name; no display
+configuration or drivers were changed.
 
 AMD adapters can be selected and use the existing Windows GPU process counters; HIP runtime DLLs
 are recognized as runtime evidence. On supported drivers, the AMD Display Library supplied by the
@@ -753,17 +803,37 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state; exercised live |
 | Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
 | LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
+| vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
 | stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
 | Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
+| Unknown apps / custom server flags | Validated model-like file paths in launch arguments, marked `path-arg` (*not proven loaded*); no runtime tag required |
 | Handy | Reads selected model from settings and bounded load/start/preview/unload events from `handy.log`; selection is not load evidence and log events are historical, not proof of current residency |
 | WinML / local helper processes | GPU-backed execution is in scope; generic process counters and runtime detection only. No WinML-specific model/session or client-to-helper attribution yet |
 | Windows Studio Effects | Only any observable GPU portion is in scope. NPU inference is out of scope; do not interpret GPU camera/render activity as proof of model execution |
 
 WinML can select different execution backends; a local helper/service is still **local**, not
 cloud-hosted. The GPU counters belong to whichever process holds/uses the GPU resources.
-Parent-PID lookup currently helps find Ollama/LM Studio APIs; it is not a general cross-process
+Parent-PID lookup currently helps find Ollama/LM Studio and local vLLM APIs; it is not a general cross-process
 ownership graph for shared Windows services.
+
+For vLLM, `vllm serve`, `python -m vllm.entrypoints.openai.api_server`, `VLLM::EngineCore`,
+`VLLM::Worker` and `VLLM::Worker_TP<n>` are detection hints, not loading evidence. An inherited launch command
+also works without process titles. Worker discovery checks at most two live ancestors, their
+creation times and their signatures. Only one exclusively owned listening port on one recognized
+server is accepted; shared/multiple listeners, unrelated or inaccessible ancestry and explicit
+distributed/data-parallel options give no association. There is no port scanning or matching by
+model name. Processes outside the visible PID namespace are not linked to local servers.
+Source-grounded fixtures follow upstream vLLM commit
+[`499a3d1`](https://github.com/vllm-project/vllm/tree/499a3d1e1e338e3e866c0719cfe1f429e2b0b762):
+the default single-API launcher keeps its command line, starts EngineCore, and EngineCore starts
+TP workers. `VLLM::APIServer_<index>` belongs to the separate multi-API path and is not supported.
+
+The table, inspector and text label these identifiers as API-reported, with **parent process**
+when applicable. JSON has `llm.server_source` (`"process"`, `"parent"`, or `null`) alongside
+`llm.server.models[].name`. A reported ID is not a model file or evidence that a worker holds
+that model; it adds no weights, KV-cache, context-size or GPU-placement estimate. Measured memory
+and attributed totals are unchanged.
 
 GPU-backed WinML and Studio Effects paths have **not been validated on a Copilot+ PC**. A future
 hardware check should compare idle versus active workload samples, record the actual GPU adapter
@@ -779,17 +849,43 @@ Every model row shows its **evidence**, strongest first:
 |---|---|
 | `api` | The runtime's local API reports the model as loaded |
 | `mapped` | Windows shows the file memory-mapped into the process right now |
-| `cmdline` | The file was a launch argument (`-m model.gguf`) |
+| `cmdline` | The file was passed under a recognized model flag (`-m model.gguf`) |
+| `path-arg` | A model-like file was passed at launch under another flag or positionally; not proven loaded |
 | `installed` | Found in the app's install or data folder; nothing proves it is loaded |
 | Handy settings / log | Settings show selection; timestamped log events show what Handy reported, not current residency |
 
-Two sources including `api` or `mapped` show as **confirmed**. Runtime logs can report model events,
+Two of `api`, `mapped`, and `cmdline`, including `api` or `mapped`, show as **confirmed**.
+`path-arg` does not count as corroboration. Runtime logs can report model events,
 but are displayed as timestamped history and do not prove current residency. Model-store folders
 only supply a friendly name. The authoritative model *kind* comes from GGUF header keys: `decision.type` marks a
 decision model (for example [Laya](https://huggingface.co/ggml-org/Laya-GGUF)), `pooling_type`
 an embedding model or reranker, `stt.*` a speech model, and a causal model with layers and a
 trained context an LLM. llama-server's `/v1/models` `output_modalities` (`text`, `decisions`)
 confirms it. Non-causal encoders such as Laya allocate no KV cache, so none is estimated.
+
+For an unknown server, both `--native C:\models\model.gguf` and
+`--native=C:\models\model.gguf` can identify a **path argument**, as can a positional model path.
+Existing `--model` handling remains `cmdline` evidence. The automatic fallback considers
+`.gguf`, `.ggml`, `.safetensors`, `.onnx`, `.pt`, `.pth`, `.bin`, `.engine`, `.plan`, `.tflite`
+and `.ckpt` files. It requires a regular file: GGUF must have the four-byte `GGUF` magic;
+`.bin`, `.pt`, `.pth` and `.ckpt` need at least 64 MiB or a recognized model store; the other
+formats need at least 4 MiB. These checks identify plausible files, not proof of model loading.
+
+The fallback examines at most 256 argument tokens after the executable and attempts at most
+16 distinct model-extension paths per scan, including unsuccessful attempts. It does not walk
+directories or expand shell expressions. Relative paths use the target process's current working
+directory, never the monitor's; unavailable cwd means relative paths are skipped. A process may
+have changed cwd since launch, so this is not proof of the original file selection. Special and
+privacy-protected paths are skipped, as are API-key and key-file arguments. Only the GGUF magic
+is read from fallback model files; full headers and weights are not read. Existing cached store
+metadata may supply a friendly name.
+
+A `path-arg`-only match changes neither process classification nor API probing and supplies no
+weights, KV-cache or GPU-placement estimate. JSON preserves it in `model_files[].sources`;
+unobserved file RAM residency is `resident: null`, not zero. Mapped, recognized-flag or exact API
+file-identity evidence can support the existing richer analysis; store-name similarity alone
+cannot upgrade a path argument. Installed-folder discovery still requires a recognized AI runtime.
+This fallback is fixture-tested; the original unknown-server/GPU workload is **not hardware-validated**.
 
 When a file lacks specific kind metadata, known local decision-model names (`openjev`, `laya`,
 `julia-1`, `lev`, `kev`) supply a **likely decision model (name)** hint. Matching uses delimited
@@ -821,22 +917,27 @@ recipe, and a log-format change can break it. The runtime-agnostic answer is to 
 opened during the load: Windows kernel file-I/O ETW events record which process opened which model
 file. Combined with that process's VRAM jump, this identifies the model without app-specific code.
 It needs elevation and must already be running when the load happens, so it is planned as an
-opt-in mode. Until then, unknown apps show their runtime DLLs, VRAM, engine activity, and installed
-candidates. Reading model names out of another process's memory is deliberately not done.
+opt-in mode. Until then, unknown apps show their observable runtime DLLs, VRAM, engine activity and
+validated path arguments; recognized AI runtimes can also show installed candidates.
+Reading model names out of another process's memory is deliberately not done.
 
 Identification is designed to stay cheap. Measured on one Windows machine:
 
 | Probe | Cost | Used |
 |---|---|---|
 | Process list, command line, listening ports | under 1 ms | Once per process / every 5 s |
-| Windows adapter discovery (DXGI + PCI location, no telemetry sample) | ~0.40 ms median; first/cold call up to 14.1 ms in 30 reads (Windows 11 build 26340, RTX 4080 SUPER, NVIDIA 630.20) | TUI only, every 5 s; synchronous OS calls, not a hard latency bound. Other drivers/multi-GPU laptops unmeasured; provider reconstruction after changes/errors has additional driver-dependent cost |
-| Windows NVML handle reacquisition (no telemetry sample) | ~8.7 ms median, 9.3 ms max in 30 reads on the same machine | Every 5 s per active collector; retries initialization after NVML session-loss errors. Other drivers unmeasured |
+| Windows adapter discovery (DXGI + exact-LUID PnP identity + PCI location, no telemetry sample) | ~0.86 ms median, 2.60 ms max in 30 warm reads, 26.1 ms first/cold call (Windows 11 build 28000, RTX Spark N1X, driver 32.0.16.2114); same machine without the PnP probe: ~0.36 ms median | Once at startup; TUI rediscovery every 5 s. PnP uses fixed buffers, one interface lookup per adapter and at most two name-property reads, no path/device enumeration or retries. Synchronous OS calls are not a hard latency bound. Other drivers, virtual displays and multi-GPU laptops unmeasured; provider reconstruction has additional driver-dependent cost |
+| Windows NVML handle reacquisition (no telemetry sample) | ~8.7 ms median, 9.3 ms max in 30 reads (Windows 11 build 26340, RTX 4080 SUPER, NVIDIA 630.20) | Every 5 s per active collector; retries initialization after NVML session-loss errors. Other drivers unmeasured |
 | Windows TCC discovery (NVML init, device count, one driver-model read per GPU, shutdown) | First call in 15 fresh processes on the same machine, one WDDM GPU: median 37.6 ms, 27.8-43.8 ms. About 15 ms of that is the first `nvmlInit` (it loads `nvml.dll`), which NVML readings pay anyway; the added cost is one extra init-to-shutdown cycle, median 20.7 ms (13.3-30.3 ms). Later calls are cached (about 3 µs). A TCC GPU adds PCI, name and memory reads, which are unmeasured (no TCC hardware here) | Once per process on Windows, including `--list-gpus`; never repeated while running |
 | Memory-map scan (DLLs + mapped files) | 1-50 ms per process | New processes, a 64 MiB / 10% memory change, or every 2 min; at most 150 ms per refresh |
+| Model-path argument fallback | 0.14 ms median / 0.20 ms max for 256 non-model arguments; 5.51 / 6.58 ms for 16 local GGUF paths; 0.18 / 0.62 ms for 16 missing paths (30 warm reads, Windows 11 build 26340, x64, Python 3.13.17; synthetic files, no GPU workload). First 16-file call: 7.74 ms | Same cached scan cadence as memory maps; at most 256 tokens and 16 candidate paths, no directory walk or full GGUF headers. Counts bound work, not synchronous filesystem latency; other platforms and network filesystems unmeasured |
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
+| vLLM `/v1/models` | 1.32 ms median, 21.36 ms max in 30 loopback fixture GETs; cached lookup ~0.0004 ms (Windows 11 build 28000, ARM64; no vLLM runtime/GPU workload) | One GET, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects; actual Linux/vLLM latency unmeasured |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
+| Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
+| Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
@@ -868,6 +969,12 @@ to JSON, and the inspector shows it as `***`. A key in `--api-key-file` or `LLAM
 gputaskman does not open a path taken from another process's command line, and an environment variable
 can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
 one rejected request every 30 seconds, and the inspector says why server details are missing.
+
+vLLM uses only `/v1/models`, with the same request bounds and cache intervals. Parent-discovered
+ports are **always unauthenticated**, even when parent and worker launch arguments match:
+the worker's key is never sent there. A 401 is shown as **Parent-process API locked**.
+Probe caches separate own/parent origins, process creation times, runtime and credentials, so
+an authenticated own-port result cannot silently satisfy a parent request.
 
 Ollama's local `server.log` is considered when one Ollama runner is detected. Log formats,
 rotation, and stale load blocks can affect attribution, so compare the reported model and

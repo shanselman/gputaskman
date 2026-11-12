@@ -27,6 +27,9 @@ class TccAdapter(Adapter):
     def pci_domain(self) -> int:
         return self._pci_domain
 
+    def matches_pci(self, value) -> bool:
+        return _pci_identity(value) == (self.pci_domain, self.pci_address)
+
 
 _lock = threading.Lock()
 _found: list[TccAdapter] | None = None  # NVML is asked once per process

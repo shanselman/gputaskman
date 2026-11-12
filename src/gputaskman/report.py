@@ -89,11 +89,12 @@ def inferred_note(g) -> str:
 METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows show each process's graphics "
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
-INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of local memory resident in the processes gputaskman can inspect "
-                     "(the driver has no device-wide counter): buffers shared between processes can be counted "
-                     "twice, and kernel-owned memory and processes it can't inspect are missing. The total is the "
-                     "size of the card's local-memory PCI window, an estimate that can differ from its memory, so "
-                     "free memory is not shown.")
+INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of memory resident in the processes gputaskman can inspect "
+                     "(the driver has no device-wide counter): local memory on a discrete card, system memory on "
+                     "an integrated GPU. Buffers shared between processes can be counted twice, and kernel-owned "
+                     "memory and processes it can't inspect are missing. The total is the size of the card's "
+                     "local-memory PCI window, an estimate that can differ from its memory (0 on an integrated "
+                     "GPU, whose total is unknown), so free memory is not shown.")
 
 
 def intel_memory_note(s: Snapshot) -> str:
@@ -150,6 +151,7 @@ def to_dict(s: Snapshot) -> dict:
                 "segments": [dataclasses.asdict(x) for x in p.llm.segments],
                 "kv_bytes_per_token": p.llm.kv_per_token, "n_ctx": p.llm.n_ctx, "flags": p.llm.flags,
                 "server": dataclasses.asdict(p.llm.server) if p.llm.server else None,
+                "server_source": p.llm.server_source,
                 "log_source": p.llm.log_source, "notes": p.llm.notes,
             }
         procs.append(item)
@@ -198,12 +200,15 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
         pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
-        label = "AMD gfx" if nv.source.startswith("AMD ") else "GPU"
+        is_intel = nv.source == "Intel sysfs"
+        label = "AMD gfx" if nv.source.startswith("AMD ") else ("Intel GT" if is_intel else "GPU")
         clock = (f"gfx {format_metric(nv.gfx_clock)}" if nv.source.startswith("AMD ") else
+                 f"GT {format_metric(nv.sm_clock)}" if is_intel else
                  f"SM {format_metric(nv.sm_clock)}")
         power_kind = f" ({nv.power_kind})" if nv.power_kind else ""
+        temp_label = f" ({nv.temp_kind})" if nv.temp_kind else ""
         out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
-                   f"{format_metric(nv.temp, unit='C')}  {format_metric(nv.power_w, '.0f')}/"
+                   f"{format_metric(nv.temp, unit='C')}{temp_label}  {format_metric(nv.power_w, '.0f')}/"
                    f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
                    f"{clock} MHz  "
                    f"video {format_metric(nv.video_clock)} MHz  "
@@ -249,6 +254,12 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                 out.append(f"   last Handy event: {p.handy.last_event} {p.handy.last_model or ''} "
                            f"at {p.handy.last_event_local} (runtime-reported history, not current GPU residency)")
         if not p.llm:
+            path_args = [m for m in p.detail.models if "path-arg" in m.sources]
+            if path_args:
+                out.append("")
+                out.append(f"== {p.name} ({p.pid_label})  VRAM {vram_label(p.gpu)}")
+                for m in path_args:
+                    out.append(f"   file: {m.store_name or m.path}  ({gb(m.size)})  evidence: {m.evidence}")
             continue
         out.append("")
         out.append(f"== {p.name} ({p.pid_label})  VRAM {vram_label(p.gpu)}")
@@ -266,6 +277,11 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
             sv = p.llm.server
             out.append(f"   server: {sv.kind} {sv.url} ctx={sv.n_ctx} slots={sv.slots_busy}/{sv.slots_total}"
                        + (f" gen={sv.gen_tok_s:.1f} tok/s" if sv.gen_tok_s is not None else ""))
+            if p.llm.server_source == "parent":
+                out.append("   server source: parent process (API report, not worker residency)")
+            if sv.kind == "vllm":
+                for m in sv.models:
+                    out.append(f"   API-reported model ID: {m['name']}")
         if p.llm.log_source:
             out.append(f"   exact sizes from log: {p.llm.log_source}")
         for n in p.llm.notes:

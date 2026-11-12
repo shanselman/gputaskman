@@ -67,7 +67,7 @@ This display-only choice applies to all GPUs and resets to full when the app res
 
 | Layer | Source | Works for |
 |---|---|---|
-| **Device** telemetry | NVML, AMD ADL, or optional AMD SMI; amdgpu or Intel (i915) sysfs on Linux | availability varies by GPU and driver |
+| **Device** telemetry | NVML, AMD ADL, optional AMD SMI, Intel WDDM activity on Windows; amdgpu or Intel (i915) sysfs on Linux | availability varies by GPU and driver |
 | **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl); DRM fdinfo for amdgpu or Intel (i915) on Linux | workloads visible to WDDM or DRM |
 | **Which runtime** (CUDA, HIP, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
 | **Which model file** | memory-mapped files + command line | llama.cpp, stable-diffusion.cpp, LM Studio, Ollama |
@@ -76,8 +76,10 @@ This display-only choice applies to all GPUs and resets to full when the app res
 | Per-texture / per-buffer names | needs a debugger (PIX, Nsight) attached to the app | games, 3D apps |
 
 **Evidence** shows how a model was identified: `api` (the runtime says it is loaded), `mapped`
-(Windows shows the file mapped into the process right now), `cmdline` (a launch argument only).
-Two sources, including `api` or `mapped`, is shown as *confirmed*.
+(Windows shows the file mapped into the process right now), `cmdline` (a recognized model flag),
+`path-arg` (a model-like file passed at launch; not proven loaded), `installed` (an app-folder candidate).
+Two of `api`, `mapped`, and `cmdline`, including `api` or `mapped`, are shown as *confirmed*.
+`path-arg` alone does not identify a runtime or produce weights/KV estimates.
 
 **Local workloads only:** inference, decision models, vision, speech, training, graphics and video.
 Cloud-hosted models are outside this monitor's scope. DLLs identify runtimes, not models or tasks.
@@ -93,11 +95,13 @@ first sample and for ROCm/HIP processes: their compute runs on `/dev/kfd` queues
 process). VRAM and SPILL are charged to a process only when its DRM clients are provably private: one holder,
 opened through a render node, and no shared buffers. Otherwise they show `n/a` and the bytes stay unattributed;
 the inspector still shows the resident bytes it can reach (shared buffers included, so not added up). **Intel GPUs
-on Linux** (`i915`) take the same path: sysfs for the device, fdinfo for engine load and, on a discrete Arc, local-memory
-VRAM. An integrated GPU shows engine load only (VRAM `n/a`), `xe` cards are detected but their per-process fdinfo isn't
+on Linux** (`i915`) take the same path: sysfs for the device (actual GT clock, throttle reasons), fdinfo for engine load and, on a discrete Arc, local-memory
+VRAM. On an integrated GPU a provably private client's system memory is its GPU memory in the VRAM column (SPILL stays
+`N/A`: system memory is its memory there, not spill); shared clients show `n/a`, with the resident bytes still in the inspector.
+`xe` cards are detected but their per-process fdinfo isn't
 decoded yet (rows show `n/a`). With no device-wide memory counter, an Intel card's VRAM used is a sum over the processes
-it can inspect (shared buffers can be counted twice; kernel-owned memory and uninspectable processes are missing), its total is
-the size of the card's local-memory PCI window (an estimate), and free memory is not shown. Only processes you can inspect are
+it can inspect (local memory on a discrete card, system memory on an integrated GPU; shared buffers can be counted twice; kernel-owned memory and uninspectable processes are missing), its total is
+the size of the card's local-memory PCI window (an estimate; unknown on an integrated GPU), and free memory is not shown. Only processes you can inspect are
 listed, and the header says how many it couldn't; run with `sudo` to see other users'. Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
@@ -573,25 +577,31 @@ class GpuTaskManager(App):
             rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
             tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
             pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
+            is_amd = nv.source.startswith("AMD ")
+            is_intel = nv.source == "Intel sysfs"
             m = Text()
-            label = "AMD gfx" if nv.source.startswith("AMD ") else "GPU"
+            label = "AMD gfx" if is_amd else ("Intel GT" if is_intel else "GPU")
             m.append(f"{label} {format_metric(nv.util_gpu, unit='%')}", style=f"bold {self.CHART_COLORS['GPU']}")
             m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
             m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
             if nv.enc or nv.dec:
                 m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
+            if nv.video is not None:
+                m.append(f"  video {format_metric(nv.video, unit='%')}")
             lines.append(m)
-            clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if nv.source.startswith("AMD ") else
+            clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if is_amd else
+                           f"GT {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz" if is_intel else
                            f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz")
             power_kind = f" {nv.power_kind}" if nv.power_kind else ""
+            temp_kind = f" ({nv.temp_kind})" if nv.temp_kind else ""
             if self.monitoring:
-                clock = nv.gfx_clock if nv.source.startswith("AMD ") else nv.sm_clock
-                label = "gfx" if nv.source.startswith("AMD ") else "SM"
-                st = Text(f"{format_metric(nv.temp, unit='°C')}  "
+                clock = nv.gfx_clock if is_amd else nv.sm_clock
+                label = "gfx" if is_amd else ("GT" if is_intel else "SM")
+                st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  "
                           f"{format_metric(nv.power_w, '.0f')} W{power_kind}  "
                           f"{label} {format_metric(clock)} MHz", style="grey70")
             else:
-                st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
+                st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  {format_metric(nv.power_w, '.0f')}/"
                           f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
                           f"{clock_label}  "
                           f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "
@@ -851,6 +861,8 @@ class GpuTaskManager(App):
             if v.server:
                 sv = v.server
                 st = Text.assemble(("server ", "bold"), (f"{sv.kind} {sv.url}", "cyan"))
+                if v.server_source == "parent":
+                    st.append(" (parent process; API report, not worker residency)")
                 if sv.n_ctx:
                     st.append(f"  ctx {sv.n_ctx:,}")
                 if sv.slots_total is not None:
@@ -862,6 +874,8 @@ class GpuTaskManager(App):
                 for m in sv.models[:4]:
                     if sv.kind == "lmstudio":
                         st.append(f"\n  loaded: {m['name']} {m.get('type') or ''} {m.get('quant') or ''} ctx {m.get('ctx') or '?'}")
+                    elif sv.kind == "vllm":
+                        st.append(f"\n  API-reported model ID: {m['name']}")
                 out.append(st)
             for n in v.notes:
                 out.append(Text("• " + n, style="bold red" if n.startswith("!") else "grey70"))

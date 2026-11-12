@@ -595,6 +595,12 @@ class CollectorTests(TccTestCase):
         self.assertEqual((snap.nv.name, snap.nv.driver_model, snap.vram_used), ("P102-100", "TCC", GiB))
         self.assertEqual([(r.pid, r.gpu.dedicated) for r in snap.procs], [(7, GiB)])
 
+    def test_device_telemetry_matches_tcc_adapter_by_domain(self):
+        self.api.devices = [device(1, bus_id="00010000:01:00.0", total=24 * GiB, used=GiB)]
+        snap = self.sample(self.collector(tcc_adapter(1, domain=0x10000)))
+        self.assertEqual((snap.nv.driver_model, snap.nv.mem_total, snap.vram_used),
+                         ("TCC", 24 * GiB, GiB))
+
     def test_hidden_process_memory_leaves_the_total_unknown_but_the_adapter_measured(self):
         self.api.devices = [device(0x0A, used=9 * GiB, processes=[(100, 6 * GiB), (200, None)])]
         snap = self.sample(self.collector())
