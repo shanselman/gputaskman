@@ -67,12 +67,39 @@ class ParseTests(unittest.TestCase):
         dev = macos.parse_accelerator([{"model": "Apple M4", "PerformanceStatistics": stats}])
         self.assertIsNone(dev.allocated)
 
+    def test_intel_and_amd_accelerator_counters(self):
+        intel = [{"IOClass": "IntelAccelerator", "model": "Intel Iris Plus",
+                  "PerformanceStatistics": {"Device Utilization %": 42, "gartUsedBytes": 512 * 1024**2}}]
+        amd = [{"IOClass": "AMDRadeonX5000_AMDNavi14GraphicsAccelerator", "model": "Radeon Pro",
+                "PerformanceStatistics": {"GPU Activity(%)": 73, "inUseVidMemoryBytes": 2 * GiB,
+                                          "VRAM,totalMB": 8192}}]
+        with patch.object(macos, "physical_memory", return_value=16 * GiB):
+            igpu = macos.parse_accelerator(intel)
+            dgpu = macos.parse_accelerator(amd)
+        self.assertEqual((igpu.vendor_id, igpu.utilization, igpu.allocated, igpu.total),
+                         (macos.VENDOR_INTEL, 42, 512 * 1024**2, 16 * GiB))
+        self.assertEqual((dgpu.vendor_id, dgpu.utilization, dgpu.allocated, dgpu.total),
+                         (macos.VENDOR_AMD, 73, 2 * GiB, 8192 * 1024**2))
+
+    def test_unrecognized_accelerator_memory_stays_unknown(self):
+        dev = macos.parse_accelerator([{"IOClass": "nvaccelerator",
+                                        "PerformanceStatistics": {"Device Utilization %": 25,
+                                                                  "Alloc system memory": GiB}}])
+        self.assertEqual(dev.vendor_id, macos.VENDOR_NVIDIA)
+        self.assertIsNone(dev.allocated)
+        self.assertFalse(dev.process_memory_supported)
+
     def test_gpu_time_is_kept_per_client(self):
         # WindowServer has several Metal clients; runningboardd has one with no usage yet
         times = macos.parse_clients([client(167, "WindowServer", 53012153708, 17704333, cid=11),
                                      client(167, "WindowServer", 262833, cid=12), client(176, "runningboardd", cid=13),
                                      {"IOUserClientCreator": "garbage"}])
         self.assertEqual(times, {167: {11: 53012153708 + 17704333, 12: 262833}, 176: {13: 0}})
+
+    def test_intel_submitter_has_direct_gpu_time(self):
+        self.assertEqual(macos.parse_clients([{"IOUserClientCreator": "pid 12, app",
+                                               "accumulatedGPUTime": 123, "IORegistryEntryID": 3}]),
+                         {12: {3: 123}})
 
     def test_graphics_footprint_counts_only_graphics_categories(self):
         process = {"pid": 79379, "categories": {
@@ -126,6 +153,18 @@ class CountersTests(unittest.TestCase):
         self.assertEqual(poller.targets, [(79379, "same", True), (486, "same", False)])  # busiest first
         self.assertEqual(adapters[macos.ADAPTER_KEY].dedicated, 5494423552)
         self.assertEqual((c.device.name, c.device.util_gpu, c.device.driver_model), ("Apple M4", 99, "Metal"))
+
+    def test_intel_submitter_query_fallback_measures_process_gpu_time(self):
+        c, _ = self.counters({}, {1: ME})
+        accel_entry = [{"IOClass": "IntelAccelerator", "model": "Intel Iris",
+                        "PerformanceStatistics": {"Device Utilization %": 50, "gartUsedBytes": GiB}}]
+        first = [{"IOUserClientCreator": "pid 1, game", "accumulatedGPUTime": 1_000_000_000}]
+        later = [{"IOUserClientCreator": "pid 1, game", "accumulatedGPUTime": 2_000_000_000}]
+        with patch.object(macos, "_ioreg", side_effect=[accel_entry, [], first]):
+            c.sample(now=100.0)
+        with patch.object(macos, "_ioreg", side_effect=[accel_entry, [], later]):
+            procs, _ = c.sample(now=102.0)
+        self.assertAlmostEqual(procs[macos.ADAPTER_KEY][1].gpu_pct, 50.0)
 
     def test_a_closed_client_does_not_hide_work_on_the_others(self):
         c, _ = self.counters({}, {1: ME})
@@ -182,6 +221,19 @@ class CountersTests(unittest.TestCase):
         _, adapters = self.sample(c, entries, [], now=1.0)
         self.assertIsNone(c.device.mem_used)
         self.assertIsNone(adapters[macos.ADAPTER_KEY].dedicated)
+
+    def test_discrete_mac_vram_is_not_attributed_from_footprint(self):
+        c, _ = self.counters({1: GiB}, {1: ME})
+        amd = [{"IOClass": "AMDRadeonX5000", "model": "Radeon Pro",
+                "PerformanceStatistics": {"Device Utilization %": 40, "inUseVidMemoryBytes": GiB,
+                                          "VRAM,totalMB": 8192}}]
+        self.sample(c, amd, [client(1, "game", 1_000_000_000, cid=1)], now=1.0)
+        procs, adapters = self.sample(c, amd, [client(1, "game", 2_000_000_000, cid=1)], now=2.0)
+        gpu = procs[macos.ADAPTER_KEY][1]
+        self.assertFalse(gpu.attributed)
+        self.assertNotIn("dedicated", gpu.available)
+        self.assertEqual(adapters[macos.ADAPTER_KEY].dedicated, GiB)
+        self.assertEqual(c.device.mem_total, 8192 * 1024**2)
 
     def test_failed_client_read_preserves_baseline_and_footprint_targets(self):
         c, poller = self.counters({1: GiB}, {1: ME})

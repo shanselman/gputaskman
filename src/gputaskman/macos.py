@@ -1,12 +1,11 @@
-"""macOS GPU backend (Apple Silicon): device stats and per-process GPU time from IOKit, GPU memory from footprint.
+"""macOS GPU backend: device stats and per-process GPU time from IOKit, GPU memory from footprint.
 
-Apple GPUs share one pool of memory with the CPU (unified memory), so there is no VRAM to divide up and no
-spill/commit counters. What macOS does expose without root:
+Apple Silicon and Intel integrated GPUs share system memory with the CPU. Discrete AMD GPUs in Intel Macs
+expose device-wide VRAM, but not per-process VRAM through footprint. What macOS does expose without root:
 
-- Device-wide: the IOAccelerator's PerformanceStatistics -- "Device Utilization %" and "Alloc system memory"
-  (GPU allocations across all processes).
-- Per process, for every user: each Metal client (AGXDeviceUserClient) names its creator PID and keeps a
-  cumulative accumulatedGPUTime in ns. GPU% is the change between two samples.
+- Device-wide: the IOAccelerator's PerformanceStatistics -- device utilization and GPU memory counters.
+- Per process, for every user: Metal clients name their creator PID and keep cumulative GPU time. GPU% is
+  the change between two samples.
 - Per process, own processes only: footprint(1) reports the process's memory charged to graphics (Metal
   buffers and textures) -- the "(graphics)" categories. Other users' processes (WindowServer, daemons) need
   root, so their GPU memory is unknown, never zero.
@@ -34,7 +33,11 @@ from .nvml import NvDevice
 from .pdh import AdapterGpu, ProcGpu
 
 VENDOR_APPLE = 0x106B
-ADAPTER_KEY = 1  # one integrated GPU
+VENDOR_AMD = 0x1002
+VENDOR_INTEL = 0x8086
+VENDOR_NVIDIA = 0x10DE
+VENDOR_UNKNOWN = 0
+ADAPTER_KEY = 1  # the selected macOS GPU
 _CREATOR = re.compile(r"pid (\d+)")
 # Other users' processes show only GPU time; keep the idle ones out of the table (except the compositor).
 ALWAYS_SHOWN = {"windowserver"}
@@ -55,7 +58,10 @@ class DeviceStats:
     utilization: float | None = None  # Device Utilization %
     renderer: float | None = None
     tiler: float | None = None
-    allocated: int | None = None  # Alloc system memory: GPU allocations, all processes
+    allocated: int | None = None
+    total: int | None = None
+    vendor_id: int = VENDOR_APPLE
+    process_memory_supported: bool = True
 
 
 def parse_accelerator(entries: list | None) -> DeviceStats | None:
@@ -63,11 +69,37 @@ def parse_accelerator(entries: list | None) -> DeviceStats | None:
         stats = e.get("PerformanceStatistics")
         if not isinstance(stats, dict):
             continue
-        allocated = stats.get("Alloc system memory")
-        return DeviceStats(model=str(e.get("model", "Apple GPU")), cores=e.get("gpu-core-count"),
-                           utilization=stats.get("Device Utilization %"),
+        name = str(e.get("model") or e.get("IOClass") or "Mac GPU")
+        kind = f"{name} {e.get('IOClass', '')}".lower()
+        vendor_id = VENDOR_AMD if "amd" in kind or "radeon" in kind else (
+            VENDOR_INTEL if "intel" in kind else
+            VENDOR_NVIDIA if "nvidia" in kind or "nvaccelerator" in kind else
+            VENDOR_APPLE if "apple" in kind or "agx" in kind else VENDOR_UNKNOWN)
+        if vendor_id == VENDOR_AMD:
+            allocated = stats.get("inUseVidMemoryBytes")
+            total_key = next((key for key in ("VRAM,totalMB", "vram,totalMB", "ATY,memsize")
+                              if e.get(key) is not None or stats.get(key) is not None), None)
+            total = e.get(total_key) if total_key else None
+            if total is None and total_key:
+                total = stats.get(total_key)
+            if total is not None and total_key != "ATY,memsize":
+                total = int(float(total) * (1 << 20))
+            total = int(total) if total is not None else None
+        elif vendor_id == VENDOR_INTEL:
+            allocated = stats.get("gartUsedBytes", stats.get("Alloc system memory"))
+            total = physical_memory()
+        elif vendor_id == VENDOR_APPLE:
+            allocated = stats.get("Alloc system memory")
+            total = physical_memory()
+        else:
+            allocated = None
+            total = None
+        utilization = stats.get("Device Utilization %", stats.get("GPU Activity(%)"))
+        return DeviceStats(model=name, cores=e.get("gpu-core-count"), utilization=utilization,
                            renderer=stats.get("Renderer Utilization %"), tiler=stats.get("Tiler Utilization %"),
-                           allocated=int(allocated) if allocated is not None else None)
+                           allocated=int(allocated) if allocated is not None else None, total=total,
+                           vendor_id=vendor_id,
+                           process_memory_supported=vendor_id in (VENDOR_APPLE, VENDOR_INTEL))
     return None
 
 
@@ -80,8 +112,13 @@ def parse_clients(entries: list | None) -> dict[int, dict[int, int]]:
         if not m:
             continue
         cid = e.get("IORegistryEntryID", -1 - i)
-        out[int(m[1])][cid] = sum(int(u.get("accumulatedGPUTime", 0))
-                                  for u in e.get("AppUsage") or [] if isinstance(u, dict))
+        usage = e.get("AppUsage")
+        if isinstance(usage, list):
+            elapsed = sum(int(u.get("accumulatedGPUTime", 0))
+                          for u in usage if isinstance(u, dict))
+        else:
+            elapsed = int(e.get("accumulatedGPUTime", 0))
+        out[int(m[1])][cid] = elapsed
     return dict(out)
 
 
@@ -108,7 +145,9 @@ def enumerate_adapters() -> list[Adapter]:
     dev = parse_accelerator(_ioreg("-d", "1", "-c", "IOAccelerator"))
     if dev is None:
         return []
-    return [Adapter(luid=ADAPTER_KEY, name=dev.model, vendor_id=VENDOR_APPLE, dedicated_vram=physical_memory(),
+    return [Adapter(luid=ADAPTER_KEY, name=dev.model, vendor_id=dev.vendor_id,
+                    dedicated_vram=(dev.total if dev.total is not None else
+                                    physical_memory() if dev.process_memory_supported else 0),
                     shared_system=0, software=False)]
 
 
@@ -273,7 +312,10 @@ class MacCounters:
                now: float | None = None) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         now = time.monotonic() if now is None else now  # a rate: immune to wall-clock adjustments
         accel = _ioreg("-d", "1", "-c", "IOAccelerator") if accel is None else accel
-        clients = _ioreg("-l", "-c", "AGXDeviceUserClient") if clients is None else clients
+        if clients is None:
+            clients = _ioreg("-l", "-c", "AGXDeviceUserClient")
+            if clients == []:
+                clients = _ioreg("-l", "-c", "IOAccelSubmitter2")
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
         dev = parse_accelerator(accel)
@@ -282,7 +324,9 @@ class MacCounters:
         else:
             if dev.allocated is not None:
                 adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
-            self.device = NvDevice(index=0, name=dev.model, driver_model="Metal", mem_total=physical_memory(),
+            self.device = NvDevice(index=0, name=dev.model, driver_model="Metal",
+                                   mem_total=(dev.total if dev.total is not None else
+                                              physical_memory() if dev.process_memory_supported else 0),
                                    mem_used=dev.allocated, util_gpu=dev.utilization, source="IOKit")
         if clients is None:
             # A failed client query is not an empty client list: preserve the last valid rate baseline and
@@ -323,7 +367,10 @@ class MacCounters:
                 g.available.discard("engine")
             elif pct:
                 g.engines["gpu"] = pct
-            if mine:
+            if dev and not dev.process_memory_supported:
+                g.attributed = False  # footprint doesn't prove VRAM ownership on this adapter
+                g.available.discard("dedicated")
+            elif mine:
                 if ident is not None:
                     targets.append((pct or 0.0, pid, ident))
                     size = self.poller.get(pid, ident)

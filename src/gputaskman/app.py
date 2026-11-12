@@ -22,7 +22,8 @@ from .host import HostSample, HostSampler
 from .llm import gb, redact_cmdline
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
-from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
+from .report import (DRM_RESIDENT_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
+                     macos_memory_label, macos_note,
                      inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
@@ -521,7 +522,8 @@ class GpuTaskManager(App):
         if self.monitoring:
             head = Text(name, style="bold")
         elif s.backend == "metal":
-            head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"), "  unified memory")
+            head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"),
+                                 f"  {macos_memory_label(s)}")
         else:
             info = (f"   driver {s.driver}" if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
             head = Text.assemble((name, "bold"), info + "  ",
@@ -541,7 +543,7 @@ class GpuTaskManager(App):
         other = max(s.vram_used - attributed * scale, 0) if s.vram_used is not None else 0
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
-        vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
+        vram = Text("VRAM " if s.backend != "metal" or macos_memory_label(s) == "VRAM" else "GPU mem ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
         used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
         vram.append(f" {used_label} / {vram_total_label(s)}", style="bold")
@@ -561,7 +563,7 @@ class GpuTaskManager(App):
         if s.backend == "wsl":
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
-            legend.append("\n     " + METAL_NOTE, style="grey62")
+            legend.append("\n     " + macos_note(s), style="grey62")
         if intel_memory_note(s):
             legend.append("\n     " + intel_memory_note(s), style="grey62")
         if s.counter_status:
@@ -805,8 +807,10 @@ class GpuTaskManager(App):
             elif s.backend == "drm":
                 out.append(Text(drm_note(r.gpu), style="grey62"))
             elif s.backend == "metal":
-                out.append(Text("GPU memory n/a: footprint can't read other users' processes without root "
-                                "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time.",
+                reason = ("per-process GPU memory isn't measured for this adapter." if
+                          s.adapter and s.adapter.vendor_id not in (0x106B, 0x8086) else
+                          "footprint can't read other users' processes without root or hasn't measured this one yet.")
+                out.append(Text(f"GPU memory n/a: {reason} GPU% comes from IOKit per-process GPU time.",
                                 style="grey62"))
         if s.backend == "drm" and not r.host and (r.gpu.resident_vram is not None or r.gpu.resident_gtt is not None):
             def size(v): return gb(v) if v is not None else "n/a"

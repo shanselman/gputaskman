@@ -89,6 +89,27 @@ def inferred_note(g) -> str:
 METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows show each process's graphics "
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
+
+
+def macos_memory_label(s: Snapshot) -> str:
+    vendor_id = s.adapter.vendor_id if s.adapter else 0x106B
+    return {0x1002: "VRAM", 0x8086: "shared system memory", 0x106B: "unified memory"}.get(
+        vendor_id, "GPU memory")
+
+
+def macos_note(s: Snapshot) -> str:
+    vendor_id = s.adapter.vendor_id if s.adapter else 0x106B
+    if vendor_id == 0x1002:
+        return ("macOS AMD GPU: device VRAM is measured by IOAccelerator. Per-process VRAM is unknown; "
+                "footprint reports CPU-side graphics memory, not discrete VRAM.")
+    if vendor_id == 0x8086:
+        return ("macOS Intel integrated GPU: device GART usage is shared system memory. Per-process graphics "
+                "footprint is partial; other users' processes show GPU% only unless run as root.")
+    if vendor_id == 0x106B:
+        return METAL_NOTE
+    return "macOS GPU memory counters are unavailable for this adapter; per-process GPU memory is unknown."
+
+
 INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of memory resident in the processes gputaskman can inspect "
                      "(the driver has no device-wide counter): local memory on a discrete card, system memory on "
                      "an integrated GPU. Buffers shared between processes can be counted twice, and kernel-owned "
@@ -175,8 +196,9 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     if s.backend == "metal":
         used = gb(s.vram_used) if s.vram_used is not None else "N/A"
         out.append(f"{name}  {s.driver}  Metal")
-        out.append(f"GPU memory {used} allocated / {gb(s.vram_total)} unified")
-        out.append(METAL_NOTE)
+        label = macos_memory_label(s)
+        out.append(f"{label} {used} allocated / {vram_total_label(s)}")
+        out.append(macos_note(s))
         if nv:
             out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}")
     else:
