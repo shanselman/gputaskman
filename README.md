@@ -4,7 +4,8 @@
 
 Windows with NVIDIA/AMD telemetry and Intel WDDM activity, plus Linux and WSL support (NVIDIA
 everywhere, AMD and Intel on native Linux; see
-[Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
+[Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon and Intel (see
+[macOS](#macos-apple-silicon-and-intel)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
 
@@ -389,18 +390,18 @@ For a flake-based NixOS configuration, add this repository as a `gputaskman` inp
 The flake was contributed and checked on x86_64 NixOS 26.05; CI does not build it, and ARM64 has
 not been validated.
 
-## macOS (Apple Silicon)
+## macOS (Apple Silicon and Intel)
 
-Run from a clone (`uv run gputaskman`); there is no portable macOS download yet. Apple GPUs share
-one pool of memory with the CPU, so there is no VRAM to split and no spill/commit counters. What
-macOS exposes without root:
+Run from a clone (`uv run gputaskman`); there is no portable macOS download yet. Apple Silicon and
+Intel integrated GPUs share system memory with the CPU. Intel Macs with an AMD discrete GPU have
+separate VRAM. What macOS exposes without root:
 
 | Column | Source | Who |
 |---|---|---|
-| GPU memory (header) | IOAccelerator `PerformanceStatistics`: `Alloc system memory` (all GPU allocations) out of physical RAM | device |
-| GPU% (header) | `Device Utilization %` | device |
-| GPU% | Each Metal client (`AGXDeviceUserClient`) names its creator PID and keeps a cumulative `accumulatedGPUTime`; the rate between samples, per client (a closed client never hides the others' work) | every process |
-| VRAM | `footprint`: the process's memory macOS charges to graphics (the `(graphics)` categories: Metal buffers, textures) | your own processes |
+| GPU memory (header) | IOAccelerator `PerformanceStatistics`: `Alloc system memory` on Apple Silicon, GART usage on Intel integrated graphics, or `inUseVidMemoryBytes` on AMD discrete graphics. The Intel GART total is `gartSizeBytes`, when available; the AMD total comes from the matching PCI device when exposed | device |
+| GPU% (header) | IOAccelerator `PerformanceStatistics`: `Device Utilization %` (or `GPU Activity(%)` when that is the driver's key) | device |
+| GPU% | Apple Silicon Metal clients (`AGXDeviceUserClient`) or Intel Mac submitters (`IOAccelSubmitter2`) report cumulative `accumulatedGPUTime`; the rate is measured per client (a closed client never hides the others' work) | every process, when the driver exposes it |
+| GPU memory | `footprint`: memory macOS charges to graphics (the `(graphics)` categories: Metal buffers, textures) | your own processes on Apple Silicon / Intel integrated graphics |
 | Runtime, model files | Mapped files from `proc_pidinfo` region walks (psutil has no memory maps on macOS): `libggml*.dylib`, `libllama*.dylib`, `libmlx*.dylib`, `libtorch_cpu.dylib`, the Metal driver bundle | your own processes |
 
 Other users' processes (WindowServer, system daemons) show GPU% with memory `n/a`: `footprint` needs
@@ -413,8 +414,16 @@ never shows the previous process's numbers.
 
 Metal reports one GPU time per process, with no 3D/compute/copy/video split, so those columns show
 `n/a`; a Metal process above 10% GPU is classified `3D/game` unless something more specific applies
-(AI runtime, browser, compositor). Spill, paged, clocks, power, and temperature are not available, so
-the chart picker offers only GPU and GPU memory. Handy's log is read from
+(AI runtime, browser, compositor). AMD discrete per-process VRAM is unknown: `footprint` only reports
+CPU-side graphics memory, not GPU-only allocations. Spill, paged, clocks, power, and temperature are
+not available, so the chart picker offers only GPU and GPU memory. Other unrecognized GPU memory
+counters remain unknown. Intel Mac device and process counters have not yet been validated on
+hardware; dual-GPU switching and eGPUs are not validated. Adapters are matched to readings by IOKit
+registry identity, not enumeration order. When multiple accelerators are present, process data is
+unavailable because their clients cannot yet be reliably paired to an individual GPU. Restart after
+GPU topology changes to rediscover adapters. A device without a usable identity or memory total is
+not guessed.
+Handy's log is read from
 `~/Library/Logs/com.pais.handy/handy.log`.
 
 Live check on an M4 Mac mini (macOS 26.3.1): a PyTorch MPS job with a 2 GiB buffer and a matmul loop
@@ -917,6 +926,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
+| macOS: AMD PCI registry tree (`ioreg`) | Not measured on Intel Mac hardware | At adapter discovery and once per collector when AMD is present; 5 s command timeout, no per-refresh tree scan |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
 | System RAM/CPU: process list + psutil totals | Windows (`NtQuerySystemInformation`): ~28 ms median for 995 processes (Windows 11, RTX 4080 SUPER machine, 32 threads); the contributor measured ~6 ms for ~480 processes (Windows 11, i9-13900K). Linux under WSL2 (psutil): ~3.4 ms median for 44 processes, ~9.5 ms for the first sample of 123; the per-pid reuse check (`is_running()`) adds ~0.3 ms for 44 processes, about 7 µs each | Every refresh; `--no-system` turns it off. psutil's per-process `memory_info`/`cpu_times` took ~6 s per pass for 995 processes on Windows, so it is only the non-Windows path. macOS unmeasured |
@@ -1091,8 +1101,8 @@ downloads are bundled in this repository.
 - Reliable multi-GPU matching and per-device model placement.
 - Intel `xe` per-process memory and load (`drm-cycles-*`), the Intel GT clock in the device panel, and Intel
   validation beyond the Arc A770 / UHD 730 pair.
-- macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
-  `swapped`) as the paged column.
+- macOS: a portable build, Intel Mac hardware validation, Ollama/llama.cpp/MLX validation, and
+  compressed GPU memory (footprint's `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
 - Replay and summaries of a `gputaskman record` file; today any one line works with `diff`.
