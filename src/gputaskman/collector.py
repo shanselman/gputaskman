@@ -220,6 +220,8 @@ class Collector:
         with ExitStack() as resources:
             self.counters = GpuCounters()
             resources.callback(self.counters.close)
+            if BACKEND == "metal":
+                self.counters.select_adapter(self.adapter, len(self.adapters) > 1)
             self.nvml = Nvml()
             resources.callback(self.nvml.close)
             self.amdsmi = AmdSmi(self.adapter, self.adapters)
@@ -341,7 +343,8 @@ class Collector:
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
-        total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
+        total = (((nv.mem_total or 0) if nv else 0) if BACKEND == "metal" else
+                 (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0))
 
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
@@ -354,6 +357,9 @@ class Collector:
             shared_is_spill=not (self.drm_card is not None and self.drm_card.integrated),
         )
 
+        if BACKEND == "metal":
+            snap.counter_status = self.counters.status
+            snap.process_memory_available = self.counters.process_memory_available
         snap.host_status = self.host_status
         if BACKEND == "wddm" and self.adapter:
             snap.counter_adapter_matched = luid in per_luid or luid in adapters

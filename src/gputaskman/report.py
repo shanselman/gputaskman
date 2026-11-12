@@ -92,18 +92,18 @@ METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows 
 
 
 def macos_memory_label(s: Snapshot) -> str:
-    vendor_id = s.adapter.vendor_id if s.adapter else 0x106B
+    vendor_id = s.adapter.vendor_id if s.adapter else 0
     return {0x1002: "VRAM", 0x8086: "shared system memory", 0x106B: "unified memory"}.get(
         vendor_id, "GPU memory")
 
 
 def macos_note(s: Snapshot) -> str:
-    vendor_id = s.adapter.vendor_id if s.adapter else 0x106B
+    vendor_id = s.adapter.vendor_id if s.adapter else 0
     if vendor_id == 0x1002:
-        return ("macOS AMD GPU: device VRAM is measured by IOAccelerator. Per-process VRAM is unknown; "
+        return ("macOS AMD GPU: device VRAM is reported by IOAccelerator when available. Per-process VRAM is unknown; "
                 "footprint reports CPU-side graphics memory, not discrete VRAM.")
     if vendor_id == 0x8086:
-        return ("macOS Intel integrated GPU: device GART usage is shared system memory. Per-process graphics "
+        return ("macOS Intel integrated GPU: device usage is driver-reported shared system memory. Per-process graphics "
                 "footprint is partial; other users' processes show GPU% only unless run as root.")
     if vendor_id == 0x106B:
         return METAL_NOTE

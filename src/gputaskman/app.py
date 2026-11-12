@@ -808,7 +808,7 @@ class GpuTaskManager(App):
                 out.append(Text(drm_note(r.gpu), style="grey62"))
             elif s.backend == "metal":
                 reason = ("per-process GPU memory isn't measured for this adapter." if
-                          s.adapter and s.adapter.vendor_id not in (0x106B, 0x8086) else
+                          not s.adapter or s.adapter.vendor_id not in (0x106B, 0x8086) else
                           "footprint can't read other users' processes without root or hasn't measured this one yet.")
                 out.append(Text(f"GPU memory n/a: {reason} GPU% comes from IOKit per-process GPU time.",
                                 style="grey62"))

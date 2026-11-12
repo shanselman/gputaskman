@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import plistlib
 import re
@@ -37,7 +38,7 @@ VENDOR_AMD = 0x1002
 VENDOR_INTEL = 0x8086
 VENDOR_NVIDIA = 0x10DE
 VENDOR_UNKNOWN = 0
-ADAPTER_KEY = 1  # the selected macOS GPU
+ADAPTER_KEY = 1  # legacy key when the only accelerator has no registry ID
 _CREATOR = re.compile(r"pid (\d+)")
 # Other users' processes show only GPU time; keep the idle ones out of the table (except the compositor).
 ALWAYS_SHOWN = {"windowserver"}
@@ -64,40 +65,116 @@ class DeviceStats:
     process_memory_supported: bool = True
 
 
-def parse_accelerator(entries: list | None) -> DeviceStats | None:
+def _number(value) -> int | None:
+    if isinstance(value, bytes):
+        return int.from_bytes(value, "little") if len(value) in (4, 8) else None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 0xFFFFFFFFFFFFFFFF else None
+    if isinstance(value, float):
+        return int(value) if 0 <= value < 2**64 and value.is_integer() else None
+    if isinstance(value, str) and len(value) <= 20 and value.isascii() and value.isdecimal():
+        return _number(int(value))
+    return None
+
+
+def _first_number(*values) -> int | None:
+    return next((number for value in values if (number := _number(value)) is not None), None)
+
+
+def _metric(*values) -> float | None:
+    for value in values:
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and 0 <= value <= 0xFFFFFFFFFFFFFFFF and math.isfinite(value)):
+            return value
+        number = _number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _model(value) -> str:
+    if isinstance(value, bytes):
+        return value.rstrip(b"\0").decode("utf-8", "replace")
+    return value if isinstance(value, str) else ""
+
+
+def _pci_parents(entries: list | None) -> dict[int, dict]:
+    """Map accelerator registry IDs to their nearest PCI ancestor, never by model or list order."""
+    parents: dict[int, dict] = {}
+    ambiguous: set[int] = set()
+
+    def visit(entry, pci=None):
+        if not isinstance(entry, dict):
+            return
+        if entry.get("IOClass") == "IOPCIDevice":
+            pci = entry
+        if pci is not None and isinstance(entry.get("PerformanceStatistics"), dict):
+            key = _number(entry.get("IORegistryEntryID"))
+            if key is not None and key not in ambiguous:
+                if key in parents:
+                    parents.pop(key)
+                    ambiguous.add(key)
+                else:
+                    parents[key] = {k: pci[k] for k in ("model", "VRAM,totalMB", "vram,totalMB", "ATY,memsize")
+                                    if k in pci}
+        for child in entry.get("IORegistryEntryChildren") or []:
+            visit(child, pci)
+
+    for entry in entries or []:
+        visit(entry)
+    return parents
+
+
+def _read_pci_parents() -> dict[int, dict]:
+    return _pci_parents(_ioreg("-l", "-p", "IOService", "-c", "IOPCIDevice"))
+
+
+def _has_amd(entries: list | None) -> bool:
+    return any(any(label in f"{_model(e.get('model'))} {e.get('IOClass', '')}".lower()
+                   for label in ("amd", "radeon"))
+               for e in entries or [] if isinstance(e, dict))
+
+
+def parse_accelerator(entries: list | None, parents: dict[int, dict] | None = None) -> DeviceStats | None:
     for e in entries or []:
+        if not isinstance(e, dict):
+            continue
         stats = e.get("PerformanceStatistics")
         if not isinstance(stats, dict):
             continue
-        name = str(e.get("model") or e.get("IOClass") or "Mac GPU")
+        parent = (parents or {}).get(_number(e.get("IORegistryEntryID")), {})
+        name = _model(e.get("model")) or _model(parent.get("model")) or _model(e.get("IOClass")) or "Mac GPU"
         kind = f"{name} {e.get('IOClass', '')}".lower()
         vendor_id = VENDOR_AMD if "amd" in kind or "radeon" in kind else (
             VENDOR_INTEL if "intel" in kind else
             VENDOR_NVIDIA if "nvidia" in kind or "nvaccelerator" in kind else
             VENDOR_APPLE if "apple" in kind or "agx" in kind else VENDOR_UNKNOWN)
         if vendor_id == VENDOR_AMD:
-            allocated = stats.get("inUseVidMemoryBytes")
-            total_key = next((key for key in ("VRAM,totalMB", "vram,totalMB", "ATY,memsize")
-                              if e.get(key) is not None or stats.get(key) is not None), None)
-            total = e.get(total_key) if total_key else None
-            if total is None and total_key:
-                total = stats.get(total_key)
-            if total is not None and total_key != "ATY,memsize":
-                total = int(float(total) * (1 << 20))
-            total = int(total) if total is not None else None
+            allocated = _number(stats.get("inUseVidMemoryBytes"))
+            total = None
+            for key in ("VRAM,totalMB", "vram,totalMB", "ATY,memsize"):
+                total = _first_number(parent.get(key), e.get(key), stats.get(key))
+                if total is not None:
+                    total = _number(total * (1 if key == "ATY,memsize" else 1 << 20))
+                    break
         elif vendor_id == VENDOR_INTEL:
-            allocated = stats.get("gartUsedBytes", stats.get("Alloc system memory"))
-            total = physical_memory()
+            allocated = _number(stats.get("gartUsedBytes"))
+            total = _number(stats.get("gartSizeBytes")) if allocated is not None else None
+            if allocated is None:
+                allocated = _number(stats.get("Alloc system memory"))
         elif vendor_id == VENDOR_APPLE:
-            allocated = stats.get("Alloc system memory")
+            allocated = _number(stats.get("Alloc system memory"))
             total = physical_memory()
         else:
             allocated = None
             total = None
-        utilization = stats.get("Device Utilization %", stats.get("GPU Activity(%)"))
-        return DeviceStats(model=name, cores=e.get("gpu-core-count"), utilization=utilization,
-                           renderer=stats.get("Renderer Utilization %"), tiler=stats.get("Tiler Utilization %"),
-                           allocated=int(allocated) if allocated is not None else None, total=total,
+        utilization = _metric(stats.get("Device Utilization %"), stats.get("GPU Activity(%)"))
+        return DeviceStats(model=name, cores=_number(e.get("gpu-core-count")), utilization=utilization,
+                           renderer=_metric(stats.get("Renderer Utilization %")),
+                           tiler=_metric(stats.get("Tiler Utilization %")),
+                           allocated=allocated, total=total,
                            vendor_id=vendor_id,
                            process_memory_supported=vendor_id in (VENDOR_APPLE, VENDOR_INTEL))
     return None
@@ -142,13 +219,31 @@ def macos_version() -> str:
 
 
 def enumerate_adapters() -> list[Adapter]:
-    dev = parse_accelerator(_ioreg("-d", "1", "-c", "IOAccelerator"))
-    if dev is None:
-        return []
-    return [Adapter(luid=ADAPTER_KEY, name=dev.model, vendor_id=dev.vendor_id,
-                    dedicated_vram=(dev.total if dev.total is not None else
-                                    physical_memory() if dev.process_memory_supported else 0),
-                    shared_system=0, software=False)]
+    entries = _ioreg("-d", "1", "-c", "IOAccelerator")
+    parents = _read_pci_parents() if _has_amd(entries) else {}
+    has_id = any(_number(e.get("IORegistryEntryID")) is not None
+                 for e in entries or [] if isinstance(e, dict))
+    return [Adapter(luid=key, name=dev.model, vendor_id=dev.vendor_id,
+                    dedicated_vram=dev.total if dev.total is not None else 0,
+                    shared_system=0, software=False)
+            for key, dev in _devices(entries, parents).items() if has_id or dev.vendor_id == VENDOR_APPLE]
+
+
+def _devices(entries: list | None, parents: dict[int, dict] | None = None) -> dict[int, DeviceStats]:
+    candidates = [e for e in entries or [] if isinstance(e, dict)]
+    ids = [_number(e.get("IORegistryEntryID")) for e in candidates]
+    devices = {}
+    for entry, key in zip(candidates, ids):
+        if key is None:
+            if len(candidates) != 1:
+                continue
+            key = ADAPTER_KEY
+        elif ids.count(key) != 1:
+            continue
+        dev = parse_accelerator([entry], parents)
+        if dev is not None:
+            devices[key] = dev
+    return devices
 
 
 def _owner(pid: int) -> int | None:
@@ -291,9 +386,28 @@ class MacCounters:
         self._owners: dict[int, int | None] = {}
         self._names: dict[int, str] = {}
         self._unknown_identity: set[int] = set()
+        self._pci_parents: dict[int, dict] | None = None
+        self._selected: Adapter | None = None
+        self._selection_set = False
+        self._multiple = False
+        self._sampled_key: int | None = None
+        self.status = ""
+        self.process_memory_available = True
         self.poller = poller or FootprintPoller()
         self.poller.start()
         self.sample()  # baseline: GPU% is a rate, like the WDDM counters' first collection
+
+    def select_adapter(self, adapter: Adapter | None, multiple: bool = False) -> None:
+        keep_baseline = (adapter is not None and adapter.luid == self._sampled_key
+                         and self.device is not None and self.device.name == adapter.name
+                         and not multiple and not self._multiple)
+        self._selected = adapter
+        self._selection_set = True
+        self._multiple = self._multiple or multiple
+        if not keep_baseline:
+            self._prev.clear()
+            self._last = None
+            self.poller.set_targets([])
 
     def warm_up(self, timeout: float) -> None:
         """One-shot output: wait for a full footprint pass so own processes have their GPU memory."""
@@ -318,19 +432,49 @@ class MacCounters:
                 clients = _ioreg("-l", "-c", "IOAccelSubmitter2")
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
-        dev = parse_accelerator(accel)
+        if self._pci_parents is None and _has_amd(accel):
+            self._pci_parents = _read_pci_parents()
+        candidates = [e for e in accel or [] if isinstance(e, dict)]
+        if len(candidates) > 1:
+            self._multiple = True
+        devices = _devices(accel, self._pci_parents)
+        key = self._selected.luid if self._selected else next(iter(devices), ADAPTER_KEY)
+        dev = devices.get(key)
+        if self._selection_set and self._selected is None:
+            dev = None
+        if (self._selected and self._selected.vendor_id != VENDOR_APPLE and len(candidates) == 1
+                and _number(candidates[0].get("IORegistryEntryID")) is None):
+            dev = None
+        if dev and self._selected and (dev.vendor_id != self._selected.vendor_id or
+                                       (key == ADAPTER_KEY and dev.model != self._selected.name)):
+            dev = None
+        self.status = ""
+        self.process_memory_available = bool(dev and dev.process_memory_supported and not self._multiple)
+        self._sampled_key = key if dev is not None else None
         if dev is None:
             self.device = None  # no reading this time: never keep showing the last one as current
+            self.status = "Selected macOS GPU is unavailable or cannot be matched to its registry identity."
         else:
             if dev.allocated is not None:
-                adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
+                adapters[key].dedicated = float(dev.allocated)
             self.device = NvDevice(index=0, name=dev.model, driver_model="Metal",
-                                   mem_total=(dev.total if dev.total is not None else
-                                              physical_memory() if dev.process_memory_supported else 0),
+                                   mem_total=dev.total or None,
                                    mem_used=dev.allocated, util_gpu=dev.utilization, source="IOKit")
+            if dev.allocated is not None and not dev.total:
+                self.status = "macOS GPU memory total is unavailable from the matching driver counter."
+        if dev is None or self._multiple:
+            if self._multiple and dev is not None:
+                self.status = " ".join(filter(None, (self.status,
+                    "Multiple macOS GPUs: per-process GPU data cannot be matched to a selected GPU.")))
+            self._prev.clear()
+            self._last = None
+            self.poller.set_targets([])
+            return procs, adapters
         if clients is None:
             # A failed client query is not an empty client list: preserve the last valid rate baseline and
             # footprint targets so the next successful sample spans the full elapsed interval.
+            self.process_memory_available = False
+            self.status = " ".join(filter(None, (self.status, "macOS GPU process counters are unavailable.")))
             return procs, adapters
         per_pid = parse_clients(clients)
         elapsed = now - self._last if self._last is not None else None
@@ -362,6 +506,8 @@ class MacCounters:
             if pid not in self._owners:
                 self._owners[pid] = self._owner(pid)
             mine = self._root or self._owners[pid] == self._uid
+            if not mine and (pct is None or pct < 0.5) and self._name(pid).lower() not in ALWAYS_SHOWN:
+                continue
             g = ProcGpu()
             if pct is None:
                 g.available.discard("engine")
@@ -382,9 +528,7 @@ class MacCounters:
                     g.dedicated = float(size)
             else:
                 g.attributed = False  # footprint needs root for other users' processes
-                if (pct is None or pct < 0.5) and self._name(pid).lower() not in ALWAYS_SHOWN:
-                    continue
-            procs[ADAPTER_KEY][pid] = g
+            procs[key][pid] = g
         self._prev, self._last = current, now
         self._unknown_identity.intersection_update(per_pid)
         self._owners = {p: o for p, o in self._owners.items() if p in per_pid}
