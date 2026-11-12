@@ -31,12 +31,14 @@ _unsafe = False
 
 
 def mark_unsafe() -> None:
-    """An NVIDIA adapter went away: skip nvmlShutdown() from now on and let process exit clean up."""
+    """An NVML call faulted: make no further DLL calls and let process exit clean up."""
     global _unsafe
     _unsafe = True
 
 
 def _try(fn, *a, default=None):
+    if _unsafe:
+        return default
     try:
         return fn(*a)
     except Exception:
@@ -55,21 +57,28 @@ class Nvml:
 
     def refresh(self) -> None:
         """Reacquire handles without sampling telemetry or restarting a healthy NVML session."""
-        if N is None:
+        if N is None or _unsafe:
             return
         if self.needs_reset:
             self.close()
             self.needs_reset = False
         if not self.ok:
             try:
+                if _unsafe:
+                    return
                 N.nvmlInit()
             except Exception:
                 return
             self.ok = True
         try:
+            if _unsafe:
+                return
+            count = N.nvmlDeviceGetCount()
             handles = []
             reset_needed = False
-            for i in range(N.nvmlDeviceGetCount()):
+            for i in range(count):
+                if _unsafe:
+                    return
                 try:
                     handles.append((i, N.nvmlDeviceGetHandleByIndex(i)))
                 except Exception as error:
@@ -88,6 +97,8 @@ class Nvml:
             self.cuda_version = f"{cv // 1000}.{(cv % 1000) // 10}"
 
     def _read(self, fn, *args, default=None):
+        if _unsafe:
+            return default
         try:
             return fn(*args)
         except OSError:  # access violation inside nvml.dll, not an NVML error code
@@ -100,7 +111,11 @@ class Nvml:
 
     def sample(self) -> list[NvDevice]:
         out = []
+        if _unsafe:
+            return out
         for i, h in self.handles:
+            if _unsafe:
+                break
             self._faulted = False
             d = NvDevice(index=i)
             d.name = self._read(N.nvmlDeviceGetName, h, default="?")

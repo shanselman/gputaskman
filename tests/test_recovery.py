@@ -471,7 +471,7 @@ class NvmlRecoveryTests(TestCase):
             self.assertFalse(nv.needs_reset)
             nv.close()
 
-    def test_access_violation_stops_reading_that_gpu_and_skips_hanging_shutdown(self):
+    def test_access_violation_stops_all_nvml_reads_and_skips_hanging_shutdown(self):
         class Api(SimpleNamespace):
             def __getattr__(self, name):
                 return 0 if name.startswith("NVML_") else lambda *args: None
@@ -490,8 +490,8 @@ class NvmlRecoveryTests(TestCase):
             self.assertEqual([(d.pci_bus, d.temp) for d in nv.sample()], [("00000000:01:00.0", 40)])
             self.assertEqual(nvml.LOST, {"00000000:05:00.0"})
             calls = api.nvmlDeviceGetTemperature.call_count
-            self.assertEqual(len(nv.sample()), 1)
-            self.assertEqual(api.nvmlDeviceGetTemperature.call_count, calls + 1)  # the lost GPU is skipped
+            self.assertEqual(nv.sample(), [])
+            self.assertEqual(api.nvmlDeviceGetTemperature.call_count, calls)
             nv.close()
             api.nvmlShutdown.assert_not_called()
 

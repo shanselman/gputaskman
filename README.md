@@ -525,13 +525,18 @@ An NVIDIA GPU in **TCC** mode (a datacenter card, or a mining card such as the P
 display driver, so Windows lists no adapter for it and publishes no GPU counters. On Windows,
 gputaskman asks NVML, once when it starts, for TCC devices that DXGI did not list and adds them
 **after** the listed adapters, so no existing GPU number moves. `--list-gpus` marks them
-`TCC compute-only` with their PCI address, and `--gpu N` selects one. Adapter VRAM and each
+`TCC compute-only` with their PCI address (including the PCI domain when nonzero), and `--gpu N`
+selects one. Adapter VRAM and each
 process's VRAM come from NVML. NVML documents per-process memory as always unavailable under WDDM
 (Windows manages it, not the NVIDIA driver), so a TCC GPU is where it should be reported; a process
 whose memory the driver does not report is `n/a`, never 0. Engine load, shared memory and commit are
 `n/a`, and no model breakdown is attempted because it needs the shared memory counter too. A TCC GPU
 added or removed while gputaskman runs needs a restart to be noticed. This is covered by mocks, and
-the same code path was run against a WDDM GPU (RTX 4080 SUPER, NVIDIA 630.20: adapter VRAM matched
+`--list-gpus` reports whether NVML found no TCC GPU or could not complete its probe; raw driver
+exception details are not printed. To validate a real TCC card, run `gputaskman --list-gpus`, then
+`gputaskman --once --gpu N` for the TCC index and compare device and per-process VRAM with
+`nvidia-smi` under the same workload. Record the GPU, driver and workload. The same code path was run
+against a WDDM GPU (RTX 4080 SUPER, NVIDIA 630.20: adapter VRAM matched
 `nvidia-smi` to the MiB with and without a 1 GiB CUDA allocation, and every per-process number stayed
 `n/a`, as NVML documents for WDDM). It is **not validated on TCC hardware**, so per-process VRAM on a
 real TCC card is expected, not confirmed.

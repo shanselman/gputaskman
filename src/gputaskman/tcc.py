@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import threading
 
 from . import nvml as nvml_mod
-from .amdsmi import _bdf
 from .dxgi import VENDOR_NVIDIA, Adapter
 from .nvml import Nvml
 from .pdh import AdapterGpu, ProcGpu
@@ -18,9 +18,19 @@ class TccAdapter(Adapter):
     looks the same for every adapter. Its luid is made up from the PCI address, so it is the same on every run
     (`diff` pairs adapters by it)."""
 
+    def __init__(self, luid: int, name: str, vendor_id: int, dedicated_vram: int, shared_system: int, software: bool,
+                 pci_address: tuple[int, int, int] | None = None, pci_domain: int = 0) -> None:
+        super().__init__(luid, name, vendor_id, dedicated_vram, shared_system, software, pci_address)
+        self._pci_domain = pci_domain
+
+    @property
+    def pci_domain(self) -> int:
+        return self._pci_domain
+
 
 _lock = threading.Lock()
 _found: list[TccAdapter] | None = None  # NVML is asked once per process
+_discovery_status = ""
 
 
 def _text(value) -> str:
@@ -34,46 +44,92 @@ def _value(v) -> int | None:
     return int(v)
 
 
+def _pci_identity(value) -> tuple[int, tuple[int, int, int]] | None:
+    text = _text(value)
+    match = re.fullmatch(r"([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+)\.([0-9a-fA-F]+)", text)
+    if not match:
+        return None
+    domain, bus, device, function = (int(part, 16) for part in match.groups())
+    if domain > 0xFFFFFFFF or bus > 0xFF or device > 0x1F or function > 7:
+        return None
+    return domain, (bus, device, function)
+
+
+def _nvml_call(N, name: str, *args):
+    if nvml_mod._unsafe:
+        raise RuntimeError("NVML is marked unsafe")
+    return getattr(N, name)(*args)
+
+
 def _read_device(N, index: int) -> TccAdapter | None:
-    handle = N.nvmlDeviceGetHandleByIndex(index)
-    if N.nvmlDeviceGetDriverModel(handle)[0] != NVML_DRIVER_TCC:
+    handle = _nvml_call(N, "nvmlDeviceGetHandleByIndex", index)
+    if _nvml_call(N, "nvmlDeviceGetDriverModel", handle)[0] != NVML_DRIVER_TCC:
         return None
-    bdf = _bdf(_text(N.nvmlDeviceGetPciInfo(handle).busId))
-    if bdf is None:  # another PCI domain: DXGI's address has none, so this GPU could not be paired
-        return None
-    return TccAdapter(luid=(1 << 62) | bdf[0] << 16 | bdf[1] << 8 | bdf[2], name=_text(N.nvmlDeviceGetName(handle)),
-                      vendor_id=VENDOR_NVIDIA, dedicated_vram=N.nvmlDeviceGetMemoryInfo(handle).total,
-                      shared_system=0, software=False, pci_address=bdf)
+    identity = _pci_identity(_nvml_call(N, "nvmlDeviceGetPciInfo", handle).busId)
+    if identity is None:
+        raise ValueError("NVML returned an invalid PCI address")
+    domain, bdf = identity
+    packed_bdf = bdf[0] << 8 | bdf[1] << 3 | bdf[2]
+    luid = (1 << 62) | domain << 16 | packed_bdf
+    return TccAdapter(luid=luid, name=_text(_nvml_call(N, "nvmlDeviceGetName", handle)),
+                      vendor_id=VENDOR_NVIDIA, dedicated_vram=_nvml_call(N, "nvmlDeviceGetMemoryInfo", handle).total,
+                      shared_system=0, software=False, pci_address=bdf, pci_domain=domain)
 
 
 def _discover() -> list[TccAdapter]:
+    global _discovery_status
     N = nvml_mod.N
     if N is None:
+        _discovery_status = "NVML is unavailable; TCC GPUs could not be checked."
+        return []
+    if nvml_mod._unsafe:
+        _discovery_status = "NVML is marked unsafe; TCC GPUs were not checked."
         return []
     try:
-        N.nvmlInit()
+        _nvml_call(N, "nvmlInit")
     except Exception:
+        _discovery_status = "NVML initialization failed; TCC GPUs could not be checked."
         return []
-    found, faulted = [], False
+    found, faulted, failed, shutdown_failed = [], False, False, False
     try:
-        for i in range(N.nvmlDeviceGetCount()):
+        for i in range(_nvml_call(N, "nvmlDeviceGetCount")):
+            if nvml_mod._unsafe:
+                failed = True
+                break
             try:
                 adapter = _read_device(N, i)
             except Exception as error:  # one unreadable device must not hide a TCC peer
+                failed = True
                 faulted |= isinstance(error, OSError)  # an access violation inside nvml.dll
                 continue
             if adapter is not None:
                 found.append(adapter)
     except Exception as error:
+        failed = True
         faulted |= isinstance(error, OSError)
     if faulted:
         nvml_mod.mark_unsafe()  # nvmlShutdown() can hang after a fault; process exit cleans up
     if not nvml_mod._unsafe:
         try:
-            N.nvmlShutdown()
+            _nvml_call(N, "nvmlShutdown")
         except Exception:
-            pass
+            shutdown_failed = True
+    if nvml_mod._unsafe:
+        _discovery_status = "NVML encountered an unsafe driver fault; TCC discovery is incomplete."
+    elif failed:
+        _discovery_status = "NVML TCC discovery was incomplete; one or more devices could not be read."
+    elif found:
+        _discovery_status = f"NVML TCC discovery succeeded; found {len(found)} TCC GPU(s)."
+    else:
+        _discovery_status = "NVML TCC discovery succeeded; no TCC GPUs found."
+    if shutdown_failed:
+        _discovery_status += " NVML shutdown failed."
     return found
+
+
+def tcc_discovery_status() -> str:
+    """A safe, user-facing summary of the one-time TCC discovery attempt."""
+    return _discovery_status
 
 
 def tcc_adapters(listed: list[Adapter]) -> list[Adapter]:
@@ -85,7 +141,7 @@ def tcc_adapters(listed: list[Adapter]) -> list[Adapter]:
             _found = _discover()
         found = list(_found)
     seen = {a.pci_address for a in listed if a.pci_address}
-    return [a for a in found if a.pci_address not in seen]
+    return [a for a in found if a.pci_domain != 0 or a.pci_address not in seen]
 
 
 class TccCounters:
@@ -111,7 +167,7 @@ class TccCounters:
             for _index, handle in self._handles:
                 pci = nvml._read(nvml_mod.N.nvmlDeviceGetPciInfo, handle)
                 bus = _text(pci.busId) if pci is not None else ""
-                if _bdf(bus) == self.adapter.pci_address:
+                if _pci_identity(bus) == (self.adapter.pci_domain, self.adapter.pci_address):
                     self._located = (handle, bus)
                     break
         return self._located
@@ -119,7 +175,8 @@ class TccCounters:
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         nvml = self.nvml
         located = self._locate() if nvml.ok else None
-        if located is None or any(_bdf(bus) == self.adapter.pci_address for bus in nvml_mod.LOST):
+        if located is None or any(_pci_identity(bus) == (self.adapter.pci_domain, self.adapter.pci_address)
+                                  for bus in nvml_mod.LOST):
             return {}, {}
         handle, bus = located
         N = nvml_mod.N

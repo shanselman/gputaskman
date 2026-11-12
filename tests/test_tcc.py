@@ -36,8 +36,10 @@ def listed_adapter(luid, vendor=VENDOR_NVIDIA, bus=1, total=16 * GiB):
     return Adapter(luid, f"GPU at {bus}", vendor, total, 0, False, (bus, 0, 0))
 
 
-def tcc_adapter(bus=0x0A, name="Tesla P40", total=24 * GiB):
-    return TccAdapter((1 << 62) | bus << 16, name, VENDOR_NVIDIA, total, 0, False, (bus, 0, 0))
+def tcc_adapter(bus=0x0A, name="Tesla P40", total=24 * GiB, domain=0):
+    packed_bdf = bus << 8
+    luid = (1 << 62) | domain << 16 | packed_bdf
+    return TccAdapter(luid, name, VENDOR_NVIDIA, total, 0, False, (bus, 0, 0), domain)
 
 
 def device(bus, *, model=1, pending=None, name="Tesla P40", total=24 * GiB, used=0, processes=(), bus_id=None):
@@ -144,7 +146,8 @@ class TccTestCase(unittest.TestCase):
     def setUp(self):
         self.api = FakeNvml()
         for target, value in (("gputaskman.nvml.N", self.api), ("gputaskman.nvml._unsafe", False),
-                              ("gputaskman.nvml.LOST", set()), ("gputaskman.tcc._found", None)):
+                              ("gputaskman.nvml.LOST", set()), ("gputaskman.tcc._found", None),
+                              ("gputaskman.tcc._discovery_status", "")):
             patcher = patch(target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -186,9 +189,24 @@ class DiscoveryTests(TccTestCase):
         elsewhere = Adapter(8, "Tesla P40", VENDOR_NVIDIA, 24 * GiB, 0, False, (0x0B, 0, 0))
         self.assertEqual(len(tcc_adapters([unpaired, elsewhere])), 1)
 
-    def test_a_gpu_in_another_pci_domain_cannot_be_paired_and_is_skipped(self):
+    def test_a_nonzero_pci_domain_is_preserved_in_tcc_identity(self):
         self.api.devices = [device(1, bus_id="00010000:01:00.0"), device(2)]
-        self.assertEqual([a.pci_address for a in tcc_adapters([])], [(2, 0, 0)])
+        found = tcc_adapters([])
+        self.assertEqual([(a.pci_domain, a.pci_address) for a in found], [(0x10000, (1, 0, 0)), (0, (2, 0, 0))])
+        self.assertNotEqual(found[0].luid, found[1].luid)
+
+    def test_identical_bdf_values_in_different_domains_have_distinct_ids(self):
+        self.api.devices = [device(1, bus_id="00000000:01:00.0"), device(2, bus_id="00010000:01:00.0")]
+        found = tcc_adapters([])
+        self.assertEqual([(a.pci_domain, a.pci_address) for a in found],
+                         [(0, (1, 0, 0)), (0x10000, (1, 0, 0))])
+        self.assertEqual(len({a.luid for a in found}), 2)
+
+    def test_only_domain_zero_can_be_deduplicated_against_dxgi(self):
+        self.api.devices = [device(1, bus_id="00000000:01:00.0"), device(2, bus_id="00010000:01:00.0")]
+        listed = Adapter(7, "Listed GPU", VENDOR_NVIDIA, 24 * GiB, 0, False, (1, 0, 0))
+        found = tcc_adapters([listed])
+        self.assertEqual([(a.pci_domain, a.pci_address) for a in found], [(0x10000, (1, 0, 0))])
 
     def test_bytes_and_lowercase_text_from_other_bindings(self):
         self.api.devices = [device(0x0A, bus_id=b"00000000:0a:00.0", name=b"Tesla P40")]
@@ -217,6 +235,7 @@ class DiscoveryTests(TccTestCase):
                 self.assertEqual(tcc_adapters([]), [])
                 self.assertIs(nvml_mod._unsafe, unsafe)
                 self.assertEqual(self.names().count("nvmlShutdown"), 0 if unsafe else 1)
+                self.assertIn("unsafe driver fault" if unsafe else "incomplete", tcc_mod.tcc_discovery_status())
 
     def test_one_unreadable_device_does_not_hide_a_tcc_peer(self):
         self.api.devices = [device(1), device(2)]
@@ -233,6 +252,7 @@ class DiscoveryTests(TccTestCase):
                 self.assertEqual([a.pci_address for a in tcc_adapters([])], [(2, 0, 0)])
                 self.assertIs(nvml_mod._unsafe, unsafe)  # an access violation inside nvml.dll can hang a shutdown
                 self.assertEqual(self.names().count("nvmlShutdown"), 0 if unsafe else 1)
+                self.assertIn("unsafe driver fault" if unsafe else "incomplete", tcc_mod.tcc_discovery_status())
 
     def test_nvml_is_asked_once_per_process_even_when_it_found_nothing(self):
         for devices in ([device(0x0A)], []):
@@ -254,13 +274,32 @@ class DiscoveryTests(TccTestCase):
     def test_no_shutdown_once_nvml_is_marked_unsafe(self):
         self.api.devices = [device(0x0A)]
         nvml_mod._unsafe = True
-        self.assertEqual(len(tcc_adapters([])), 1)
-        self.assertNotIn("nvmlShutdown", self.names())
+        self.assertEqual(tcc_adapters([]), [])
+        self.assertEqual(self.api.log, [])
+        self.assertIn("marked unsafe", tcc_mod.tcc_discovery_status())
 
-    def test_a_failing_shutdown_is_ignored(self):
+    def test_nvml_sessions_make_no_dll_calls_after_the_unsafe_flag_is_set(self):
+        nvml_mod._unsafe = True
+        nvml = Nvml()
+        nvml.refresh()
+        self.assertEqual(nvml.sample(), [])
+        nvml.close()
+        self.assertEqual(self.api.log, [])
+
+    def test_discovery_status_distinguishes_no_tcc_devices_from_a_failed_probe(self):
+        self.assertEqual(tcc_adapters([]), [])
+        self.assertIn("succeeded; no TCC GPUs found", tcc_mod.tcc_discovery_status())
+        tcc_mod._found = None
+        self.api.init_error = NvmlError("private driver detail")
+        self.assertEqual(tcc_adapters([]), [])
+        self.assertIn("initialization failed", tcc_mod.tcc_discovery_status())
+        self.assertNotIn("private driver detail", tcc_mod.tcc_discovery_status())
+
+    def test_a_failing_shutdown_is_reported_without_hiding_discovery(self):
         self.api.devices = [device(0x0A)]
         self.api.faults = {("nvmlShutdown", None): NvmlError(3)}
         self.assertEqual(len(tcc_adapters([])), 1)
+        self.assertIn("shutdown failed", tcc_mod.tcc_discovery_status())
 
     def test_the_listed_adapters_filter_every_call_while_nvml_is_asked_once(self):
         self.api.devices = [device(0x0A)]
@@ -293,7 +332,8 @@ class DiscoveryTests(TccTestCase):
         tcc_mod._found = None
         again = tcc_adapters([])
         self.assertEqual([a.luid for a in first], [a.luid for a in again])
-        self.assertEqual([a.luid for a in first], [(1 << 62) | 0x3B << 16 | 2 << 8 | 1, (1 << 62) | 0x0A << 16])
+        self.assertEqual([a.luid for a in first], [(1 << 62) | 0x3B << 8 | 2 << 3 | 1,
+                                                   (1 << 62) | 0x0A << 8])
         self.assertTrue(all(a.luid >= 1 << 62 for a in first))  # far from the small LUIDs DXGI hands out
 
 
@@ -345,6 +385,14 @@ class CounterTests(TccTestCase):
         per_luid, adapters = TccCounters(found, Nvml()).sample()
         self.assertEqual((list(per_luid), list(adapters)), ([found.luid], [found.luid]))
         self.assertEqual(per_luid[found.luid][5].dedicated, GiB)
+
+    def test_counters_locate_the_gpu_by_domain_when_bdf_values_match(self):
+        self.api.devices = [device(1, bus_id="00000000:01:00.0", used=GiB, processes=[(5, GiB)]),
+                            device(2, bus_id="00010000:01:00.0", used=2 * GiB, processes=[(6, GiB)])]
+        counters = TccCounters(tcc_adapter(1, domain=0x10000), Nvml())
+        per_luid, adapters = counters.sample()
+        self.assertEqual(list(per_luid[counters.adapter.luid]), [6])
+        self.assertEqual(adapters[counters.adapter.luid].dedicated, 2 * GiB)
 
     def test_memory_uses_the_v2_query_and_falls_back_to_the_plain_one(self):
         self.api.devices = [device(0x0A, used=GiB)]
@@ -617,11 +665,34 @@ class CliTests(unittest.TestCase):
         with patch("sys.argv", ["gputaskman", "--list-gpus"]), \
                 patch("gputaskman.collector.enumerate_adapters",
                       return_value=[tcc_adapter(0x0A), listed_adapter(0x1234ABCD)]), \
+                patch("gputaskman.tcc.tcc_discovery_status", return_value=""), \
                 contextlib.redirect_stdout(output):
             main()
         self.assertEqual(output.getvalue().splitlines(), [
             "0: GPU at 1 (NVIDIA, LUID 0x000000001234abcd)",
             "1: Tesla P40 (NVIDIA, TCC compute-only, PCI 0a:00.0)"])
+
+    def test_list_gpus_reports_nvml_discovery_status_on_stderr(self):
+        output, error = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["gputaskman", "--list-gpus"]), \
+                patch("gputaskman.collector.enumerate_adapters", return_value=[]), \
+                patch("gputaskman.tcc.tcc_discovery_status",
+                      return_value="NVML initialization failed; TCC GPUs could not be checked."), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            main()
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(error.getvalue().strip(),
+                         "TCC discovery: NVML initialization failed; TCC GPUs could not be checked.")
+
+    def test_list_gpus_displays_full_domain_for_tcc_gpu(self):
+        output = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "--list-gpus"]), \
+                patch("gputaskman.collector.enumerate_adapters", return_value=[tcc_adapter(1, domain=0x10000)]), \
+                patch("gputaskman.tcc.tcc_discovery_status", return_value=""), \
+                contextlib.redirect_stdout(output):
+            main()
+        self.assertEqual(output.getvalue().strip(),
+                         "0: Tesla P40 (NVIDIA, TCC compute-only, PCI 00010000:01:00.0)")
 
 
 @unittest.skipUnless(sys.platform == "win32", "the DXGI wrapper exists only on Windows")
