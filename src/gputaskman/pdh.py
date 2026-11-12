@@ -113,6 +113,7 @@ class ProcGpu:
 class AdapterGpu:
     dedicated: float | None = None
     shared: float | None = None
+    util_gpu: float | None = None
 
 
 class GpuCounters:
@@ -174,6 +175,7 @@ class GpuCounters:
         if _pdh.PdhCollectQueryData(self._query) != 0:
             return {}, {}
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
+        engine_usage: dict[tuple[int, int, int], float] = defaultdict(float)
 
         def proc(luid: int, pid: int) -> ProcGpu:
             p = procs[luid].get(pid)
@@ -191,11 +193,17 @@ class GpuCounters:
         for name, val in self._read("engine"):
             m = _ENGINE_RE.match(name)
             if m:
-                p = proc(luid_key(m[2], m[3]), int(m[1]))
+                luid = luid_key(m[2], m[3])
+                p = proc(luid, int(m[1]))
                 p.engines[_norm_engine(m[6])] += val
                 p.available.add("engine")
+                engine_usage[(luid, int(m[4]), int(m[5]))] += val
 
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
+        for (luid, _physical, _engine), usage in engine_usage.items():
+            adapter = adapters[luid]
+            usage = min(100.0, max(0.0, usage))
+            adapter.util_gpu = max(adapter.util_gpu if adapter.util_gpu is not None else 0.0, usage)
         for attr, key in (("dedicated", "a_dedicated"), ("shared", "a_shared")):
             for name, val in self._read(key):
                 m = _ADAPTER_RE.match(name)

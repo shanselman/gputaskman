@@ -68,7 +68,7 @@ This display-only choice applies to all GPUs and resets to full when the app res
 
 | Layer | Source | Works for |
 |---|---|---|
-| **Device** telemetry | NVML, AMD ADL, or optional AMD SMI; amdgpu or Intel (i915) sysfs on Linux | availability varies by GPU and driver |
+| **Device** telemetry | NVML, AMD ADL, optional AMD SMI, Intel WDDM activity on Windows; amdgpu or Intel (i915) sysfs on Linux | availability varies by GPU and driver |
 | **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl); DRM fdinfo for amdgpu or Intel (i915) on Linux | workloads visible to WDDM or DRM |
 | **Which runtime** (CUDA, HIP, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
 | **Which model file** | memory-mapped files + command line | llama.cpp, stable-diffusion.cpp, LM Studio, Ollama |

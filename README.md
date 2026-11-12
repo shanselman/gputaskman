@@ -2,7 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD and Intel on native Linux; see
+Windows with NVIDIA/AMD telemetry and Intel WDDM activity, plus Linux and WSL support (NVIDIA
+everywhere, AMD and Intel on native Linux; see
 [Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon and Intel (see
 [macOS](#macos-apple-silicon-and-intel)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
@@ -67,7 +68,7 @@ and an installer are not part of this initial distribution. Each ZIP includes li
 
 ## Clone and run
 
-Use **64-bit Windows 10/11**, an **NVIDIA or AMD GPU with a current WDDM driver**, and a terminal
+Use **64-bit Windows 10/11** with a current WDDM driver and a terminal
 (Windows Terminal is recommended). Live workload checks have included an RTX 4080 SUPER and an
 RTX Spark N1X on Windows ARM64. CUDA workloads are supported on ARM64 with a compatible NVIDIA
 driver and ARM64 CUDA runtime.
@@ -76,6 +77,11 @@ AMD live check: Radeon 860M Graphics on Windows 11 Enterprise build 26300, AMD d
 During desktop/browser activity, WDDM reported per-process VRAM and AMD ADL reported GPU utilization,
 clocks, and ASIC power; temperature, memory activity, and PCIe readings were unavailable. Vulkan/ROCm
 workloads were not tested on this machine.
+
+Intel Arc on Windows can use WDDM's per-process memory and engine counters. When those counters are
+available, the device GPU activity is the busiest WDDM engine after combining its process counters.
+Intel temperature, power, clocks, and memory activity are not currently available on Windows.
+Arc B580 behavior is covered by mocked counters but has not been validated on Intel hardware.
 
 Install [Git for Windows](https://git-scm.com/downloads/win) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. With WinGet:

@@ -12,7 +12,7 @@ import psutil
 
 from .amdsmi import AmdSmi, _bdf
 from .adl import Adl
-from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, Adapter
+from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, Adapter
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
@@ -339,7 +339,12 @@ class Collector:
             nv = self.ascend.read_device(self.ascend_chip, self.gpu_index)
         elif self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
             # NVML can't describe this GPU, and a sweep of every NVIDIA device costs ~60 ms per device.
-            nv = (self.adl.sample() or self.amdsmi.sample()) if self.adapter.vendor_id == VENDOR_AMD else None
+            if self.adapter.vendor_id == VENDOR_AMD:
+                nv = self.adl.sample() or self.amdsmi.sample()
+            elif self.adapter.vendor_id == VENDOR_INTEL and BACKEND == "wddm" and a and a.util_gpu is not None:
+                nv = DeviceTelemetry(index=self.gpu_index, source="Windows WDDM", util_gpu=round(a.util_gpu))
+            else:
+                nv = None
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)

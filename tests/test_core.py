@@ -277,6 +277,24 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(c.nvml.sample.called, swept)
                 self.assertIs(s.nv, expected)
 
+    def test_intel_windows_uses_wddm_adapter_engine_activity(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "Intel Arc B580", 0x8086, 12 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {1: {}}, {1: AdapterGpu(util_gpu=41.6)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertEqual((s.nv.source, s.nv.util_gpu), ("Windows WDDM", 42))
+        self.assertIsNone(s.nv.temp)
+        self.assertIsNone(s.nv.power_w)
+        self.assertIn("GPU 42%", to_text(s))
+        self.assertEqual(to_dict(s)["device"]["util_gpu"], 42)
+
     def test_lost_nvml_telemetry_is_explained_not_silent(self):
         c = Collector.__new__(Collector)
         c.adapter = Adapter(1, "RTX 3060", 0x10DE, 12 * GiB, 0, False, (5, 0, 0))
@@ -351,6 +369,20 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(gpu.dedicated, 0)
         self.assertEqual(gpu.gpu_pct, 10)
         self.assertFalse(gpu.paged_available)
+
+    def test_wddm_adapter_utilization_uses_busiest_combined_engine(self):
+        counters = GpuCounters.__new__(GpuCounters)
+        counters._query = None
+        data = {"engine": [
+            ("pid_42_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 35.0),
+            ("pid_43_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 40.0),
+            ("pid_43_luid_0x0_0x1_phys_0_eng_1_engtype_Copy", 80.0),
+            ("pid_44_luid_0x0_0x1_phys_0_eng_2_engtype_Compute", 120.0),
+        ]}
+        with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])), \
+                patch("gputaskman.pdh._pdh", SimpleNamespace(PdhCollectQueryData=lambda query: 0)):
+            _, adapters = counters.sample()
+        self.assertEqual(adapters[1].util_gpu, 100.0)
 
     def test_missing_process_counters_are_not_reported_as_zero(self):
         s = snapshot()
