@@ -724,8 +724,9 @@ class GpuTaskManager(App):
             current = values[-1] if values else None
             name = self.chart_label(index, self.snap)
             cell = Text(f"{name:<12} ", style=style)
-            cell.append(f"{format_metric(current, '.0f', unit):>8} ", style="bold")
-            cell.append(spark(values, max(1, cell_width - 22), scale))
+            precision, value_width = (".2f", 12) if unit == " GB/s" else (".0f", 8)
+            cell.append(f"{format_metric(current, precision, unit):>{value_width}} ", style="bold")
+            cell.append(spark(values, max(1, cell_width - 14 - value_width), scale))
             cells.append(cell)
         for start in range(0, len(cells), columns):
             grid.add_row(*cells[start:start + columns])

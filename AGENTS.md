@@ -82,12 +82,16 @@ Xe's optional traffic providers are `intel_pmt.py` (exact PCI-path/GUID-matched 
 and `sysman.py` (native 64-bit Linux, system-installed Level Zero loader, `zesInit`, full PCI
 BDF match). Keep byte-rate families from one provider together, preserve first/reset/denied
 samples as unknown, and never substitute PCI advertised maxima or stale sysfs defaults for
-live Link Status. `mem_read_bps` / `mem_write_bps` are measured traffic, not allocation;
+live Link Status. B65 (`8086:e222`) uses the host-facing Intel `e2ff` bridge above its `e2f0`
+downstream bridge; require those identities before reading its config, never fall back to its
+internal GPU endpoint. `mem_read_bps` / `mem_write_bps` are measured traffic, not allocation;
 `mem_bandwidth_max_bps` is reported and `mem_bandwidth_pct` is derived. They never populate
 NVML `util_mem` or process-memory totals. Retain `metric_sources` and optional-runtime failure
 reasons. Close PMT descriptors with the owning collector. `tools/check_intel_telemetry.py`
-performs a read-only two-sample host audit; it starts no model or process scan. PMT/Sysman
-success paths currently have synthetic coverage only, despite PMT metadata being visible on B65.
+performs a read-only two-sample host audit; it starts no model or process scan. A contributor's
+administrator check on B65 populated native PMT, Xe memory queries and PMU load at low activity
+(README records the values). No independent reference or 80B load validation was performed;
+Sysman's success path still has synthetic coverage only.
 
 ## Where to change things
 
@@ -166,6 +170,7 @@ Intel i915 (an Arc A770 with resizable BAR plus a UHD 730) was validated by a co
 the maintainer.
 Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, NVIDIA TCC-mode GPUs
 (run `gputaskman --list-gpus` and `gputaskman --once --gpu N`, then compare device and per-process VRAM
-with `nvidia-smi`; the code path was exercised against a WDDM GPU only), Intel `xe` and Arc cards
-without resizable BAR, and GPU-backed WinML on Copilot+ PCs. Planned work is listed under **Next** in the
+with `nvidia-smi`; the code path was exercised against a WDDM GPU only), Intel `xe` process
+attribution/80B workloads, Arc cards without resizable BAR, and GPU-backed WinML on Copilot+ PCs.
+Planned work is listed under **Next** in the
 README.

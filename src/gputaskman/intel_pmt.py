@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
+import re
 import struct
 import time
 
@@ -244,10 +245,29 @@ class PmtTelemetry:
         self.previous.clear()
 
 
-def pci_link(sysfs: str) -> tuple[dict, str]:
-    """PCIe capability Link Status, never sysfs defaults or advertised maximum speed."""
+def pci_link(sysfs: str, *, upstream: bool = False) -> tuple[dict, str]:
+    """Return (values, source-or-error), reading the card's host-facing link.
+
+    B65 has internal bridges: Intel's BMG Sysman implementation reads the second
+    PCI ancestor. Require its known bridge identities before selecting it; an
+    unrecognized topology must not fall back to the internal GPU endpoint.
+    """
+    device = Path(sysfs).resolve()
+    source = "PCI configuration Link Status (GPU endpoint)"
+    if upstream:
+        try:
+            for node, expected_id in ((device.parent, 0xE2F0), (device.parent.parent, 0xE2FF)):
+                if (not re.fullmatch(r"[0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", node.name)
+                        or int((node / "vendor").read_text().strip(), 0) != 0x8086
+                        or int((node / "device").read_text().strip(), 0) != expected_id
+                        or int((node / "class").read_text().strip(), 0) != 0x060400):
+                    return {}, "B65 upstream PCIe port topology is not recognized"
+        except (OSError, ValueError):
+            return {}, "B65 upstream PCIe port identity is unavailable"
+        device = device.parent.parent
+        source = f"PCI configuration Link Status (B65 upstream port {device.name})"
     try:
-        with (Path(sysfs) / "config").open("rb", buffering=0) as stream:
+        with (device / "config").open("rb", buffering=0) as stream:
             data = stream.read(256)
         if len(data) < 64:
             return {}, "PCI configuration header unavailable"
@@ -270,7 +290,7 @@ def pci_link(sysfs: str) -> tuple[dict, str]:
                 gen, width = status & 0xF, (status >> 4) & 0x3F
                 if gen not in range(1, 8) or width not in (1, 2, 4, 8, 12, 16, 32):
                     return {}, "PCIe Link Status is unknown or link is down"
-                return {"pcie_gen": gen, "pcie_width": width}, ""
+                return {"pcie_gen": gen, "pcie_width": width}, source
             offset = next_offset
         return {}, "PCI capability chain exceeds scan limit"
     except OSError as error:

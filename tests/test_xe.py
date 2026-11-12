@@ -430,6 +430,10 @@ class IntelChartTests(unittest.IsolatedAsyncioTestCase):
                 data = to_dict(snap)["device"]
                 self.assertEqual(data["mem_read_bps"], 2e9)
                 self.assertIsNone(data["util_mem"])
+                snap.nv.mem_read_bps, snap.nv.mem_write_bps = 82_957_939.74, 191_557.09
+                app.apply(snap)
+                await pilot.pause()
+                self.assertIn("0.08 GB/s", self.chart_text(app))
                 # A counter read failure retains the chart but leaves a gap, not idle zero.
                 snap.nv.mem_read_bps = snap.nv.mem_write_bps = None
                 app.apply(snap)

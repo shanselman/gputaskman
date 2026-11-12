@@ -317,8 +317,12 @@ Failed initialization/domain discovery retries after 30 seconds. Driver calls ar
 successful initialization and sampling costs depend on the installed runtime and remain unmeasured here.
 
 Live PCIe generation/width come from PCI configuration **Link Status**, with Sysman's live state
-as fallback. Neither stale sysfs defaults nor advertised maximum link speed replace an unreadable
-live value. The JSON fields `mem_read_bps` / `mem_write_bps` contain measured bytes/sec;
+as fallback. B65's GPU endpoint is behind internal bridges: following
+[Intel's card-bus selection](https://github.com/intel/compute-runtime/blob/13f35c66bc22a281b812e328d79871ea43fb9e0d/level_zero/sysman/source/shared/linux/zes_os_sysman_imp.cpp),
+read the host-facing port two PCI ancestors above the GPU, after checking the Intel `e2f0` / `e2ff`
+bridge identities. Unknown topology or an unreadable upstream configuration stays unknown rather
+than displaying the internal endpoint's link. Neither stale sysfs defaults nor advertised maximum
+link speed replace an unreadable live value. The JSON fields `mem_read_bps` / `mem_write_bps` contain measured bytes/sec;
 `mem_bandwidth_max_bps` is firmware/driver-reported, and `mem_bandwidth_pct` is the derived ratio
 of traffic to that reported maximum. `metric_sources` identifies each provider. These are separate
 from NVML's memory busy-time percentage (`util_mem`), which remains `null` on Xe. The chart and
@@ -358,8 +362,18 @@ or observed. Device-query/PMU and visible-client fallback behavior are covered b
 **not live 80B validation**. No inference request was sent for either check.
 A further check found both exact PMT GUIDs above, but their binary telemetry reads returned access
 denied. PCI configuration reads stopped at 64 bytes, before Link Status; the Sysman loader was absent.
-Consequently the new PMT/Sysman bandwidth, memory-clock and PCIe paths are **fixture-tested, not
-validated live on this card**. The host check above is required before claiming those measurements work.
+The contributor then ran the read-only check as administrator on the host. The second sample
+reported 82,957,939.74 bytes/s memory reads, 191,557.09 bytes/s writes, a firmware-reported
+608,000,000,000 bytes/s maximum and 9500 MHz memory clock. PMT PCIe RX/TX were about 194.40 /
+194.21 KiB/s; the internal endpoint's PCI Link Status reported gen1 x1. This exposed a port-selection
+issue, corrected to read B65's host-facing upstream port (not yet revalidated by an administrator).
+The privileged Xe query reported
+34,242,297,856 bytes usable VRAM and 605,257,728 bytes used (driver estimate). Xe PMU GPU/video
+load populated at about 0.052% / 0%. Thus native PMT, memory queries and PMU counters are
+**validated at low activity on this host**; there was no external reference measurement and no
+80B workload in this check. Link scaling and bandwidth under load remain unvalidated. The
+optional Sysman success path remains fixture-tested because its loader is absent. Fan RPM
+populated, but neither a maximum RPM nor a percentage was exposed.
 
 Live check on an integrated GPU (ASUS Vivobook 14 X1404VA, Intel Core 3 100U Xe-LP, `i915`, kernel 7.3.1, Mesa 26.2.5):
 the card is found and named, the header shows the actual GT clock (`GT 300/1250 MHz`) with no throttle reasons active,
@@ -1016,7 +1030,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | Intel Xe device sysfs (labelled GPU temperature, board energy, primary-GT frequency/throttle) | 0.43 ms median, 0.79 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic | Every refresh for the selected Xe card; energy sampling needs two readings, primed at startup. Host process/fd scans were unavailable in this agent's process namespace and are not included |
 | Intel Xe extended provider (sensors, media clock, memory query and PMU fallback) | 1.56 ms median, 1.83 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic, 2026-11-12 | Selected card only; render-node access was unavailable, so this measures cached query failure plus sysfs sensors. Successful device-query/PMU cost and host fd scans remain unmeasured |
-| Intel Xe PMT/config/Sysman additions | 2.15 ms first call; 0.043 ms median, 0.069 ms max across 30 warm reads on the same B65, 2026-11-12. Whole `read_device` with these additions: 1.49 ms median, 2.68 ms max | PMT read denied, PCI config truncated, optional loader absent; these are cached failure-path costs. Successful PMT/Sysman cost remains unmeasured. PMT discovery/open retries every 5 s; failed Sysman initialization/domain discovery every 30 s. PMT reads at most three 16 KiB frames per endpoint per refresh; PCI config reads at most 256 bytes |
+| Intel Xe PMT/config/Sysman additions | 2.11 ms first call; 0.268 ms median, 0.320 ms max across 30 warm reads on the same B65, 2026-11-12. Whole `read_device` with these additions: 1.52 ms median, 2.90 ms max | PMT read denied, upstream PCI config truncated, optional loader absent; these are cached failure-path costs including bridge identity checks. Successful PMT/Sysman cost remains unmeasured. PMT discovery/open retries every 5 s; failed Sysman initialization/domain discovery every 30 s. PMT reads at most three 16 KiB frames per endpoint per refresh; PCI config reads at most 256 bytes |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |

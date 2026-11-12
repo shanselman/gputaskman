@@ -933,13 +933,13 @@ def _xe_extra_telemetry(card: DrmCard, dev: DeviceTelemetry) -> None:
     if card.pmt_provider is None:
         card.pmt_provider = PmtTelemetry(card.sysfs)
     values, status, sources = card.pmt_provider.sample()
-    link, link_error = pci_link(card.sysfs)
+    link, link_note = pci_link(card.sysfs, upstream=card.vendor_id == 0x8086 and card.device_id == 0xE222)
     values.update(link)
     for key in ("pcie_gen", "pcie_width"):
         if key in link:
-            sources[key] = "PCI configuration Link Status (GPU endpoint)"
+            sources[key] = link_note
         else:
-            status[key] = link_error
+            status[key] = link_note
     now = time.monotonic()
     if card.sysman_provider is None or (now >= card.sysman_retry_at and
             (card.sysman_provider.error or card.sysman_provider.domain_errors)):

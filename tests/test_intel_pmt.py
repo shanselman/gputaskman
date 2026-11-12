@@ -181,7 +181,37 @@ class PciLinkTests(unittest.TestCase):
             (root / 'config').write_bytes(raw)
             (root / 'current_link_speed').write_text('2.5 GT/s PCIe')
             (root / 'current_link_width').write_text('1')
-            self.assertEqual(pmt.pci_link(tmp), ({'pcie_gen': 5, 'pcie_width': 16}, ''))
+            values, source = pmt.pci_link(tmp)
+            self.assertEqual(values, {'pcie_gen': 5, 'pcie_width': 16})
+            self.assertIn('GPU endpoint', source)
+
+    def test_b65_reads_the_host_facing_port_and_rejects_unknown_bridges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            port = Path(tmp) / '0000:02:00.0'
+            downstream = port / '0000:03:01.0'
+            gpu = downstream / '0000:04:00.0'
+            gpu.mkdir(parents=True)
+            for node, identity in ((port, '0xe2ff'), (downstream, '0xe2f0')):
+                (node / 'vendor').write_text('0x8086')
+                (node / 'device').write_text(identity)
+                (node / 'class').write_text('0x060400')
+            def config(node, gen, width):
+                raw = bytearray(256)
+                struct.pack_into('<H', raw, 6, 0x10)
+                raw[0x34], raw[0x40] = 0x40, 0x10
+                struct.pack_into('<H', raw, 0x52, gen | width << 4)
+                (node / 'config').write_bytes(raw)
+            config(gpu, 1, 1)
+            config(port, 4, 4)
+            values, source = pmt.pci_link(str(gpu), upstream=True)
+            self.assertEqual(values, {'pcie_gen': 4, 'pcie_width': 4})
+            self.assertIn('B65 upstream port 0000:02:00.0', source)
+            (port / 'config').write_bytes((port / 'config').read_bytes()[:64])
+            self.assertEqual(pmt.pci_link(str(gpu), upstream=True)[0], {})  # no internal-link fallback
+            (port / 'device').write_text('0x1234')
+            values, reason = pmt.pci_link(str(gpu), upstream=True)
+            self.assertEqual(values, {})
+            self.assertIn('not recognized', reason)
 
     def test_truncated_configuration_and_cycle_cannot_become_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
