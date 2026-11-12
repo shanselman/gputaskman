@@ -38,3 +38,9 @@ class DeviceTelemetry:
     throttle: list[str] | None = field(default_factory=list)  # None = unreadable (unknown), [] = readable and idle
     compute_cap: str = ""
     source: str = "NVML"
+    fan_rpm: int | None = None
+    vram_temp: float | None = None
+    util_kind: str = ""  # nonempty when load covers only the visible DRM clients
+    video_kind: str = ""
+    memory_note: str = ""  # provider-specific provenance of device memory figures
+    metric_status: dict[str, str] = field(default_factory=dict)  # unavailable metric -> reason

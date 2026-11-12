@@ -23,7 +23,7 @@ from .llm import gb, redact_cmdline
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_shared_counters, has_wddm_counters,
-                     inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
+                     device_metric_notes, inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -420,7 +420,7 @@ class GpuTaskManager(App):
             self.hist_bw.append(nv.util_mem)
             self.hist_temp.append(nv.temp)
             self.hist_power.append(nv.power_w)
-            self.hist_enc.append(nv.enc)
+            self.hist_enc.append(nv.video if nv.source == "Intel sysfs" else nv.enc)
             self.hist_dec.append(nv.dec)
         else:
             for history in (self.hist_util, self.hist_clock, self.hist_bw, self.hist_temp,
@@ -431,13 +431,18 @@ class GpuTaskManager(App):
 
     def render_dashboard(self) -> None:
         amd = bool(self.snapshots[0].adapter and self.snapshots[0].adapter.vendor_id == 0x1002)
-        clock_label = "SM/GFX clock" if len(self.snapshots) > 1 else "GFX clock" if amd else "SM clock"
-        if getattr(self, "_clock_label", None) != clock_label:
-            self._clock_label = clock_label
+        clock_label = "GPU clock" if len(self.snapshots) > 1 else self.chart_label(self.CHARTS.index("SM clock"), self.snapshots[0])
+        intel = [bool(s.nv and s.nv.source == "Intel sysfs") for s in self.snapshots]
+        video_label = "Video" if all(intel) else "Encoder / Video" if any(intel) else "Encoder"
+        profile = (tuple(self.available_charts), clock_label, video_label)
+        if getattr(self, "_chart_profile", None) != profile:
+            self._chart_profile = profile
             selector = self.query_one("#chart-mode", Select)
-            selected = selector.value
+            selected = self.chart_idx if self.chart_idx in self.available_charts else -1
+            self.chart_idx = selected
             selector.set_options([("All charts", -1), *(
-                (clock_label if self.CHARTS[index] == "SM clock" else self.CHARTS[index], index)
+                (clock_label if self.CHARTS[index] == "SM clock" else
+                 video_label if self.CHARTS[index] == "Encoder" else self.CHARTS[index], index)
                 for index in self.available_charts)])
             selector.value = selected
         self._amd_chart_labels = amd
@@ -582,12 +587,17 @@ class GpuTaskManager(App):
             m = Text()
             label = "AMD gfx" if is_amd else ("Intel GT" if is_intel else "GPU")
             m.append(f"{label} {format_metric(nv.util_gpu, unit='%')}", style=f"bold {self.CHART_COLORS['GPU']}")
-            m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
-            m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
+            if nv.util_kind:
+                m.append(f" ({nv.util_kind})", style="grey62")
+            if not is_intel:
+                m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
+                m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
             if nv.enc or nv.dec:
                 m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
             if nv.video is not None:
                 m.append(f"  video {format_metric(nv.video, unit='%')}")
+                if nv.video_kind:
+                    m.append(f" ({nv.video_kind})", style="grey62")
             lines.append(m)
             clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if is_amd else
                            f"GT {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz" if is_intel else
@@ -600,6 +610,10 @@ class GpuTaskManager(App):
                 st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  "
                           f"{format_metric(nv.power_w, '.0f')} W{power_kind}  "
                           f"{label} {format_metric(clock)} MHz", style="grey70")
+            elif is_intel:
+                st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  {format_metric(nv.power_w, '.0f')}/"
+                          f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {clock_label}  "
+                          f"video {format_metric(nv.video_clock)} MHz  {nv.source}", style="grey70")
             else:
                 st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  {format_metric(nv.power_w, '.0f')}/"
                           f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
@@ -609,7 +623,13 @@ class GpuTaskManager(App):
                           + (f"CC {nv.compute_cap or 'N/A'}" if nv.source == "NVML" else nv.source), style="grey70")
             if nv.throttle:
                 st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
+            if nv.fan_rpm is not None:
+                st.append(f"  fan {nv.fan_rpm} RPM")
+            if nv.vram_temp is not None:
+                st.append(f"  VRAM {format_metric(nv.vram_temp, unit='°C')}")
             lines.append(st)
+            if nv.metric_status and not self.monitoring:
+                lines.append(Text("Metric availability: " + device_metric_notes(nv), style="grey62"))
         return Group(*lines)
 
     def chart_series(self, index: int, nv: NvDevice | None) -> tuple[deque, float, str, str]:
@@ -660,7 +680,12 @@ class GpuTaskManager(App):
     def _chart_content(self) -> tuple[Table, str]:
         # Reserve the border, padding, and scrollbar even before child resize events arrive.
         width = max(1, self.size.width - 6)
-        indices = list(self.available_charts) if self.chart_idx == -1 else [self.chart_idx]
+        supported = self.charts_for(self.snap)
+        indices = supported if self.chart_idx == -1 else [self.chart_idx] if self.chart_idx in supported else []
+        if not indices:
+            grid = Table.grid()
+            grid.add_row(Text(f"{self.CHARTS[self.chart_idx]} is not exposed by this GPU", style="grey62"))
+            return grid, "Unavailable metrics are not zero"
         columns = min(len(indices), 3, max(1, (width + 2) // 46))
         cell_width = max(1, (width - 2 * (columns - 1)) // columns)
         grid = Table.grid(padding=(0, 2), pad_edge=False, expand=True)
@@ -670,9 +695,7 @@ class GpuTaskManager(App):
         for index in indices:
             values, scale, unit, style = self.chart_series(index, self.snap.nv)
             current = values[-1] if values else None
-            name = self.CHARTS[index]
-            if getattr(self, "_amd_chart_labels", False) and name == "SM clock":
-                name = "GFX clock"
+            name = self.chart_label(index, self.snap)
             cell = Text(f"{name:<12} ", style=style)
             cell.append(f"{format_metric(current, '.0f', unit):>8} ", style="bold")
             cell.append(spark(values, max(1, cell_width - 22), scale))
@@ -684,7 +707,7 @@ class GpuTaskManager(App):
         note = (
             "Recent samples · blank = no reading" if self.snap.backend == "metal" else
             f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
-            f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz"
+            f"{self.chart_label(self.CHARTS.index('SM clock'), self.snap)} 0–{clock_scale:.0f} MHz"
         )
         return grid, note
 
@@ -912,10 +935,26 @@ class GpuTaskManager(App):
 
     @property
     def available_charts(self) -> list[int]:
-        """Chart indices this backend has data for: IOKit (macOS) has no clocks, power, temperature or codecs."""
-        if BACKEND == "metal":
+        """Dropdown union; each device's chart grid still uses only its own supported counters."""
+        snapshots = self.snapshots or [self.snap]
+        supported = set().union(*(self.charts_for(snap) for snap in snapshots))
+        return [i for i in range(len(self.CHARTS)) if i in supported]
+
+    def charts_for(self, snap: Snapshot | None) -> list[int]:
+        if BACKEND == "metal" or (snap and snap.backend == "metal"):
             return [i for i, name in enumerate(self.CHARTS) if name in METAL_CHARTS]
+        if snap and snap.nv and snap.nv.source == "Intel sysfs":
+            # Intel reports combined video, not separate encoder/decoder or memory activity.
+            return [i for i, name in enumerate(self.CHARTS) if name not in ("Mem activity", "Decoder")]
         return list(range(len(self.CHARTS)))
+
+    def chart_label(self, index: int, snap: Snapshot | None) -> str:
+        name = self.CHARTS[index]
+        if snap and snap.nv and snap.nv.source == "Intel sysfs":
+            return {"SM clock": "GT clock", "Encoder": "Video"}.get(name, name)
+        if name == "SM clock" and snap and snap.adapter and snap.adapter.vendor_id == 0x1002:
+            return "GFX clock"
+        return name
 
     def action_cycle_chart(self) -> None:
         order = [-1, *self.available_charts]

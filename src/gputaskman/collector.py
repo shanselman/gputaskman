@@ -375,9 +375,10 @@ class Collector:
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
             driver=self._mac_driver or (self.amdsmi.driver if nv and nv.source == "AMD SMI"
                                         else self.nvml.driver if nv and nv.source == "NVML"
-                                        else f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else ""),
+                                        else f"kernel {os.uname().release}" if nv and nv.source in ("AMD sysfs", "Intel sysfs") else ""),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
-            vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
+            vram_used=(nv.mem_used if nv and nv.source == "Intel sysfs" and nv.memory_note
+                       else int(a.dedicated) if a and a.dedicated is not None else None),
             shared_used=int(a.shared) if a and a.shared is not None else None, backend=self.backend,
             shared_is_spill=not (integrated_intel or (self.drm_card is not None and self.drm_card.integrated)),
         )

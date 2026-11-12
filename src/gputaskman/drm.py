@@ -20,6 +20,7 @@ import time
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 
 from .dxgi import VENDORS, Adapter
 from .linux import pci_key
@@ -70,6 +71,9 @@ class DrmCard:
     # shared buffers can double-count); None = no readable client, unknown.
     vram_used: int | None = None
     pmu_state: dict = field(default_factory=dict, repr=False)
+    xe_provider: object | None = field(default=None, repr=False)
+    client_util: float | None = None
+    client_video: float | None = None
 
 
 def _read(path: str) -> str | None:
@@ -152,21 +156,52 @@ def parse_fdinfo(text: str) -> dict | None:
         except (ValueError, IndexError):
             engines = None  # a torn or malformed counter: this client's load is unknown, not 0
             break
-    if fields.get("drm-driver") in ("i915", "xe"):
+    if fields["drm-driver"] == "xe":
+        # Xe exports GPU-clock ticks, not nanoseconds. Keep busy/total pairs together:
+        # only their deltas have meaning, and CPU wall time is not their denominator.
+        cycles = {}
+        names = {k[len("drm-cycles-"):] for k in fields if k.startswith("drm-cycles-")}
+        names |= {k[len("drm-total-cycles-"):] for k in fields if k.startswith("drm-total-cycles-")}
+        try:
+            for name in names:
+                busy = int(fields["drm-cycles-" + name])
+                total = int(fields["drm-total-cycles-" + name])
+                if busy < 0 or total < 0:
+                    raise ValueError("negative GPU counter")
+                cycles[name] = (busy, total)
+        except (KeyError, ValueError):
+            cycles = None  # a missing/malformed pair makes the client's load unknown
+        regions = {k[len(prefix):] for prefix in ("drm-resident-", "drm-shared-", "drm-total-")
+                   for k in fields if k.startswith(prefix) and not k.startswith("drm-total-cycles-")}
+        local = ["drm-resident-" + r for r in regions if re.fullmatch(r"vram\d+", r)]
+        shared_keys = ["drm-shared-" + r for r in regions]
+        # Require every region's sharing counter, including CPU-only system memory.
+        # A missing sharing counter must never turn reachable bytes into private bytes.
+        shared_values = [parse_size(fields.get(k)) for k in shared_keys]
+        return {
+            "driver": "xe", "client_id": client_id, "pdev": fields.get("drm-pdev", ""),
+            "vram": intel_resident(*local) if local and all(k in fields for k in local) else None,
+            "gtt": intel_resident("drm-resident-gtt"),
+            "cpu": intel_resident("drm-resident-system"),
+            "shared": (sum(shared_values) if regions and "gtt" in regions and "system" in regions
+                       and None not in shared_values else None),
+            "engines": engines or None,
+            "cycles": cycles or None,
+        }
+    if fields["drm-driver"] == "i915":
         if not engines:
             # i915 (gen8+) prints a drm-engine-<class> line for each engine class the device has, even at 0 ns;
-            # xe reports drm-cycles-* instead and gen7 i915 nothing. No such line means the load is unknown, not 0
+            # gen7 i915 prints nothing. No such line means the load is unknown, not 0
             # (AGENTS.md rule 2).
             engines = None
         # i915's regions: local0 is device memory and system0 is system memory the GPU's buffers currently
         # sit in (the GTT slot); stolen-local0 and stolen-system0 are the firmware-reserved parts of each.
         # system0 includes buffers placed there on purpose, not only memory that spilled from local0.
-        # There is no separate CPU-only region. These are i915's names; xe calls them vram0/gtt/system, so
-        # its memory stays unknown until validated.
+        # There is no separate CPU-only region.
         has_local = any("local0" in key for key in fields)
-        if fields["drm-driver"] == "i915" and not has_local:
+        if not has_local:
             # An integrated GPU has no local0 region at all, so there is no shared-local0 to require:
-            # the gate needs only the system0 region the device has. xe keeps the old gate (unknown keys).
+            # the gate needs only the system0 region the device has.
             required_shared = ("drm-shared-system0",)
         else:
             required_shared = ("drm-shared-local0", "drm-shared-system0")
@@ -375,14 +410,17 @@ def _microwatts(path: str) -> float | None:
     return None if value is None else value / 1_000_000
 
 
-def _hwmon_temp(hwmon: str) -> int | None:
+def _hwmon_temp(hwmon: str, intel: bool = False) -> int | None:
     try:
         names = sorted(os.listdir(hwmon))
     except OSError:
         names = []
-    for name in names:
-        if name.startswith("temp") and name.endswith("_label") and _read(os.path.join(hwmon, name)) == "edge":
-            return _milli(os.path.join(hwmon, f"{name[:-len('_label')]}_input"))
+    for label in (("pkg", "gpu", "edge") if intel else ("edge",)):
+        for name in names:
+            if name.startswith("temp") and name.endswith("_label") and _read(os.path.join(hwmon, name)) == label:
+                value = _milli(os.path.join(hwmon, f"{name[:-len('_label')]}_input"))
+                if value is not None:
+                    return value
     return _milli(os.path.join(hwmon, "temp1_input"))
 
 
@@ -448,7 +486,7 @@ _INTEL_THROTTLE = (
 )
 
 
-def _intel_throttle(gt: str) -> list[str] | None:
+def _intel_throttle(gt: str, xe: bool = False) -> list[str] | None:
     """Names of the limits currently throttling an Intel GPU; empty when none is active.
 
     _int already turns an unreadable or unparseable node into None, so those are skipped. None when no
@@ -457,6 +495,8 @@ def _intel_throttle(gt: str) -> list[str] | None:
     seen = False
     active = []
     for node, label in _INTEL_THROTTLE:
+        if xe:
+            node = os.path.join("throttle", node.replace("throttle_reason_", "reason_"))
         value = _int(os.path.join(gt, node))
         if value is None:
             continue
@@ -485,7 +525,7 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
         util_mem=None if card.intel else _int(os.path.join(d, "mem_busy_percent")),
     )
     if hwmon:
-        dev.temp = _hwmon_temp(hwmon)
+        dev.temp = _hwmon_temp(hwmon, intel=card.intel)
         if card.intel:
             # Intel hwmon has no instantaneous power node, but energy1_input is a cumulative uJ counter;
             # its rate over the interval between samples is the card's average power draw.
@@ -502,16 +542,19 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
                 dev.power_kind = _read(os.path.join(hwmon, "power1_label")) or ""  # amdgpu: "PPT" (package power)
             dev.power_limit_w = _microwatts(os.path.join(hwmon, "power1_cap"))
         fan_input = _int(os.path.join(hwmon, "fan1_input"))
+        dev.fan_rpm = fan_input
         fan_max = _int(os.path.join(hwmon, "fan1_max"))
         if fan_input is not None and fan_max is not None and fan_max > 0:
             dev.fan = int(round(100 * fan_input / fan_max))
         dev.gfx_clock = _hwmon_clock(hwmon, "sclk")
         dev.mem_clock = _hwmon_clock(hwmon, "mclk")
     if card.intel:
-        # The gt nodes hang off the DRM card itself (/sys/class/drm/cardN/gt/gt0), not the PCI device.
-        gt = os.path.join(os.path.dirname(d), "gt", "gt0")
-        act = _int(os.path.join(gt, "rps_act_freq_mhz"))
-        cur = _int(os.path.join(gt, "rps_cur_freq_mhz"))
+        # i915's GT is on the DRM card; Xe's frequency nodes are below the PCI device's primary tile/GT.
+        xe = card.driver == "xe"
+        gt = (os.path.join(d, "tile0", "gt0", "freq0") if xe
+              else os.path.join(os.path.dirname(d), "gt", "gt0"))
+        act = _int(os.path.join(gt, "act_freq" if xe else "rps_act_freq_mhz"))
+        cur = _int(os.path.join(gt, "cur_freq" if xe else "rps_cur_freq_mhz"))
         # rps_act_freq_mhz is the actual frequency; rps_cur_freq_mhz is what the driver last requested
         # (per the kernel's intel_gt_sysfs_pm.c). The actual one can read 0 while the GPU idles in RC6,
         # which is a real reading, not a missing one; fall back to the requested one on kernels without it.
@@ -519,11 +562,65 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
         if cur is not None:
             # hwmon has no sclk on Intel; keep the requested frequency too, for the JSON.
             dev.gfx_clock = cur
-        dev.sm_clock_max = _int(os.path.join(gt, "rps_RP0_freq_mhz"))
-        dev.throttle = _intel_throttle(gt)
+        dev.sm_clock_max = _int(os.path.join(gt, "rp0_freq" if xe else "rps_RP0_freq_mhz"))
+        dev.throttle = _intel_throttle(gt, xe=xe)
         util, video = _intel_pmu_rates(card)
         dev.util_gpu = util
         dev.video = video
+        if xe:
+            provider = _xe_device(card)
+            total, used = provider.memory()
+            if total is not None:
+                card.integrated = False  # a queried local VRAM region also proves a small-BAR card is discrete
+                dev.mem_total = total
+                dev.memory_note = "Xe query: driver-reported usable VRAM; "
+                if used is not None:
+                    dev.mem_used = used
+                    dev.memory_note += "used VRAM is the driver's privileged device-wide estimate."
+                else:
+                    dev.memory_note += ("used VRAM is the visible clients' resident sum (shared buffers may "
+                                        "double-count; uninspectable clients are missing). Device-wide used "
+                                        "accounting requires CAP_PERFMON or CAP_SYS_ADMIN.")
+            if dev.util_gpu is None and card.client_util is not None:
+                dev.util_gpu, dev.util_kind = card.client_util, "visible DRM clients (estimated)"
+            if dev.video is None and card.client_video is not None:
+                dev.video, dev.video_kind = card.client_video, "visible DRM clients (estimated)"
+            dev.power_limit_w = _microwatts(os.path.join(hwmon, "power1_cap")) if hwmon else None
+            if hwmon:
+                try:
+                    labels = sorted(os.listdir(hwmon))
+                except OSError:
+                    labels = []
+                for filename in labels:
+                    if filename.endswith("_label") and _read(os.path.join(hwmon, filename)) == "vram":
+                        dev.vram_temp = _milli(os.path.join(hwmon, filename[:-6] + "_input"))
+                        break
+            # The media GT is separate on B65. Find it by its engine classes, not by a guessed GT index.
+            for tile in sorted(Path(d).glob("tile[0-9]*")):
+                for media_gt in sorted(tile.glob("gt[0-9]*")):
+                    if any((media_gt / "engines" / name).is_dir() for name in ("vcs", "vecs")):
+                        dev.video_clock = _int(str(media_gt / "freq0" / "act_freq"))
+                        break
+            dev.metric_status = {
+                "util_mem": "no Xe bandwidth counter in this provider",
+                "enc": "Xe exposes combined video activity instead",
+                "dec": "Xe exposes combined video activity instead",
+                "pstate": "NVIDIA-specific metric",
+                "compute_cap": "NVIDIA-specific metric",
+                "pcie_rx_kbs": "no Xe traffic counter in this provider",
+                "pcie_tx_kbs": "no Xe traffic counter in this provider",
+                "pcie_gen": "Xe sysfs link readings can be stale",
+                "pcie_width": "Xe sysfs link readings can be stale",
+                "mem_clock": "no Xe memory-clock sensor",
+            }
+            if dev.fan is None:
+                dev.metric_status["fan"] = "no maximum RPM sensor; use measured RPM" if dev.fan_rpm is not None else "no readable fan sensor"
+            if total is None and provider.query_error:
+                dev.metric_status["memory_query"] = provider.query_error + "; using PCI window and visible-client memory"
+            for metric, value in (("util_gpu", dev.util_gpu), ("video", dev.video)):
+                if value is None:
+                    dev.metric_status[metric] = ("perf access denied" if provider.pmu_error == "denied"
+                                               else provider.pmu_error or "waiting for a complete counter interval")
         if dev.power_w is None and card.integrated:
             # No hwmon energy either: RAPL's uncore zone is the integrated GPU's power.
             # A discrete card keeps N/A here (uncore is not its power).
@@ -664,6 +761,12 @@ def _intel_pmu_rates(card: DrmCard, now: int | None = None) -> tuple[float | Non
     """Whole-GPU busy % (busiest engine) and video-engine busy % for an Intel card; (None, None) when
     unreadable. The first sample only arms the baseline (a rate needs an interval); a counter stepping
     back re-arms it instead of reporting a negative load."""
+    if card.driver == "xe":
+        provider = _xe_device(card)
+        values = provider.rates(_perf_open, _read_counter)
+        card.pmu_state["fail"] = ("denied" if provider.pmu_error == "denied"
+                                  else "missing" if provider.pmu_error else None)
+        return values
     if now is None:
         now = time.monotonic_ns()
     state = card.pmu_state
@@ -793,7 +896,8 @@ def intel_counter_status(card: DrmCard, nv=None) -> str:
         para = _read("/proc/sys/kernel/perf_event_paranoid") or "?"
         parts.append(f"GPU and video load need perf privileges this user lacks (perf_event_paranoid={para})")
     elif pmu_fail == "missing":
-        parts.append("no readable supported i915 performance counters for this GPU")
+        parts.append(("Xe device-wide load unavailable: " + _xe_device(card).pmu_error)
+                     if card.driver == "xe" else "no readable supported i915 performance counters for this GPU")
     elif pmu_fail == "shared":
         parts.append("performance counters can't attribute load with multiple Intel GPUs")
     hwmon_power = nv is not None and nv.power_kind == "Board"
@@ -802,9 +906,19 @@ def intel_counter_status(card: DrmCard, nv=None) -> str:
             parts.append("GPU power needs root (RAPL energy is root-only)")
         elif _INTEL_RAPL_FAIL == "missing":
             parts.append("no RAPL uncore zone found")
+    if card.driver == "xe" and nv is not None and (nv.util_kind or nv.video_kind):
+        parts.append("fallback load covers visible DRM clients only; other clients may be missing")
     if not parts:
         return ""
     return "Intel device metrics unavailable: " + "; ".join(parts) + ". N/A is unknown, not zero."
+
+
+def _xe_device(card: DrmCard):
+    if card.xe_provider is None:
+        from .xe import XeDevice
+
+        card.xe_provider = XeDevice(card.sysfs, card.pdev)
+    return card.xe_provider
 
 
 def _vcn_major(device: str) -> int:
@@ -873,6 +987,7 @@ class DrmCounters:
         self._clock = clock
         self._timer = timer
         self._prev: dict[tuple, tuple[dict[str, int], int]] = {}  # client -> (high-water engine ns, read time)
+        self._prev_cycles: dict[tuple, tuple[dict[str, tuple[int, int]], int]] = {}
         # pid -> (start time, [(fd name, link target)], holds /dev/kfd, every fd and link was readable)
         self._known: dict[int, tuple[str, list[tuple[str, str]], bool, bool]] = {}
         self._cursor = 0
@@ -890,6 +1005,9 @@ class DrmCounters:
         intel_cards = [c for c in self.cards if c.intel]
         selected_intel = [c for c in intel_cards if selected is None or c is selected]
         for card in selected_intel:
+            hwmon = _hwmon_dir(card.sysfs)
+            if hwmon:
+                _intel_power_w(hwmon)  # --once needs an energy baseline too
             if card.integrated:
                 _intel_rapl_w()  # arm the power baseline; RAPL is package-global, unaffected by sharing
         pmu_paths = {card.sysfs: _intel_pmu_path(card) for card in intel_cards}
@@ -1072,6 +1190,40 @@ class DrmCounters:
         self.status = "; ".join(notes)
         return clients, kfd, incomplete
 
+    def _cycle_rates(self, clients: dict, now: int) -> dict:
+        """Xe client load from GPU busy/total tick deltas; never a wall-clock conversion.
+
+        The DRM spec allows busy counters to step back temporarily, so retain their high
+        water mark. A total counter reset re-arms both counters; stalled totals are unknown.
+        Like the nanosecond path, class capacity is not divided out (one busy engine is 100%).
+        """
+        rates = {}
+        current = {}
+        for key, (_owners, info, _render, read_at) in clients.items():
+            cycles = info.get("cycles")
+            old = self._prev_cycles.get(key)
+            rates[key] = None
+            if cycles is None:
+                continue
+            high = {}
+            values = {}
+            for name, (busy, total) in cycles.items():
+                before = old[0].get(name) if old else None
+                if before is None or total < before[1]:
+                    high[name] = (busy, total)
+                    continue
+                high[name] = (max(busy, before[0]), total)
+                if total > before[1]:
+                    values[name] = min(100.0, 100.0 * (high[name][0] - before[0]) / (total - before[1]))
+            current[key] = (high, read_at)
+            if len(values) == len(cycles):
+                rates[key] = values
+        for key, value in self._prev_cycles.items():
+            if key not in current and now - value[1] < _PRUNE_NS:
+                current[key] = value
+        self._prev_cycles = current
+        return rates
+
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         by_pdev = {c.pdev: c.key for c in self.cards}
         by_key = {c.key: c for c in self.cards}
@@ -1088,6 +1240,22 @@ class DrmCounters:
                 by_pid.setdefault((by_pdev[client[1]["pdev"]], pid), []).append((client_key, client))
 
         now = self._clock()
+        cycle_rates = self._cycle_rates(clients, now)
+        for card in self.cards:
+            if card.driver != "xe":
+                continue
+            visible = [key for key, client in clients.items() if client[1]["pdev"] == card.pdev]
+            card.client_util = card.client_video = None
+            if (visible and not self.partial
+                    and all(not (set(clients[key][0]) & incomplete)
+                            and cycle_rates[key] is not None for key in visible)):
+                classes = {}
+                for key in visible:
+                    for name, pct in cycle_rates[key].items():
+                        classes[name] = min(100.0, classes.get(name, 0.0) + pct)
+                card.client_util = max(classes.values(), default=None)
+                card.client_video = max((pct for name, pct in classes.items()
+                                         if name.startswith(("vcs", "vecs"))), default=None)
         current: dict[tuple, tuple[dict[str, int], int]] = {}
         for client_key, (owners, info, _render, read_at) in clients.items():
             old = self._prev.get(client_key)
@@ -1155,15 +1323,19 @@ class DrmCounters:
             engines: dict[str, float] = {}
             for client_key, (owners, info, _render, read_at) in held:
                 old = self._prev.get(client_key)
-                if (proc.kfd or not complete or self.partial or len(owners) > 1 or info["engines"] is None
-                        or old is None or read_at - old[1] <= 0):
+                if (proc.kfd or not complete or self.partial or len(owners) > 1
+                        or (info["engines"] is None and cycle_rates[client_key] is None)
+                        or (info["engines"] is not None and (old is None or read_at - old[1] <= 0))):
                     engines = {}
                     proc.available.discard("engine")  # unknown, not 0 (rule 2)
                     break
-                delta = read_at - old[1]
-                for name, ns in current[client_key][0].items():
+                rates = cycle_rates[client_key]
+                if info["engines"] is not None:
+                    delta = read_at - old[1]
                     # amdgpu omits an engine until it has run, so a missing earlier value really is 0.
-                    pct = min(100.0, max(0.0, 100.0 * (ns - old[0].get(name, 0)) / delta))
+                    rates = {name: min(100.0, max(0.0, 100.0 * (ns - old[0].get(name, 0)) / delta))
+                             for name, ns in current[client_key][0].items()}
+                for name, pct in rates.items():
                     engine = _engine_key(name, info["pdev"] in unified, info["pdev"] in intel_pdevs)
                     engines[engine] = min(100.0, engines.get(engine, 0.0) + pct)
             for engine, pct in engines.items():
@@ -1179,6 +1351,9 @@ class DrmCounters:
     def close(self) -> None:
         """Close this collector's Intel PMU file descriptors, leaving other collectors alone."""
         for card in self.cards:
+            if card.xe_provider is not None:
+                card.xe_provider.close()
+                card.xe_provider = None
             for fd in card.pmu_state.get("fds", {}).values():
                 try:
                     os.close(fd)
