@@ -72,6 +72,9 @@ class DrmCard:
     vram_used: int | None = None
     pmu_state: dict = field(default_factory=dict, repr=False)
     xe_provider: object | None = field(default=None, repr=False)
+    pmt_provider: object | None = field(default=None, repr=False)
+    sysman_provider: object | None = field(default=None, repr=False)
+    sysman_retry_at: float = 0.0
     client_util: float | None = None
     client_video: float | None = None
 
@@ -602,7 +605,7 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
                         dev.video_clock = _int(str(media_gt / "freq0" / "act_freq"))
                         break
             dev.metric_status = {
-                "util_mem": "no Xe bandwidth counter in this provider",
+                "util_mem": "Xe does not expose NVML memory busy-time percentage",
                 "enc": "Xe exposes combined video activity instead",
                 "dec": "Xe exposes combined video activity instead",
                 "pstate": "NVIDIA-specific metric",
@@ -621,6 +624,7 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
                 if value is None:
                     dev.metric_status[metric] = ("perf access denied" if provider.pmu_error == "denied"
                                                else provider.pmu_error or "waiting for a complete counter interval")
+            _xe_extra_telemetry(card, dev)
         if dev.power_w is None and card.integrated:
             # No hwmon energy either: RAPL's uncore zone is the integrated GPU's power.
             # A discrete card keeps N/A here (uncore is not its power).
@@ -921,6 +925,67 @@ def _xe_device(card: DrmCard):
     return card.xe_provider
 
 
+def _xe_extra_telemetry(card: DrmCard, dev: DeviceTelemetry) -> None:
+    """Prefer native PMT/config-space readings, with optional PCI-matched Sysman fallbacks."""
+    from .intel_pmt import PmtTelemetry, pci_link
+    from .sysman import Sysman
+
+    if card.pmt_provider is None:
+        card.pmt_provider = PmtTelemetry(card.sysfs)
+    values, status, sources = card.pmt_provider.sample()
+    link, link_error = pci_link(card.sysfs)
+    values.update(link)
+    for key in ("pcie_gen", "pcie_width"):
+        if key in link:
+            sources[key] = "PCI configuration Link Status (GPU endpoint)"
+        else:
+            status[key] = link_error
+    now = time.monotonic()
+    if card.sysman_provider is None or (now >= card.sysman_retry_at and
+            (card.sysman_provider.error or card.sysman_provider.domain_errors)):
+        if card.sysman_provider is not None:
+            card.sysman_provider.close()
+        card.sysman_provider = Sysman(card.pdev)
+        card.sysman_retry_at = now + 30
+    all_fields = {"mem_read_bps", "mem_write_bps", "mem_bandwidth_pct", "mem_bandwidth_max_bps",
+                  "mem_clock", "pcie_rx_kbs", "pcie_tx_kbs", "pcie_gen", "pcie_width", "fan", "fan_rpm"}
+    wanted = {field for field in all_fields if values.get(field, getattr(dev, field)) is None}
+    for family in (("mem_read_bps", "mem_write_bps", "mem_bandwidth_pct", "mem_bandwidth_max_bps"),
+                   ("pcie_rx_kbs", "pcie_tx_kbs"), ("pcie_gen", "pcie_width")):
+        if all(values.get(key) is not None for key in family[:2]):
+            wanted.difference_update(family)
+    fallback, fallback_status, fallback_sources = card.sysman_provider.sample(wanted)
+    # Never splice one provider's bandwidth percentage into another's traffic rates.
+    for family in (("mem_read_bps", "mem_write_bps", "mem_bandwidth_pct", "mem_bandwidth_max_bps"),
+                   ("pcie_rx_kbs", "pcie_tx_kbs"), ("pcie_gen", "pcie_width")):
+        if all(values.get(key) is not None for key in family[:2]):
+            for key in family:
+                fallback.pop(key, None)
+        elif all(fallback.get(key) is not None for key in family[:2]):
+            for key in family:
+                values.pop(key, None)
+                if key not in fallback:
+                    sources.pop(key, None)
+    for key, value in fallback.items():
+        if value is not None and (values.get(key, getattr(dev, key)) is None):
+            values[key] = value
+            sources[key] = fallback_sources.get(key, "Intel Level Zero Sysman")
+    for key, reason in fallback_status.items():
+        if key == "sysman" or key not in status:
+            status[key] = reason
+    for key, value in values.items():
+        if value is not None:
+            setattr(dev, key, value)
+            dev.metric_status.pop(key, None)
+    for key, reason in status.items():
+        if key == "sysman" or getattr(dev, key, None) is None:
+            dev.metric_status[key] = reason
+    # Sources can identify a successfully primed counter while its first rate is still null.
+    dev.metric_sources.update(sources)
+    if dev.mem_read_bps is not None or "mem_read_bps" in sources:
+        dev.metric_status["util_mem"] = "busy-time percentage unavailable; see measured memory bandwidth"
+
+
 def _vcn_major(device: str) -> int:
     """Major version of the card's video block (VCN, listed as UVD in amdgpu's IP discovery); 0 if unknown."""
     return _int(os.path.join(device, "ip_discovery", "die", "0", "UVD", "0", "major")) or 0
@@ -1010,6 +1075,8 @@ class DrmCounters:
                 _intel_power_w(hwmon)  # --once needs an energy baseline too
             if card.integrated:
                 _intel_rapl_w()  # arm the power baseline; RAPL is package-global, unaffected by sharing
+            if card.driver == "xe":
+                _xe_extra_telemetry(card, DeviceTelemetry(index=0))  # prime PMT/Sysman rates for --once
         pmu_paths = {card.sysfs: _intel_pmu_path(card) for card in intel_cards}
         for card in selected_intel:
             path = pmu_paths[card.sysfs]
@@ -1351,9 +1418,11 @@ class DrmCounters:
     def close(self) -> None:
         """Close this collector's Intel PMU file descriptors, leaving other collectors alone."""
         for card in self.cards:
-            if card.xe_provider is not None:
-                card.xe_provider.close()
-                card.xe_provider = None
+            for provider in ("xe_provider", "pmt_provider", "sysman_provider"):
+                instance = getattr(card, provider)
+                if instance is not None:
+                    instance.close()
+                    setattr(card, provider, None)
             for fd in card.pmu_state.get("fds", {}).values():
                 try:
                     os.close(fd)

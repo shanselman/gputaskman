@@ -22,7 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MACHINES = {"x64": 0x8664, "arm64": 0xAA64}  # PE machine
 ELF_MACHINES = {"x64": 0x3E, "arm64": 0xB7}  # ELF e_machine
 # Provided by Windows or the installed GPU driver, never by the portable app.
-FORBIDDEN = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
+FORBIDDEN = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "dxgi.dll", "pdh.dll",
+             "libnvidia-ml.so", "libcuda.so", "libdxcore.so", "libze_loader.so", "libze_intel_gpu.so",
+             "ze_loader.dll", "ze_intel_gpu64.dll")
 PLATFORMS = {"win-amd64": ("windows", "x64"), "win-arm64": ("windows", "arm64"),
              "linux-x86_64": ("linux", "x64"), "linux-aarch64": ("linux", "arm64")}
 
@@ -151,6 +153,9 @@ def python_license() -> Path:
 def add_notices(bundle: Path, system: str = "windows") -> None:
     sep = "\\" if system == "windows" else "/"
     shutil.copy2(ROOT / "LICENSE", bundle / "LICENSE")
+    intel_notices = bundle / "licenses" / "intel-pmt"
+    intel_notices.mkdir(parents=True)
+    shutil.copy2(ROOT / "licenses" / "intel-pmt.txt", intel_notices / "LICENSE.txt")
     shutil.copy2(python_license(), bundle / "PYTHON-LICENSE.txt")
     installer = metadata.distribution("pyinstaller")
     license_files = [
@@ -174,6 +179,7 @@ def add_notices(bundle: Path, system: str = "windows") -> None:
         "Python: see PYTHON-LICENSE.txt.\n"
         f"PyInstaller bootloader: see licenses{sep}pyinstaller (including its exception).\n"
         f"NVIDIA Python bindings: see licenses{sep}nvidia-ml-py.\n"
+        f"Intel PMT register-layout reference: see licenses{sep}intel-pmt.\n"
         f"Runtime package metadata and license texts are included in _internal{sep}*.dist-info.\n"
         "GPU libraries are provided by the installed driver, system libraries by the operating system.\n",
         encoding="utf-8",

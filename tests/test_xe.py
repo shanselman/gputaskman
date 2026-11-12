@@ -254,7 +254,7 @@ class XeDeviceTests(unittest.TestCase):
                 self.assertIn("fan 960 RPM", text)
                 self.assertIn("visible DRM clients", text)
                 self.assertIn("Metric availability:", text)
-                self.assertIn("no Xe bandwidth counter", text)
+                self.assertIn("memory busy-time percentage", text)
             self.assertIn("VRAM 32°C", panel)
 
 
@@ -400,6 +400,48 @@ class IntelChartTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         Console(file=output, width=140, color_system=None).print(app.query_one("#charts").content)
         return output.getvalue()
+
+    async def test_measured_bandwidth_uses_gb_per_second_and_reaches_all_outputs(self):
+        from gputaskman.app import GpuTaskManager
+        from gputaskman.report import to_dict, to_text
+
+        snap = self.snapshot()
+        snap.nv.mem_read_bps, snap.nv.mem_write_bps = 2e9, 1e9
+        snap.nv.mem_bandwidth_max_bps, snap.nv.mem_bandwidth_pct = 10_000_000_000, 30
+        snap.nv.metric_sources = {"mem_read_bps": "Intel PMT (BMG G31)"}
+        snap.nv.pcie_rx_kbs, snap.nv.pcie_tx_kbs = 2048, 0
+        snap.nv.pcie_gen, snap.nv.pcie_width = 5, 16
+        snap.nv.mem_clock, snap.nv.fan = 1800, 40
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager(system=False)
+            async with app.run_test(size=(160, 48)) as pilot:
+                app.apply(snap)
+                await pilot.pause()
+                self.assertIn("Memory BW", self.chart_text(app))
+                self.assertEqual(app.hist_bw[-1], 3)
+                _, scale, unit, _ = app.chart_series(app.CHARTS.index("Mem activity"), snap.nv)
+                self.assertEqual((scale, unit), (10, " GB/s"))
+                panel = "\n".join(line.plain for line in app.render_device(snap).renderables)
+                for text in (panel, to_text(snap)):
+                    for expected in ("read 2.00 / write 1.00 GB/s", "max 10.00 GB/s", "30.0%", "Intel PMT",
+                                     "1800 MHz", "PCIe gen5 x16"):
+                        self.assertIn(expected, text)
+                    self.assertNotIn("P N/A", text)
+                data = to_dict(snap)["device"]
+                self.assertEqual(data["mem_read_bps"], 2e9)
+                self.assertIsNone(data["util_mem"])
+                # A counter read failure retains the chart but leaves a gap, not idle zero.
+                snap.nv.mem_read_bps = snap.nv.mem_write_bps = None
+                app.apply(snap)
+                await pilot.pause()
+                self.assertIsNone(app.hist_bw[-1])
+                self.assertIn("Memory BW", self.chart_text(app))
+                # Device/profile changes cannot combine percentage and GB/s histories.
+                nvml = self.snapshot(source="NVML")
+                nvml.nv.util_mem = 80
+                app.apply(nvml)
+                await pilot.pause()
+                self.assertEqual(list(app.hist_bw), [80])
 
     async def test_intel_uses_gt_and_combined_video_without_permanent_na_boxes(self):
         from gputaskman.app import GpuTaskManager

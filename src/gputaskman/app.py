@@ -23,7 +23,8 @@ from .llm import gb, redact_cmdline
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_shared_counters, has_wddm_counters,
-                     device_metric_notes, inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
+                     device_metric_notes, device_metric_sources, inferred_note, intel_memory_note, memory_bandwidth_label,
+                     vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -256,6 +257,7 @@ class GpuTaskManager(App):
         self.hist_util: deque = deque(maxlen=60)
         self.hist_clock: deque = deque(maxlen=60)
         self.hist_bw: deque = deque(maxlen=60)
+        self._bw_modes: dict[int, str] = {}
         self.hist_vram: deque = deque(maxlen=60)
         self.hist_temp: deque = deque(maxlen=60)
         self.hist_power: deque = deque(maxlen=60)
@@ -417,7 +419,14 @@ class GpuTaskManager(App):
         if nv:
             self.hist_util.append(nv.util_gpu)
             self.hist_clock.append(nv.gfx_clock if amd else nv.sm_clock)
-            self.hist_bw.append(nv.util_mem)
+            intel = nv.source == "Intel sysfs"
+            mode = "GB/s" if intel else "%"
+            if self._bw_modes.get(id(self.hist_bw), mode) != mode:
+                self.hist_bw.clear()  # samples with different units cannot share a chart
+            self._bw_modes[id(self.hist_bw)] = mode
+            self.hist_bw.append((nv.mem_read_bps + nv.mem_write_bps) / 1e9
+                                if intel and nv.mem_read_bps is not None and nv.mem_write_bps is not None
+                                else None if intel else nv.util_mem)
             self.hist_temp.append(nv.temp)
             self.hist_power.append(nv.power_w)
             self.hist_enc.append(nv.video if nv.source == "Intel sysfs" else nv.enc)
@@ -434,7 +443,8 @@ class GpuTaskManager(App):
         clock_label = "GPU clock" if len(self.snapshots) > 1 else self.chart_label(self.CHARTS.index("SM clock"), self.snapshots[0])
         intel = [bool(s.nv and s.nv.source == "Intel sysfs") for s in self.snapshots]
         video_label = "Video" if all(intel) else "Encoder / Video" if any(intel) else "Encoder"
-        profile = (tuple(self.available_charts), clock_label, video_label)
+        bw_label = "Memory BW" if all(intel) else "Mem activity / BW" if any(intel) else "Mem activity"
+        profile = (tuple(self.available_charts), clock_label, video_label, bw_label)
         if getattr(self, "_chart_profile", None) != profile:
             self._chart_profile = profile
             selector = self.query_one("#chart-mode", Select)
@@ -442,7 +452,8 @@ class GpuTaskManager(App):
             self.chart_idx = selected
             selector.set_options([("All charts", -1), *(
                 (clock_label if self.CHARTS[index] == "SM clock" else
-                 video_label if self.CHARTS[index] == "Encoder" else self.CHARTS[index], index)
+                 video_label if self.CHARTS[index] == "Encoder" else
+                 bw_label if self.CHARTS[index] == "Mem activity" else self.CHARTS[index], index)
                 for index in self.available_charts)])
             selector.value = selected
         self._amd_chart_labels = amd
@@ -592,6 +603,8 @@ class GpuTaskManager(App):
             if not is_intel:
                 m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
                 m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
+            elif nv.pcie_rx_kbs is not None or nv.pcie_tx_kbs is not None:
+                m.append(f"  PCIe↓{format_metric(rx, '.1f')} ↑{format_metric(tx, '.1f')} MiB/s")
             if nv.enc or nv.dec:
                 m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
             if nv.video is not None:
@@ -599,6 +612,8 @@ class GpuTaskManager(App):
                 if nv.video_kind:
                     m.append(f" ({nv.video_kind})", style="grey62")
             lines.append(m)
+            if memory_bandwidth_label(nv):
+                lines.append(Text(memory_bandwidth_label(nv), style=self.CHART_COLORS["Mem activity"]))
             clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if is_amd else
                            f"GT {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz" if is_intel else
                            f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz")
@@ -625,11 +640,19 @@ class GpuTaskManager(App):
                 st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
             if nv.fan_rpm is not None:
                 st.append(f"  fan {nv.fan_rpm} RPM")
+            if is_intel and nv.fan is not None:
+                st.append(f" ({nv.fan}%)" if nv.fan_rpm is not None else f"  fan {nv.fan}%")
             if nv.vram_temp is not None:
                 st.append(f"  VRAM {format_metric(nv.vram_temp, unit='°C')}")
+            if is_intel and nv.mem_clock is not None:
+                st.append(f"  mem {format_metric(nv.mem_clock)} MHz")
+            if is_intel and nv.pcie_gen is not None and nv.pcie_width is not None:
+                st.append(f"  PCIe gen{nv.pcie_gen} x{nv.pcie_width}")
             lines.append(st)
             if nv.metric_status and not self.monitoring:
                 lines.append(Text("Metric availability: " + device_metric_notes(nv), style="grey62"))
+            if device_metric_sources(nv) and not self.monitoring:
+                lines.append(Text("Metric sources: " + device_metric_sources(nv), style="grey62"))
         return Group(*lines)
 
     def chart_series(self, index: int, nv: NvDevice | None) -> tuple[deque, float, str, str]:
@@ -644,6 +667,10 @@ class GpuTaskManager(App):
         if chart == "VRAM":
             return self.hist_vram, 100, "%", color
         if chart == "Mem activity":
+            if nv and nv.source == "Intel sysfs":
+                values = [value for value in self.hist_bw if value is not None]
+                scale = max((nv.mem_bandwidth_max_bps or 0) / 1e9, max(values, default=0), 1)
+                return self.hist_bw, scale, " GB/s", color
             return self.hist_bw, 100, "%", color
         if chart == "Temperature":
             return self.hist_temp, 120, "°C", color
@@ -945,13 +972,15 @@ class GpuTaskManager(App):
             return [i for i, name in enumerate(self.CHARTS) if name in METAL_CHARTS]
         if snap and snap.nv and snap.nv.source == "Intel sysfs":
             # Intel reports combined video, not separate encoder/decoder or memory activity.
-            return [i for i, name in enumerate(self.CHARTS) if name not in ("Mem activity", "Decoder")]
+            bandwidth = "mem_read_bps" in snap.nv.metric_sources or snap.nv.mem_read_bps is not None
+            return [i for i, name in enumerate(self.CHARTS) if name != "Decoder" and
+                    (name != "Mem activity" or bandwidth)]
         return list(range(len(self.CHARTS)))
 
     def chart_label(self, index: int, snap: Snapshot | None) -> str:
         name = self.CHARTS[index]
         if snap and snap.nv and snap.nv.source == "Intel sysfs":
-            return {"SM clock": "GT clock", "Encoder": "Video"}.get(name, name)
+            return {"SM clock": "GT clock", "Encoder": "Video", "Mem activity": "Memory BW"}.get(name, name)
         if name == "SM clock" and snap and snap.adapter and snap.adapter.vendor_id == 0x1002:
             return "GFX clock"
         return name

@@ -267,7 +267,7 @@ covered by unit tests only and **not yet validated on AMD hardware**.
 | Per-process VRAM and Shared | i915: `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions. Xe: the sum of `drm-resident-vramN` and `drm-resident-gtt`; CPU-only `system` bytes are kept apart. Both use the same private-client rules as AMD. On an integrated GPU there is no local memory: a provably private client's system/GTT bytes are its GPU memory in the VRAM column, and Shared stays `N/A` (system memory is its memory, not spill). On a discrete card system/GTT bytes include buffers placed there on purpose, so Shared is where they are, not proof they were pushed out of VRAM. The shared gate needs every region's sharing counter, including Xe's `system` and `stolen` regions when present. Missing sharing counters keep private memory `n/a` (`legacy`); shared buffers keep it `n/a` (`shared_buffers`). An unparseable or missing resident value makes that figure `n/a`, not a smaller sum |
 | Per-process engine load (3d, compute, copy, video) | i915: `drm-engine-render`, `-compute`, `-copy`, `-video`, `-video-enhance` busy time, sampled twice. Xe: `100 * delta(drm-cycles-CLASS) / delta(drm-total-cycles-CLASS)` for `rcs`, `ccs`, `bcs`, `vcs`, `vecs`; GPU ticks are never divided by CPU wall time. First samples, missing/malformed pairs and stalled/reset total counters stay `n/a`; a measured idle interval is 0. A temporarily decreasing busy counter retains its high-water mark, per the DRM specification. A class with several identical engines is not divided by its capacity, so one busy engine reads 100%, capped at 100% like the existing nanosecond path |
 
-Device memory bandwidth and the PCIe link are `n/a`: i915 has no device-wide bandwidth counter, and its
+On i915, device memory bandwidth and the PCIe link are `n/a`: it has no device-wide bandwidth counter, and its
 sysfs link fields can report the power-on default instead of the live link. Device GPU load and video load
 come from the i915 performance counters and need root; power comes from RAPL's uncore zone on an integrated
 GPU and needs root too.
@@ -290,12 +290,54 @@ Xe also reads `power1_cap`, measured `fan1_input` RPM, the labelled VRAM tempera
 GT's actual frequency (located by video engines). JSON adds `fan_rpm`, `vram_temp`, and
 `metric_status`; the dashboard and `--once` show the sensors and unavailable-metric reasons.
 The Intel dashboard uses six applicable charts, labels the GT clock correctly, and shows combined
-video activity. It omits unsupported memory-activity and separate encoder/decoder charts, plus
-NVIDIA-only states and unavailable PCIe/memory-clock fields from the device header. Supported
+video activity. A seventh **Memory BW** chart appears when a supported bandwidth counter can be
+sampled. It omits separate encoder/decoder charts, NVIDIA-only states and unavailable
+PCIe/memory-clock fields from the device header. Supported
 counters still show `N/A` when unreadable or awaiting an interval; unknown is never converted to idle.
-A missing maximum RPM keeps fan percentage unknown. Memory bandwidth/activity, memory clock,
-PCIe traffic/link, separate encode/decode, NVIDIA P-states and CUDA capability remain unavailable
-with explanations, rather than fabricated values.
+A missing maximum RPM or percentage sensor keeps fan percentage unknown; measured RPM remains useful.
+Separate encode/decode, NVIDIA P-states and CUDA capability do not have direct Xe equivalents.
+
+On BMG G31 (including the B65 checked below), `intel_pmt.py` reads **measured memory read/write
+traffic and PCIe RX/TX traffic**, plus firmware-reported memory MHz and maximum bandwidth, from
+PCI-matched Intel PMT endpoints. Only the documented PUNIT rev 3 GUID `0x1e2f8302` and OOBMSM
+rev 16 GUID `0x5e2f8311` are decoded; other revisions stay unknown. The layout follows
+[Intel's BMG implementation](https://github.com/intel/compute-runtime/blob/13f35c66bc22a281b812e328d79871ea43fb9e0d/level_zero/sysman/source/shared/linux/product_helper/xe2_hpg_core/bmg/sysman_product_helper_bmg.cpp).
+PMT files may require host read permission (they are mode `0440` on the checked B65). Discovery
+and denied opens retry every five seconds; successful handles are reused and closed with the collector.
+Rates require two valid counter samples. Resets, changed memory-subsystem masks, torn/short reads
+and permission failures produce unknown values and re-prime the baseline.
+
+An optional [Level Zero Sysman](https://oneapi-src.github.io/level-zero-spec/level-zero/latest/sysman/PROG.html)
+fallback uses the installed `libze_loader.so.1` on native 64-bit Linux and matches the full PCI
+address. It can supply missing memory/PCIe traffic, actual memory frequency and fan percentage.
+No driver libraries are bundled. Initialization uses `zesInit`, without a compute context or any
+settings writes; legacy `ZES_ENABLE_SYSMAN=1` conflicts with this initialization and must be unset
+for the monitor. Missing libraries or unsupported domains leave reasons in `metric_status`.
+Failed initialization/domain discovery retries after 30 seconds. Driver calls are synchronous;
+successful initialization and sampling costs depend on the installed runtime and remain unmeasured here.
+
+Live PCIe generation/width come from PCI configuration **Link Status**, with Sysman's live state
+as fallback. Neither stale sysfs defaults nor advertised maximum link speed replace an unreadable
+live value. The JSON fields `mem_read_bps` / `mem_write_bps` contain measured bytes/sec;
+`mem_bandwidth_max_bps` is firmware/driver-reported, and `mem_bandwidth_pct` is the derived ratio
+of traffic to that reported maximum. `metric_sources` identifies each provider. These are separate
+from NVML's memory busy-time percentage (`util_mem`), which remains `null` on Xe. The chart and
+bandwidth line use decimal GB/s; the existing PCIe counters retain KiB/s internally and the Intel
+display labels their conversion as MiB/s.
+
+From a source checkout, a read-only host check samples twice without scanning processes or loading
+a model. Use the Python environment where gputaskman is installed:
+
+```bash
+python tools/check_intel_telemetry.py --pci 0000:04:00.0 > intel-user.json
+# If the first report says PMT/config reads are denied, compare an administrator read:
+sudo "$(command -v python)" tools/check_intel_telemetry.py --pci 0000:04:00.0 > intel-admin.json
+```
+
+This changes no permissions or driver settings. Success in the administrator report distinguishes
+an access restriction from missing driver support. A first sample can be unknown; inspect the
+second sample and its `metric_status` / `metric_sources`. Hardware validation under load still
+requires running a workload separately and comparing the measurements.
 
 Live check, reported by the contributor and not repeated by the maintainer: Linux 6.12, an Arc A770 (discrete, 16 GiB
 BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and selectable with `--gpu`; the Arc showed
@@ -314,6 +356,10 @@ GT frequency. The GPU render node, host PID namespace and localhost sockets were
 the agent sandbox: the installed `qwen3-coder-next:q4_K_M` (79.7B parameters) could not be loaded
 or observed. Device-query/PMU and visible-client fallback behavior are covered by synthetic tests,
 **not live 80B validation**. No inference request was sent for either check.
+A further check found both exact PMT GUIDs above, but their binary telemetry reads returned access
+denied. PCI configuration reads stopped at 64 bytes, before Link Status; the Sysman loader was absent.
+Consequently the new PMT/Sysman bandwidth, memory-clock and PCIe paths are **fixture-tested, not
+validated live on this card**. The host check above is required before claiming those measurements work.
 
 Live check on an integrated GPU (ASUS Vivobook 14 X1404VA, Intel Core 3 100U Xe-LP, `i915`, kernel 7.3.1, Mesa 26.2.5):
 the card is found and named, the header shows the actual GT clock (`GT 300/1250 MHz`) with no throttle reasons active,
@@ -824,8 +870,9 @@ fallback and slower inference, but the counter alone cannot establish why it was
 It is not an eviction trace, a pagefile measurement, or proof that Windows just moved
 those bytes out of VRAM. The value is also less reliable when fallback counters are in use.
 
-Memory labels currently use `GB` / `MB` for binary units (GiB / MiB). The `Mem activity`
-reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**.
+Memory-capacity labels currently use `GB` / `MB` for binary units (GiB / MiB). The `Mem activity`
+reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**. Intel's separate
+`Memory BW` chart uses measured read + write traffic in decimal GB/s when PMT/Sysman supports it.
 
 ## LLM and model support
 
@@ -969,6 +1016,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | Intel Xe device sysfs (labelled GPU temperature, board energy, primary-GT frequency/throttle) | 0.43 ms median, 0.79 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic | Every refresh for the selected Xe card; energy sampling needs two readings, primed at startup. Host process/fd scans were unavailable in this agent's process namespace and are not included |
 | Intel Xe extended provider (sensors, media clock, memory query and PMU fallback) | 1.56 ms median, 1.83 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic, 2026-11-12 | Selected card only; render-node access was unavailable, so this measures cached query failure plus sysfs sensors. Successful device-query/PMU cost and host fd scans remain unmeasured |
+| Intel Xe PMT/config/Sysman additions | 2.15 ms first call; 0.043 ms median, 0.069 ms max across 30 warm reads on the same B65, 2026-11-12. Whole `read_device` with these additions: 1.49 ms median, 2.68 ms max | PMT read denied, PCI config truncated, optional loader absent; these are cached failure-path costs. Successful PMT/Sysman cost remains unmeasured. PMT discovery/open retries every 5 s; failed Sysman initialization/domain discovery every 30 s. PMT reads at most three 16 KiB frames per endpoint per refresh; PCI config reads at most 256 bytes |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |

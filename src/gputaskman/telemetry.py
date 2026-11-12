@@ -44,3 +44,8 @@ class DeviceTelemetry:
     video_kind: str = ""
     memory_note: str = ""  # provider-specific provenance of device memory figures
     metric_status: dict[str, str] = field(default_factory=dict)  # unavailable metric -> reason
+    metric_sources: dict[str, str] = field(default_factory=dict)  # optional metric -> interface/provenance
+    mem_read_bps: float | None = None  # measured memory traffic, bytes/sec; not allocated bytes
+    mem_write_bps: float | None = None
+    mem_bandwidth_max_bps: int | None = None  # driver/firmware-reported current limit
+    mem_bandwidth_pct: float | None = None  # derived traffic / reported limit; not NVML's busy-time %

@@ -78,6 +78,17 @@ Intel VRAM used is a visible-client sum and total a PCI window estimate. Every c
 output (`--once`, `--json`) uses `scan_budget=None` to
 identify everything immediately; the TUI spreads scans across refreshes.
 
+Xe's optional traffic providers are `intel_pmt.py` (exact PCI-path/GUID-matched BMG G31 PMT)
+and `sysman.py` (native 64-bit Linux, system-installed Level Zero loader, `zesInit`, full PCI
+BDF match). Keep byte-rate families from one provider together, preserve first/reset/denied
+samples as unknown, and never substitute PCI advertised maxima or stale sysfs defaults for
+live Link Status. `mem_read_bps` / `mem_write_bps` are measured traffic, not allocation;
+`mem_bandwidth_max_bps` is reported and `mem_bandwidth_pct` is derived. They never populate
+NVML `util_mem` or process-memory totals. Retain `metric_sources` and optional-runtime failure
+reasons. Close PMT descriptors with the owning collector. `tools/check_intel_telemetry.py`
+performs a read-only two-sample host audit; it starts no model or process scan. PMT/Sysman
+success paths currently have synthetic coverage only, despite PMT metadata being visible on B65.
+
 ## Where to change things
 
 | Change | Start in | Notes |
