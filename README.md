@@ -1,5 +1,20 @@
 # gputaskman
 
+[Русское руководство](README.ru.md). This checkout starts in Russian. Use `--lang en`
+or `GPUTASKMAN_LANG=en` for English. Saved JSON retains its existing keys, evidence
+identifiers and values in either language. On Windows, the TUI also creates a notification
+icon with GPU utilization, VRAM and temperature; the console title carries the same summary.
+`t` minimizes a classic console to the taskbar. Windows Terminal uses its own minimize button;
+its pseudoconsole handle is not a visible window. `--no-tray` disables desktop integration.
+
+Windows also displays an always-visible text panel over the free area of the primary
+horizontal taskbar. Drag it to another free spot; its position and visibility are saved
+in `%LOCALAPPDATA%/gputaskman/taskbar.json`. Right-click the panel or tray icon and toggle
+**Show readings on taskbar**, or use `--no-taskbar` for a temporary opt-out. This is a
+non-activating application window; it does not reserve taskbar space or modify Explorer.
+It follows taskbar geometry/DPI and hides for full-screen applications and taskbar autohide.
+Multi-monitor placement and third-party taskbar replacements have not been hardware-validated.
+
 **An `htop` for what's inside your GPU, not just how full it is.**
 
 Windows with NVIDIA/AMD telemetry and Intel WDDM activity, plus Linux and WSL support (NVIDIA
@@ -929,6 +944,8 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Probe | Cost | Used |
 |---|---|---|
 | Process list, command line, listening ports | under 1 ms | Once per process / every 5 s |
+| Windows taskbar text panel (no GPU probe) | ~0.42 ms median, 1.56 ms max for text/geometry updates in a live desktop preview (Windows 11 build 26200, RTX 3060, driver 610.88); excludes asynchronous painting | Existing snapshot text only. Geometry is checked once per second and on updates. Drawing and dragging checked via computer-use; production uses NOACTIVATE/TOOLWINDOW, while the test preview permits focus for automation. No Explorer injection or foreign-window resizing |
+| Russian presentation and Windows notification icon (no probe) | Dynamic translation: 0.0081 ms median / 0.0382 ms max over 999 distinct KV labels; enqueueing a native icon update: 0.0020 / 0.0346 ms over 100 updates (Windows 11 build 26200, RTX 3060, driver 610.88, Python 3.13.15). The latter excludes asynchronous Explorer processing | Existing snapshots only, once per TUI refresh; no new GPU/process reads. `--no-tray` disables the icon and title updates. Native create/update/delete and thread shutdown checked on this machine; console minimize/restore covered by mocked Win32 calls, mouse interaction not manually validated |
 | Windows adapter discovery (DXGI + exact-LUID PnP identity + PCI location, no telemetry sample) | ~0.86 ms median, 2.60 ms max in 30 warm reads, 26.1 ms first/cold call (Windows 11 build 28000, RTX Spark N1X, driver 32.0.16.2114); same machine without the PnP probe: ~0.36 ms median | Once at startup; TUI rediscovery every 5 s. PnP uses fixed buffers, one interface lookup per adapter and at most two name-property reads, no path/device enumeration or retries. Synchronous OS calls are not a hard latency bound. Other drivers, virtual displays and multi-GPU laptops unmeasured; provider reconstruction has additional driver-dependent cost |
 | Windows NVML handle reacquisition (no telemetry sample) | ~8.7 ms median, 9.3 ms max in 30 reads (Windows 11 build 26340, RTX 4080 SUPER, NVIDIA 630.20) | Every 5 s per active collector; retries initialization after NVML session-loss errors. Other drivers unmeasured |
 | Windows TCC discovery (NVML init, device count, one driver-model read per GPU, shutdown) | First call in 15 fresh processes on the same machine, one WDDM GPU: median 37.6 ms, 27.8-43.8 ms. About 15 ms of that is the first `nvmlInit` (it loads `nvml.dll`), which NVML readings pay anyway; the added cost is one extra init-to-shutdown cycle, median 20.7 ms (13.3-30.3 ms). Later calls are cached (about 3 µs). A TCC GPU adds PCI, name and memory reads, which are unmeasured (no TCC hardware here) | Once per process on Windows, including `--list-gpus`; never repeated while running |
