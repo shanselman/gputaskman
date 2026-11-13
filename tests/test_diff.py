@@ -257,6 +257,7 @@ class AdapterGuardTests(unittest.TestCase):
                 self.assertEqual(d["adapter_check"], "name-only", (backend, bad))
 
 
+@patch.dict("os.environ", {"GPUTASKMAN_LANG": "en"})
 class LoadAndCliTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

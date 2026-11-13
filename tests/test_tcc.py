@@ -665,6 +665,7 @@ class CollectorSetupTests(TccTestCase):
         mocks["GpuCounters"].assert_not_called()
 
 
+@patch.dict("os.environ", {"GPUTASKMAN_LANG": "en"})
 class CliTests(unittest.TestCase):
     def test_list_gpus_shows_a_tcc_gpu_by_pci_address_after_the_listed_ones(self):
         output = io.StringIO()

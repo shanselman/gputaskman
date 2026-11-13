@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+from .i18n import diagnostic, current_language, in_app_language, inside, kind_label, localized_app, tr, translate_bindings
+
 import os
 from collections import deque
 from contextlib import ExitStack
+from functools import partial
 
+from rich.align import Align
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import CommandList, CommandPalette, SimpleProvider
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Markdown, Select, Static
+from textual.widgets.option_list import Option
 from textual.worker import get_current_worker
 
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
@@ -141,6 +147,15 @@ row seen from WSL); `…` means one more sample is needed. Inside WSL they descr
 
 Keys: `↑/↓` select · `s` sort · `c` chart · `a` show all · `p` pause · `?` this help · `q` quit
 
+On Windows, the notification icon and console title show GPU load, VRAM and temperature.
+The same readings are always visible over the taskbar's free area. Drag the text panel
+to reposition it; right-click it or the tray icon to toggle "Show readings on taskbar".
+Position and visibility are remembered. `--no-taskbar` hides just this panel for one run.
+`t` minimizes a classic console to the taskbar; double-click the icon to restore it.
+In Windows Terminal, use the terminal's minimize button and taskbar entry instead.
+Right-click the icon for its menu. Sampling continues while minimized; paused readings
+are marked. `--no-tray` disables all desktop integration. Other platforms have no icon.
+
 All eight trend charts are visible by default. They stack in narrow terminals and
 share rows when there is room. Click the **Charts** dropdown to show all charts or
 one metric; `c` cycles the same choices. A blank sample means no reading; zero is
@@ -172,6 +187,7 @@ def stacked_bar(parts: list[tuple[float, str]], total: float, width: int) -> Tex
     return t
 
 
+@localized_app
 class HelpScreen(ModalScreen):
     BINDINGS = [Binding("escape,q,question_mark", "app.pop_screen", "Close")]
     DEFAULT_CSS = """
@@ -179,14 +195,43 @@ class HelpScreen(ModalScreen):
     HelpScreen > VerticalScroll { width: 140; max-width: 95%; height: 85%; border: thick $accent; background: $surface; padding: 1 2; }
     """
 
+    def __init__(self) -> None:
+        self.language = current_language()
+        super().__init__()
+        translate_bindings(self._bindings)
+
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Markdown(HELP_MD)
+            from .ru import HELP_RU
+            yield Markdown(HELP_RU if self.language == "ru" else HELP_MD)
 
 
 METAL_CHARTS = ("GPU", "VRAM")
 
 
+@localized_app
+class LocalizedPalette(CommandPalette):
+    def __init__(self, **kwargs):
+        self.language = current_language()
+        kwargs.setdefault("placeholder", tr("Search for commands…"))
+        super().__init__(**kwargs)
+        translate_bindings(self._bindings)
+
+    def _start_no_matches_countdown(self, search_value: str) -> None:
+        self._stop_no_matches_countdown()
+        message = tr("No matches found")
+
+        def show():
+            if search_value:
+                self.query_one(CommandList).add_option(
+                    Option(Align.center(Text(message, style="not bold")), disabled=True, id=self._NO_MATCHES))
+                self._list_visible = True
+            else:
+                self._list_visible = False
+        self._no_matches_timer = self.set_timer(self._NO_MATCHES_COUNTDOWN, show)
+
+
+@localized_app
 class GpuTaskManager(App):
     TITLE = "gputaskman"
     CSS = """
@@ -196,8 +241,8 @@ class GpuTaskManager(App):
     #device { height: auto; border: round $accent; padding: 0 1; }
     #history { height: auto; border: round $secondary; padding: 0 1; }
     #chart-controls { height: 1; }
-    #chart-label { width: 8; text-style: bold; }
-    #chart-mode { width: 24; }
+    #chart-label { width: 9; text-style: bold; }
+    #chart-mode { width: 27; }
     #chart-mode SelectOverlay { border: solid $accent; padding: 0 1; }
     #chart-hint { width: 1fr; color: $text-muted; }
     #charts { height: auto; }
@@ -213,6 +258,7 @@ class GpuTaskManager(App):
         Binding("m", "toggle_monitoring", "Slim/Full"),
         Binding("p", "pause", "Pause"),
         Binding("question_mark", "help", "Explain"),
+        Binding("t", "minimize", "Minimize", show=os.name == "nt"),
     ]
     SORTS = [("VRAM", lambda r: -(r.gpu.shown_vram or 0)), ("GPU%", lambda r: -r.gpu.gpu_pct),
              ("Shared", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
@@ -232,8 +278,13 @@ class GpuTaskManager(App):
     CHARTS = tuple(CHART_COLORS)
 
     def __init__(self, gpu_index: int | None = None, interval: float = 1.0, host: bool = True,
-                 system: bool = True) -> None:
+                 system: bool = True, tray: bool = False, taskbar: bool = True) -> None:
+        self.language = current_language()
         super().__init__()
+        translate_bindings(self._bindings)
+        self.tray_enabled = tray and os.name == "nt"
+        self.taskbar_enabled = taskbar
+        self._desktop = None
         self.system = system
         self.sorts = self.SORTS + self.SYSTEM_SORTS if system else self.SORTS
         self.host_sample: HostSample | None = None
@@ -277,17 +328,17 @@ class GpuTaskManager(App):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="dashboard"):
-            yield Static("Sampling GPU counters...", id="device")
+            yield Static(tr("Sampling GPU counters..."), id="device")
             if self.system:
-                yield Static("Sampling RAM and CPU...", id="system")
+                yield Static(tr("Sampling RAM and CPU..."), id="system")
             with Vertical(id="history"):
                 with Horizontal(id="chart-controls"):
-                    yield Static("Charts", id="chart-label")
+                    yield Static(tr("Charts"), id="chart-label")
                     yield Select(
-                        [("All charts", -1), *((self.CHARTS[index], index) for index in self.available_charts)],
+                        [(tr("All charts"), -1), *((tr(self.CHARTS[index]), index) for index in self.available_charts)],
                         value=-1, allow_blank=False, compact=True, id="chart-mode",
                     )
-                    yield Static("Click to choose · c cycles", id="chart-hint")
+                    yield Static(tr("Click to choose · c cycles"), id="chart-hint")
                 yield Static(id="charts")
                 yield Static(id="chart-note")
         table = DataTable(id="procs", cursor_type="row", zebra_stripes=True)
@@ -301,11 +352,24 @@ class GpuTaskManager(App):
         if self.system:
             cols += ["RAM", "CPU%"]
         for col in (*cols, "What's inside"):
-            t.add_column(col, key=col)
+            t.add_column(tr(col), key=col)
         t.focus()
+        if self.tray_enabled:
+            from .tray import WindowsTray
+            self._desktop = WindowsTray(lambda: self.call_from_thread(self.exit), self.language,
+                                        taskbar=self.taskbar_enabled)
+            if not self._desktop.start():
+                self.notify(tr("Notification icon unavailable: {0}").format(tr(self._desktop.error)), severity="warning")
+            elif self._desktop.panel_error:
+                self.notify(tr("Taskbar panel unavailable: {0}").format(self._desktop.panel_error), severity="warning")
         self.poll()
 
+    def on_unmount(self) -> None:
+        if self._desktop:
+            self._desktop.close()
+
     @work(thread=True, exclusive=True)
+    @in_app_language
     def poll(self) -> None:
         worker = get_current_worker()
         self._sample_host()  # the first reading only primes the CPU rates
@@ -402,6 +466,13 @@ class GpuTaskManager(App):
         self.render_dashboard()
         self.render_table(self.snap)
         self.render_inspector()
+        self._update_desktop()
+
+    def _update_desktop(self) -> None:
+        if self._desktop and self.snapshots:
+            from .tray import compact_summary
+            summary = compact_summary(self.snapshots, self.paused, self.gpu_index)
+            self._desktop.update(summary)
 
     def _use_history(self, index: int) -> None:
         names = ("util", "clock", "bw", "vram", "temp", "power", "enc", "dec")
@@ -431,13 +502,13 @@ class GpuTaskManager(App):
 
     def render_dashboard(self) -> None:
         amd = bool(self.snapshots[0].adapter and self.snapshots[0].adapter.vendor_id == 0x1002)
-        clock_label = "SM/GFX clock" if len(self.snapshots) > 1 else "GFX clock" if amd else "SM clock"
+        clock_label = tr("SM/GFX clock") if len(self.snapshots) > 1 else tr("GFX clock") if amd else tr("SM clock")
         if getattr(self, "_clock_label", None) != clock_label:
             self._clock_label = clock_label
             selector = self.query_one("#chart-mode", Select)
             selected = selector.value
-            selector.set_options([("All charts", -1), *(
-                (clock_label if self.CHARTS[index] == "SM clock" else self.CHARTS[index], index)
+            selector.set_options([(tr("All charts"), -1), *(
+                (clock_label if self.CHARTS[index] == "SM clock" else tr(self.CHARTS[index]), index)
                 for index in self.available_charts)])
             selector.value = selected
         self._amd_chart_labels = amd
@@ -448,13 +519,13 @@ class GpuTaskManager(App):
             devices.append(self.render_device(snap))
         if self.system:
             system = self.query_one("#system", Static)
-            system.border_title = "System (WSL VM, OS-reported)" if BACKEND == "wsl" else "System (OS-reported)"
+            system.border_title = tr("System (WSL VM, OS-reported)") if BACKEND == "wsl" else tr("System (OS-reported)")
             if self.host_sample:
                 system.update(self.render_system(self.host_sample))
             elif self.host_error:
-                system.update(Text(f"RAM/CPU unavailable: {self.host_error}", style="yellow"))
+                system.update(Text(tr(f"RAM/CPU unavailable: {self.host_error}"), style="yellow"))
         device = self.query_one("#device", Static)
-        device.border_title = "Slim monitoring" if self.monitoring else "Full diagnostics"
+        device.border_title = tr("Slim monitoring") if self.monitoring else tr("Full diagnostics")
         device.update(
             Group(*devices) if len(self.snapshots) > 1 else devices[0])
         self.render_charts()
@@ -471,24 +542,24 @@ class GpuTaskManager(App):
         ram_tail = line()
         ram_tail.append(f" {gb(h.ram_used)} / {gb(h.ram_total)}", style="bold")
         ram_tail.append(f"  {ram_pct:.0f}%", style="grey62")
-        optional = [(f"  free {gb(h.ram_available)}", "grey62")]
+        optional = [(tr(f"  free {gb(h.ram_available)}"), "grey62")]
         if h.swap_total:
-            optional.append((f"  {'pagefile' if os.name == 'nt' else 'swap'} {gb(h.swap_used)}/{gb(h.swap_total)}",
+            optional.append((f"  {tr('pagefile') if os.name == 'nt' else tr('swap')} {gb(h.swap_used)}/{gb(h.swap_total)}",
                              "yellow" if h.swap_used > h.swap_total / 4 else "grey62"))
         for extra, style in optional:  # detail is dropped, not wrapped, in a narrow window
             if ram_tail.cell_len + len(extra) + min_bar <= room:
                 ram_tail.append(extra, style=style)
         cpu_tail = line()
         cpu_tail.append(f" {h.cpu_pct:4.0f}%", style="bold")
-        threads = f"  {h.logical} threads" + (f"/{h.physical} cores" if h.physical else "")
+        threads = tr(f"  {h.logical} threads") + (tr(f"/{h.physical} cores") if h.physical else "")
         if not self.monitoring and cpu_tail.cell_len + len(threads) + min_bar <= room:
             cpu_tail.append(threads, style="grey62")
         # Both bars share one width, sized so the longer line still fits on a single row.
         width = max(min_bar, min(60, room - max(ram_tail.cell_len, cpu_tail.cell_len)))
-        ram = line("RAM  ")
+        ram = line(tr("RAM  "))
         ram.append_text(stacked_bar([(h.ram_used, "dodger_blue2")], h.ram_total, width))
         ram.append_text(ram_tail)
-        cpu = line("CPU  ")
+        cpu = line(tr("CPU  "))
         cpu.append_text(stacked_bar([(h.cpu_pct, "green3")], 100, width))
         cpu.append_text(cpu_tail)
         if self.monitoring:
@@ -497,22 +568,22 @@ class GpuTaskManager(App):
         for v in h.per_core:
             cores.append(SPARK[min(int(v / 100 * (len(SPARK) - 1) + 0.5), len(SPARK) - 1)],
                          style="red" if v >= 90 else "yellow" if v >= 60 else "green3")
-        cores.append("  per-thread", style="grey50")
+        cores.append(tr("  per-thread"), style="grey50")
         history = max(8, min(30, (room - 18) // 2))  # each sparkline's width: two of them plus their labels share a row
         hist = line("     ")
         hist.append(spark(self.hist_cpu, history), style="green3")
-        hist.append(" CPU 60s   ", style="grey50")
+        hist.append(tr(" CPU 60s   "), style="grey50")
         hist.append(spark(self.hist_ram, history), style="dodger_blue2")
-        hist.append(" RAM 60s", style="grey50")
+        hist.append(tr(" RAM 60s"), style="grey50")
         top_ram = line()
-        top_ram.append("     top RAM: ", style="grey62")
+        top_ram.append(tr("     top RAM: "), style="grey62")
         top_ram.append("  ".join(f"{p.name} {gb(p.rss)}" for p in h.top("rss", 5)))
         top_cpu = line()
-        top_cpu.append("     top CPU: ", style="grey62")
+        top_cpu.append(tr("     top CPU: "), style="grey62")
         rated = h.top("cpu_pct", 5)
         busy = [p for p in rated if p.cpu_pct >= 0.5]
         # "…" until some process has a CPU reading: no reading yet is not the same as idle
-        top_cpu.append("  ".join(f"{p.name} {p.cpu_pct:.0f}%" for p in busy) if busy else "idle" if rated else "…")
+        top_cpu.append("  ".join(f"{p.name} {p.cpu_pct:.0f}%" for p in busy) if busy else tr("idle") if rated else "…")
         return Group(ram, cpu, cores, hist, top_ram, top_cpu)
 
     def render_device(self, s: Snapshot) -> Group:
@@ -521,13 +592,13 @@ class GpuTaskManager(App):
         if self.monitoring:
             head = Text(name, style="bold")
         elif s.backend == "metal":
-            head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"), "  unified memory")
+            head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"), tr("  unified memory"))
         else:
-            info = (f"   driver {s.driver}" if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
+            info = (tr(f"   driver {s.driver}") if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
             head = Text.assemble((name, "bold"), info + "  ",
                                  (nv.driver_model if nv else "", "bold yellow"), f"  {nv.pci_bus if nv else ''}")
         if self.paused:
-            head.append("   [PAUSED]", style="bold red")
+            head.append(tr("   [PAUSED]"), style="bold red")
 
         # Fit category proportions to the adapter total; row samples need not sum exactly.
         by_kind: dict[str, float] = {}
@@ -541,33 +612,33 @@ class GpuTaskManager(App):
         other = max(s.vram_used - attributed * scale, 0) if s.vram_used is not None else 0
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
-        vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
+        vram = Text(tr("GPU mem ") if s.backend == "metal" else "VRAM ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
         used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
         vram.append(f" {used_label} / {vram_total_label(s)}", style="bold")
         legend = Text("     ")
         for k, v in order[:7]:
             legend.append("■ ", style=KIND_STYLE.get(k, "white"))
-            legend.append(f"{k} {gb(v)}  ")
+            legend.append(f"{tr(k)} {gb(v)}  ")
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
-            legend.append(f"unattributed {gb(other)}  ")
+            legend.append(tr(f"unattributed {gb(other)}  "))
         if s.vram_used is not None and s.vram_total and not intel_memory_note(s):
-            legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
+            legend.append(tr(f"free {gb(max(s.vram_total - s.vram_used, 0))}"), style="grey62")
         if s.shared_used is not None and s.shared_used > 64 << 20:
-            legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")
+            legend.append(tr(f"   shared(RAM) {gb(s.shared_used)}"), style="yellow")
         if scale < 1.0:
-            legend.append("   [bar normalized; labels are raw]", style="grey62")
+            legend.append(tr("   [bar normalized; labels are raw]"), style="grey62")
         if s.backend == "wsl":
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
-            legend.append("\n     " + METAL_NOTE, style="grey62")
+            legend.append("\n     " + tr(METAL_NOTE), style="grey62")
         if intel_memory_note(s):
-            legend.append("\n     " + intel_memory_note(s), style="grey62")
+            legend.append("\n     " + tr(intel_memory_note(s)), style="grey62")
         if s.counter_status:
-            legend.append("\n     " + s.counter_status, style="grey62")
+            legend.append("\n     " + diagnostic(s.counter_status), style="grey62")
         if s.process_status:
-            legend.append(f"\n     DRM process scan: {s.process_status}.", style="grey62")
+            legend.append("\n     " + tr("DRM process scan: {0}.").format(diagnostic(s.process_status)), style="grey62")
 
         lines = [head, vram, legend]
         if nv and s.backend == "metal":
@@ -582,18 +653,18 @@ class GpuTaskManager(App):
             m = Text()
             label = "AMD gfx" if is_amd else ("Intel GT" if is_intel else "GPU")
             m.append(f"{label} {format_metric(nv.util_gpu, unit='%')}", style=f"bold {self.CHART_COLORS['GPU']}")
-            m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
+            m.append(tr(f"  Mem activity {format_metric(nv.util_mem, unit='%')}"), style=self.CHART_COLORS["Mem activity"])
             m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
             if nv.enc or nv.dec:
-                m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
+                m.append(tr(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}"))
             if nv.video is not None:
-                m.append(f"  video {format_metric(nv.video, unit='%')}")
+                m.append(tr(f"  video {format_metric(nv.video, unit='%')}"))
             lines.append(m)
             clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if is_amd else
                            f"GT {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz" if is_intel else
                            f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz")
             power_kind = f" {nv.power_kind}" if nv.power_kind else ""
-            temp_kind = f" ({nv.temp_kind})" if nv.temp_kind else ""
+            temp_kind = f" ({tr(nv.temp_kind)})" if nv.temp_kind else ""
             if self.monitoring:
                 clock = nv.gfx_clock if is_amd else nv.sm_clock
                 label = "gfx" if is_amd else ("GT" if is_intel else "SM")
@@ -604,11 +675,11 @@ class GpuTaskManager(App):
                 st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  {format_metric(nv.power_w, '.0f')}/"
                           f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
                           f"{clock_label}  "
-                          f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "
+                          f"{tr('mem')} {format_metric(nv.mem_clock)} MHz  {tr('video')} {format_metric(nv.video_clock)} MHz  "
                           f"PCIe gen{format_metric(nv.pcie_gen)} x{format_metric(nv.pcie_width)}  "
                           + (f"CC {nv.compute_cap or 'N/A'}" if nv.source == "NVML" else nv.source), style="grey70")
             if nv.throttle:
-                st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
+                st.append(tr("  throttle: ") + ",".join(tr(reason) for reason in nv.throttle), style="yellow")
             lines.append(st)
         return Group(*lines)
 
@@ -672,19 +743,23 @@ class GpuTaskManager(App):
             current = values[-1] if values else None
             name = self.CHARTS[index]
             if getattr(self, "_amd_chart_labels", False) and name == "SM clock":
-                name = "GFX clock"
-            cell = Text(f"{name:<12} ", style=style)
+                name = tr("GFX clock")
+            name = tr(name)
+            name_width = min(max(12, len(name)), max(1, cell_width - 12))
+            if len(name) > name_width:
+                name = name[:max(0, name_width - 1)] + "…"
+            cell = Text(f"{name:<{name_width}} ", style=style)
             cell.append(f"{format_metric(current, '.0f', unit):>8} ", style="bold")
-            cell.append(spark(values, max(1, cell_width - 22), scale))
+            cell.append(spark(values, max(1, cell_width - name_width - 10), scale))
             cells.append(cell)
         for start in range(0, len(cells), columns):
             grid.add_row(*cells[start:start + columns])
         _, power_scale, _, _ = self.chart_series(self.CHARTS.index("Power"), self.snap.nv)
         _, clock_scale, _, _ = self.chart_series(self.CHARTS.index("SM clock"), self.snap.nv)
         note = (
-            "Recent samples · blank = no reading" if self.snap.backend == "metal" else
-            f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
-            f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz"
+            tr("Recent samples · blank = no reading") if self.snap.backend == "metal" else
+            tr(f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
+            f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz")
         )
         return grid, note
 
@@ -745,7 +820,7 @@ class GpuTaskManager(App):
             t.add_row(
                 Text(r.pid_label, justify="right", style="grey62" if r.host else ""),
                 Text(r.name),
-                Text(r.kind, style=KIND_STYLE.get(r.kind, "")),
+                Text(tr(r.kind), style=KIND_STYLE.get(r.kind, "")),
                 Text(" ".join(r.detail.runtimes[:3]), style="grey70"),
                 Text(vram_label(r.gpu), justify="right", style="bold" if r.gpu.attributed else "grey62"), shared, paged,
                 pct(r.gpu.gpu_pct if engines else None),
@@ -753,7 +828,7 @@ class GpuTaskManager(App):
                 pct(e.get("copy", 0) if split else None),
                 pct(e.get("decode", 0) + e.get("encode", 0) + e.get("video", 0) if split else None),
                 *system_cells,
-                Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
+                Text(inside(r), style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
                 *([Text("?" if s.backend == "wsl" and not r.host else str(r.gpu_index))]
                   if len(self.snapshots) > 1 else []),
                 key=r.key,
@@ -763,9 +838,10 @@ class GpuTaskManager(App):
                 t.move_cursor(row=t.get_row_index(keep), animate=False, scroll=False)
             except Exception:
                 pass
-        t.border_subtitle = f"sort: {self.sorts[self.sort_idx][0]}  ·  {'all' if self.show_all else 'top'} processes"
+        t.border_subtitle = tr("sort: {0}  ·  {1} processes").format(
+            tr(self.sorts[self.sort_idx][0]), tr("all" if self.show_all else "top"))
         if s.backend == "wsl" and not any(not r.host for r in s.procs):
-            t.border_subtitle = WSL_EMPTY
+            t.border_subtitle = tr(WSL_EMPTY)
 
     def render_inspector(self) -> None:
         # A queued RowHighlighted can arrive while the screen is being torn down, after the
@@ -776,23 +852,23 @@ class GpuTaskManager(App):
         s = self._row_snapshots.get(self.selected_key, self.snap)
         r = next((x for x in s.procs if x.key == self.selected_key), None) if s else None
         if r is None:
-            panel.update(Text("Select a process (↑/↓) to see what's inside its GPU memory.  Press ? to learn what's knowable.", style="grey62"))
+            panel.update(Text(tr("Select a process (↑/↓) to see what's inside its GPU memory.  Press ? to learn what's knowable."), style="grey62"))
             return
-        where = {"windows": "Windows PID ", "outside": "host PID "}.get(r.origin, "") if r.host else ""
-        panel.border_title = f"{r.name} ({where}{r.pid}) - {r.kind}"
+        where = {"windows": "Windows PID ", "outside": tr("host PID ")}.get(r.origin, "") if r.host else ""
+        panel.border_title = f"{r.name} ({where}{r.pid}) - {tr(r.kind)}"
         if r.gpu_index is not None:
-            panel.border_title += " - GPU unknown" if s.backend == "wsl" and not r.host else f" - GPU {r.gpu_index}"
+            panel.border_title += tr(" - GPU unknown") if s.backend == "wsl" and not r.host else f" - GPU {r.gpu_index}"
         out: list = []
         e = r.gpu.engines
         wddm = has_wddm_counters(s, r)
-        engines = " ".join(f"{k} {v:.0f}%" for k, v in e.items() if v >= 0.5) or "idle"
-        hdr = Text.assemble(("VRAM ", "bold"), (vram_label(r.gpu), "bold"), "   shared(RAM) ",
+        engines = " ".join(f"{tr(k)} {v:.0f}%" for k, v in e.items() if v >= 0.5) or tr("idle")
+        hdr = Text.assemble(("VRAM ", "bold"), (vram_label(r.gpu), "bold"), tr("   shared(RAM) "),
                             (gb(r.gpu.shared) if has_shared_counters(s, r) else "n/a",
                              "bold red" if r.gpu.shared > 256 << 20 and s.shared_is_spill else ""),
-                            "   paged(est) ", gb(r.gpu.paged_out) if wddm and r.gpu.paged_available else "n/a",
-                            "   engines ", engines if has_engine_counters(s, r) else "n/a")
+                            tr("   paged(est) "), gb(r.gpu.paged_out) if wddm and r.gpu.paged_available else "n/a",
+                            tr("   engines "), engines if has_engine_counters(s, r) else "n/a")
         if r.detail.runtimes:
-            hdr.append("   runtime ", style="grey62")
+            hdr.append(tr("   runtime "), style="grey62")
             hdr.append(" ".join(r.detail.runtimes), style="cyan")
         out.append(hdr)
         if not r.host and r.gpu.attributed and r.gpu.inferred_by:
@@ -801,101 +877,101 @@ class GpuTaskManager(App):
             if r.gpu.inferred is not None:
                 out.append(Text(inferred_note(r.gpu), style="grey62"))
             elif s.wsl_split:
-                out.append(Text(f"No per-process VRAM: {s.wsl_split}.", style="grey62"))
+                out.append(Text(tr("No per-process VRAM: {0}.").format(diagnostic(s.wsl_split)), style="grey62"))
             elif s.backend == "drm":
                 out.append(Text(drm_note(r.gpu), style="grey62"))
             elif s.backend == "metal":
-                out.append(Text("GPU memory n/a: footprint can't read other users' processes without root "
-                                "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time.",
+                out.append(Text(tr("GPU memory n/a: footprint can't read other users' processes without root "
+                                "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time."),
                                 style="grey62"))
         if s.backend == "drm" and not r.host and (r.gpu.resident_vram is not None or r.gpu.resident_gtt is not None):
             def size(v): return gb(v) if v is not None else "n/a"
-            out.append(Text(f"Resident VRAM {size(r.gpu.resident_vram)}, GTT {size(r.gpu.resident_gtt)}. "
-                            + DRM_RESIDENT_NOTE, style="grey62"))
+            out.append(Text(tr(f"Resident VRAM {size(r.gpu.resident_vram)}, GTT {size(r.gpu.resident_gtt)}. ")
+                            + tr(DRM_RESIDENT_NOTE), style="grey62"))
         if s.backend == "drm" and r.gpu.kfd:
-            out.append(Text("Engines n/a: this process uses ROCm/HIP (/dev/kfd), whose compute queues the kernel doesn't "
-                            "time per process. The device's AMD gfx load includes its work.", style="grey62"))
+            out.append(Text(tr("Engines n/a: this process uses ROCm/HIP (/dev/kfd), whose compute queues the kernel doesn't "
+                            "time per process. The device's AMD gfx load includes its work."), style="grey62"))
         if wddm and r.gpu.paged_out >= 64 << 20:
-            out.append(Text(f"{gb(r.gpu.paged_out)} of {gb(r.gpu.committed)} committed is not accounted for by local/non-local "
-                            "usage. Estimated non-residency, not proof of eviction or disk paging.",
+            out.append(Text(tr(f"{gb(r.gpu.paged_out)} of {gb(r.gpu.committed)} committed is not accounted for by local/non-local "
+                            "usage. Estimated non-residency, not proof of eviction or disk paging."),
                             style="yellow"))
 
         if r.handy:
             if r.handy.selected_model:
-                out.append(Text(f"Handy selected (settings; not load proof): {r.handy.selected_model}", style="grey70"))
+                out.append(Text(tr(f"Handy selected (settings; not load proof): {r.handy.selected_model}"), style="grey70"))
             if r.handy.last_event:
-                out.append(Text(f"Handy last event: {r.handy.last_event} {r.handy.last_model or ''} "
-                                f"at {r.handy.last_event_local} (runtime-reported history, not current GPU residency)",
+                out.append(Text(tr(f"Handy last event: {tr(r.handy.last_event)} {r.handy.last_model or ''} "
+                                f"at {r.handy.last_event_local} (runtime-reported history, not current GPU residency)"),
                                 style="green"))
 
         v = r.llm
         if v:
             if r.gpu_index is not None:
-                out.append(Text("Model files, launch flags and runtime buffer logs can span GPUs. "
-                                "The breakdown below is not a measured per-device model placement.", style="grey70"))
+                out.append(Text(tr("Model files, launch flags and runtime buffer logs can span GPUs. "
+                                "The breakdown below is not a measured per-device model placement."), style="grey70"))
             width = max(min(self.size.width - 8, 100), 20)
             total = max(r.gpu.shown_vram or 0, sum(x.bytes for x in v.segments), 1)
             out.append(stacked_bar([(x.bytes, SEG_STYLE[x.kind]) for x in v.segments], total, width))
             legend = Text()
             for x in v.segments:
                 legend.append("■ ", style=SEG_STYLE[x.kind])
-                legend.append(f"{x.label} {gb(x.bytes)}", style="bold" if x.exact else "")
+                legend.append(f"{tr(x.label)} {gb(x.bytes)}", style="bold" if x.exact else "")
                 legend.append("  ")
             if v.log_source:
-                legend.append(f"(allocated sizes from {os.path.basename(v.log_source)})", style="green")
+                legend.append(tr(f"(allocated sizes from {os.path.basename(v.log_source)})"), style="green")
             out.append(legend)
             if v.models:
                 mt = Table(box=None, padding=(0, 1), show_edge=False, header_style="bold grey70")
-                for col in ("", "model", "arch", "params", "quant", "layers", "train ctx", "on GPU (est)", "evidence", "file"):
-                    mt.add_column(col)
+                for col in ("", tr("model"), tr("arch"), tr("params"), tr("quant"), tr("layers"), tr("train ctx"), tr("on GPU (est)"), tr("evidence"), tr("file")):
+                    mt.add_column(tr(col))
                 for i, g in enumerate(v.models):
                     f = v.files[i] if i < len(v.files) else None
-                    mt.add_row(Text(v.kind_label(i), style="magenta"), v.label(i), g.arch, g.params_label, g.quant,
+                    mt.add_row(Text(kind_label(v.kind_label(i)), style="magenta"), v.label(i), g.arch, g.params_label, g.quant,
                                str(g.n_layers or ""), f"{g.ctx_train:,}" if g.ctx_train else "",
-                               gb(g.gpu_weight_bytes()), Text(f.evidence if f else "", style="green"),
+                               gb(g.gpu_weight_bytes()), Text(tr(f.evidence) if f else "", style="green"),
                                Text(os.path.basename(g.path), style="grey50", overflow="ellipsis"))
                 out.append(mt)
             for f in v.other_files:
-                kind = f", {f.kind_label}" if f.kind_label else ""
-                out.append(Text(f"file: {f.store_name or f.path}  ({gb(f.size)}, {f.evidence}{kind})", style="grey62"))
+                kind = f", {kind_label(f.kind_label)}" if f.kind_label else ""
+                out.append(Text(tr(f"file: {f.store_name or f.path}  ({gb(f.size)}, {tr(f.evidence)}{kind})"), style="grey62"))
             if v.server:
                 sv = v.server
-                st = Text.assemble(("server ", "bold"), (f"{sv.kind} {sv.url}", "cyan"))
+                st = Text.assemble((tr("server "), "bold"), (f"{sv.kind} {sv.url}", "cyan"))
                 if v.server_source == "parent":
-                    st.append(" (parent process; API report, not worker residency)")
+                    st.append(tr(" (parent process; API report, not worker residency)"))
                 if sv.n_ctx:
-                    st.append(f"  ctx {sv.n_ctx:,}")
+                    st.append(tr(f"  ctx {sv.n_ctx:,}"))
                 if sv.slots_total is not None:
-                    st.append(f"  slots busy {sv.slots_busy}/{sv.slots_total}")
+                    st.append(tr(f"  slots busy {sv.slots_busy}/{sv.slots_total}"))
                 if sv.gen_tok_s:
-                    st.append(f"  gen {sv.gen_tok_s:.1f} tok/s", style="bold green")
+                    st.append(tr(f"  gen {sv.gen_tok_s:.1f} tok/s"), style="bold green")
                 if sv.prompt_tok_s:
-                    st.append(f"  prompt {sv.prompt_tok_s:.0f} tok/s")
+                    st.append(tr(f"  prompt {sv.prompt_tok_s:.0f} tok/s"))
                 for m in sv.models[:4]:
                     if sv.kind == "lmstudio":
-                        st.append(f"\n  loaded: {m['name']} {m.get('type') or ''} {m.get('quant') or ''} ctx {m.get('ctx') or '?'}")
+                        st.append(tr("\n  loaded: {0} {1} {2} ctx {3}").format(m['name'], tr(m.get('type') or ''), m.get('quant') or '', m.get('ctx') or '?'))
                     elif sv.kind == "vllm":
-                        st.append(f"\n  API-reported model ID: {m['name']}")
+                        st.append(tr("\n  API-reported model ID: {0}").format(m['name']))
                 out.append(st)
             for n in v.notes:
-                out.append(Text("• " + n, style="bold red" if n.startswith("!") else "grey70"))
+                out.append(Text("• " + tr(n), style="bold red" if n.startswith("!") else "grey70"))
         else:
-            out.append(Text(EXPLAIN.get(r.kind, ""), style="grey70"))
+            out.append(Text(tr(EXPLAIN.get(r.kind, "")), style="grey70"))
             for m in r.detail.models:
-                kind = f", {m.kind_label}" if m.kind_label else ""
-                out.append(Text(f"file: {m.store_name or m.path}  ({gb(m.size)}, {m.evidence}{kind})", style="magenta"))
+                kind = f", {kind_label(m.kind_label)}" if m.kind_label else ""
+                out.append(Text(tr(f"file: {m.store_name or m.path}  ({gb(m.size)}, {tr(m.evidence)}{kind})"), style="magenta"))
             if r.detail.candidates:
-                out.append(Text("No mapped model file was observed. Some runtimes read then close model files. "
-                                "Installed candidates (not proven loaded):", style="grey70"))
+                out.append(Text(tr("No mapped model file was observed. Some runtimes read then close model files. "
+                                "Installed candidates (not proven loaded):"), style="grey70"))
                 for m in r.detail.candidates:
-                    kind = f", {m.kind_label}" if m.kind_label else ""
+                    kind = f", {kind_label(m.kind_label)}" if m.kind_label else ""
                     out.append(Text(f"  {m.store_name or m.path}  ({gb(m.size)}{kind})", style="grey62"))
         if r.detail.ports:
-            out.append(Text("listening: " + ", ".join(map(str, r.detail.ports[:8])), style="grey50"))
+            out.append(Text(tr("listening: ") + ", ".join(map(str, r.detail.ports[:8])), style="grey50"))
         if r.detail.cmdline:
             out.append(Text(" ".join(redact_cmdline(r.detail.cmdline))[:400], style="grey42", overflow="ellipsis"))
         elif r.detail.access_denied:
-            out.append(Text("(protected process - run elevated for runtime/file details)", style="grey42"))
+            out.append(Text(tr("(protected process - run elevated for runtime/file details)"), style="grey42"))
         panel.update(Group(*out))
 
     # ------------------------------------------------------------------ events/actions
@@ -936,6 +1012,13 @@ class GpuTaskManager(App):
         self.paused = not self.paused
         if self.snap:
             self.render_dashboard()
+            self._update_desktop()
+
+    def action_minimize(self) -> None:
+        if self._desktop and self._desktop.minimize():
+            return
+        self.notify(tr("Use the terminal's minimize button; readings continue updating."),
+                    title=tr("Minimize"))
 
     def action_toggle_monitoring(self) -> None:
         self.monitoring = not self.monitoring
@@ -944,3 +1027,22 @@ class GpuTaskManager(App):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_command_palette(self) -> None:
+        if self.use_command_palette and not CommandPalette.is_open(self):
+            self.push_screen(LocalizedPalette(id="--command-palette"))
+
+    def get_system_commands(self, screen):
+        for command in super().get_system_commands(screen):
+            callback = self.action_help if command.title == "Keys" else command.callback
+            yield command._replace(title=tr(command.title), help=tr(command.help), callback=callback)
+
+    def search_themes(self) -> None:
+        if self.language == "en":
+            return super().search_themes()
+        commands = [(name, partial(setattr, self, "theme", name)) for name in self.available_themes]
+        self.push_screen(LocalizedPalette(providers=[SimpleProvider(self.screen, commands)],
+                                          placeholder=tr("Search for themes…")))
+
+    def notify(self, message, *, title="", **kwargs) -> None:
+        super().notify(tr(message), title=tr(title), **kwargs)

@@ -8,6 +8,8 @@ measured, not inferred. Unknown stays None: a process we may not inspect has ``r
 
 from __future__ import annotations
 
+from .i18n import tr
+
 import struct
 import sys
 import time
@@ -223,14 +225,14 @@ def to_dict(h: HostSample) -> dict:
 def to_text(h: HostSample) -> str:
     from .llm import gb
 
-    lines = ["System RAM and CPU (OS-reported; not GPU memory)",
-             f"CPU {h.cpu_pct:.0f}%  {h.logical} threads" + (f" / {h.physical} cores" if h.physical else ""),
-             f"RAM {gb(h.ram_used)} / {gb(h.ram_total)}  available {gb(h.ram_available)}"
-             f"   swap/pagefile {gb(h.swap_used)} / {gb(h.swap_total)}",
-             "", "Top processes by RAM, whole machine:", f"{'PID':>7}  {'PROCESS':<28} {'RAM':>9} {'PRIVATE':>9} {'CPU%':>5}"]
+    lines = [tr("System RAM and CPU (OS-reported; not GPU memory)"),
+             tr(f"CPU {h.cpu_pct:.0f}%  {h.logical} threads") + (tr(f" / {h.physical} cores") if h.physical else ""),
+             tr(f"RAM {gb(h.ram_used)} / {gb(h.ram_total)}  available {gb(h.ram_available)}"
+             f"   swap/pagefile {gb(h.swap_used)} / {gb(h.swap_total)}"),
+             "", tr("Top processes by RAM, whole machine:"), f"{'PID':>7}  {tr('PROCESS'):<28} {tr('RAM'):>9} {tr('PRIVATE'):>9} {tr('CPU%'):>5}"]
     for p in h.top("rss", 10):
         lines.append(f"{p.pid:>7}  {p.name[:28]:<28} {gb(p.rss):>9} {gb(p.private) if p.private is not None else 'n/a':>9} "
                      f"{f'{p.cpu_pct:.0f}' if p.cpu_pct is not None else 'n/a':>5}")
     if h.denied:
-        lines.append(f"({h.denied} processes not readable without admin)")
+        lines.append(tr(f"({h.denied} processes not readable without admin)"))
     return "\n".join(lines)

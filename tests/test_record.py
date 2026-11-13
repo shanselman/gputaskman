@@ -379,6 +379,7 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn("system", data)
 
 
+@patch.dict("os.environ", {"GPUTASKMAN_LANG": "en"})
 class CliTests(FileTestCase):
     def setUp(self):
         super().setUp()

@@ -268,7 +268,7 @@ class SystemUiTests(unittest.IsolatedAsyncioTestCase):
 class SystemReportTests(unittest.TestCase):
     def run_cli(self, *args) -> str:
         output = io.StringIO()
-        with patch("sys.argv", ["gputaskman", *args]), patch("gputaskman.cli.time.sleep"), \
+        with patch("sys.argv", ["gputaskman", "--lang", "en", *args]), patch("gputaskman.cli.time.sleep"), \
                 patch("gputaskman.collector.Collector") as collector, contextlib.redirect_stdout(output):
             collector.return_value.sample.return_value = snapshot()
             main()

@@ -68,6 +68,7 @@ def snapshot() -> Snapshot:
     )
 
 
+@patch.dict("os.environ", {"GPUTASKMAN_LANG": "en"})
 class CliTests(unittest.TestCase):
     def test_invalid_options_fail_before_collecting(self):
         for args in (["--gpu", "-1"], ["-i", "0"], ["-i", "-1"],
