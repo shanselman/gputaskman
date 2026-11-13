@@ -83,9 +83,11 @@ class ProcRow:
         """One-line 'what's in there' summary for the process table."""
         if self.handy:
             if self.handy.last_model:
-                return f"Handy last log ({self.handy.last_event}): {self.handy.last_model.rsplit('/', 1)[-1]}"
+                name = self.handy.last_model.replace("\\", "/").rsplit("/", 1)[-1]
+                return f"Handy last log ({self.handy.last_event}): {name}"
             if self.handy.selected_model:
-                return f"Handy selected (not load proof): {self.handy.selected_model.rsplit('/', 1)[-1]}"
+                name = self.handy.selected_model.replace("\\", "/").rsplit("/", 1)[-1]
+                return f"Handy selected (not load proof): {name}"
         if (self.llm and self.llm.server and self.llm.server.kind in ("vllm", "foundry-local")
                 and self.llm.server.models):
             source = "parent API" if self.llm.server_source == "parent" else "API"

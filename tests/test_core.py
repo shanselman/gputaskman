@@ -753,6 +753,21 @@ class HandyTests(unittest.TestCase):
         self.assertIn("not current GPU residency", to_text(s))
         self.assertEqual(to_dict(s)["processes"][0]["handy"]["last_event"], "loaded")
 
+    def test_handy_evidence_paths_are_truncated_to_filename(self):
+        for path in (r"C:\Users\Handy\models\whisper.bin", "/models/whisper.bin", "whisper.bin"):
+            with self.subTest(path=path):
+                last_log = ProcRow(
+                    10, "handy.exe", "AI", ProcGpu(dedicated=GiB), ProcDetail(10, "handy.exe"),
+                    handy=HandyEvidence(last_model=path, last_event="loaded"),
+                )
+                self.assertEqual(last_log.inside, "Handy last log (loaded): whisper.bin")
+
+                selected = ProcRow(
+                    10, "handy.exe", "AI", ProcGpu(dedicated=GiB), ProcDetail(10, "handy.exe"),
+                    handy=HandyEvidence(selected_model=path),
+                )
+                self.assertEqual(selected.inside, "Handy selected (not load proof): whisper.bin")
+
 
 class PathArgumentTests(unittest.TestCase):
     def setUp(self):
@@ -1353,6 +1368,103 @@ class IdentityTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_llama_server_metrics_and_kv_cache(self):
+        import http.server
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/props":
+                    body = json.dumps({"model_path": "/m/test.gguf", "total_slots": 4,
+                                       "default_generation_settings": {"n_ctx": 8192}}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/slots":
+                    body = json.dumps([{"id": 0, "is_processing": True}, {"id": 1, "is_processing": False},
+                                       {"id": 2, "is_processing": False}, {"id": 3, "is_processing": False}]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/metrics":
+                    text = ("llamacpp:prompt_tokens_seconds 150.0\n"
+                            "llamacpp:predicted_tokens_seconds 35.5\n"
+                            "llamacpp:kv_cache_usage_ratio 0.425\n"
+                            "llamacpp:requests_processing 1\n"
+                            "llamacpp:requests_deferred 2\n")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(text.encode())
+                elif self.path == "/v1/models":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"data": []}')
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        try:
+            s = probe_server(port)
+            self.assertIsNotNone(s)
+            self.assertEqual(s.kind, "llama-server")
+            self.assertEqual(s.n_ctx, 8192)
+            self.assertEqual(s.slots_total, 4)
+            self.assertEqual(s.slots_busy, 1)
+            self.assertEqual(s.prompt_tok_s, 150.0)
+            self.assertEqual(s.gen_tok_s, 35.5)
+            self.assertAlmostEqual(s.kv_cache_usage, 0.425)
+            self.assertEqual(s.requests_running, 1)
+            self.assertEqual(s.requests_waiting, 2)
+            snap = snapshot()
+            attributed = snap.attributed
+            row = snap.procs[0]
+            row.llm = build_view(row.detail, row.gpu.dedicated, row.gpu.shared, s)
+            text = to_text(snap)
+            self.assertIn("llama-server (runtime-reported): requests running 1, waiting 2, "
+                          "KV-cache pool 42.5%", text)
+            self.assertIn("not of GPU memory", text)
+            self.assertEqual(snap.attributed, attributed)
+            reported = to_dict(snap)["processes"][0]["llm"]["server"]
+            self.assertEqual((reported["requests_running"], reported["requests_waiting"],
+                              reported["kv_cache_usage"]), (1, 2, 0.425))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_llama_server_gauges_keep_zero_and_reject_invalid_values(self):
+        for value, expected in (("0", (0, 0, 0.0)), ("2", (2, 2, None)),
+                                ("1.5", (None,) * 3), ("-1", (None,) * 3),
+                                ("-inf", (None,) * 3), ("NaN", (None,) * 3),
+                                ("1e309", (None,) * 3), ("abc", (None,) * 3)):
+            metrics = "\n".join(f"llamacpp:{name} {value}" for name in
+                                ("requests_processing", "requests_deferred", "kv_cache_usage_ratio"))
+            with self.subTest(value=value), patch("gputaskman.llm._get",
+                    side_effect=[{"model_path": None}, {"data": []}, None, metrics]):
+                server = probe_server(8080)
+            self.assertEqual((server.requests_running, server.requests_waiting, server.kv_cache_usage),
+                             expected)
+
+    def test_llama_server_running_requests_fall_back_to_slots_not_zero(self):
+        for metrics, expected in ((None, 1), ("llamacpp:requests_processing -inf", 1),
+                                  ("llamacpp:requests_processing 0", 0)):
+            with self.subTest(metrics=metrics), patch("gputaskman.llm._get",
+                    side_effect=[{"model_path": None}, {"data": []},
+                                 [{"is_processing": True}], metrics]):
+                server = probe_server(8080)
+            self.assertEqual(server.slots_busy, 1)
+            self.assertEqual(server.requests_running, expected)
+            self.assertIsNone(server.requests_waiting)
+            self.assertIsNone(server.kv_cache_usage)
+
     def test_api_key_is_not_forwarded_by_a_redirect(self):
         import http.server
         seen: dict[str, list[str | None]] = {"first": [], "other": []}
@@ -1636,6 +1748,24 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         Console(file=output, width=widget.content_size.width, color_system=None).print(widget.content)
         return output.getvalue()
+
+    async def test_llama_server_gauges_label_runtime_pool_in_inspector(self):
+        snap = snapshot()
+        row = snap.procs[0]
+        server = ServerInfo("llama-server", "http://127.0.0.1:8080",
+                            requests_running=0, requests_waiting=0, kv_cache_usage=0.0)
+        row.llm = build_view(row.detail, row.gpu.dedicated, row.gpu.shared, server)
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 50)) as pilot:
+                app.apply(snap)
+                await pilot.pause()
+                text = "\n".join(getattr(line, "plain", "") for line in
+                                 app.query_one("#inspector", Static).content.renderables)
+                self.assertIn("llama-server (runtime-reported): requests running 0, waiting 0, "
+                              "KV-cache pool 0.0%", text)
+                self.assertIn("not of GPU memory", text)
 
     async def test_monitoring_toggle_hides_diagnostics_without_changing_live_state(self):
         s = snapshot()

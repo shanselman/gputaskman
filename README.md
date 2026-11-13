@@ -819,7 +819,7 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 
 | Runtime | Current support |
 |---|---|
-| llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state; exercised live |
+| llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state, slots, and throughput; exercised live. New `/metrics` request and KV-cache pool gauges are runtime-reported and fixture-tested, **not validated live** |
 | Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
 | LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
 | vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Running/waiting requests and KV-cache pool usage from `/metrics`, labelled runtime-reported for the server's engine, not per worker, per GPU or GPU memory. Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
@@ -1015,6 +1015,24 @@ to JSON, and the inspector shows it as `***`. A key in `--api-key-file` or `LLAM
 gputaskman does not open a path taken from another process's command line, and an environment variable
 can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
 one rejected request every 30 seconds, and the inspector says why server details are missing.
+
+For llama-server, the existing `/metrics` request also reads `llamacpp:kv_cache_usage_ratio`,
+`llamacpp:requests_processing`, and `llamacpp:requests_deferred`. The text report and inspector label
+them runtime-reported for the server, not GPU-memory measurements. Running requests fall back to busy
+`/slots` when no valid processing gauge is available; `slots_busy` remains separately available.
+The new gauges have only been tested with fixture responses, not a live llama-server.
+
+The following `processes[].llm.server` JSON fields are shared by llama-server and vLLM, including in
+recordings. They are never added to measured memory totals:
+
+| Field | Meaning |
+|---|---|
+| `requests_running` | Runtime-reported nonnegative integer; llama-server may use the `/slots` fallback described above |
+| `requests_waiting` | Runtime-reported nonnegative integer from `/metrics` |
+| `kv_cache_usage` | Fraction from 0 to 1 of the runtime's KV-cache pool, **not GPU memory** |
+
+Unavailable or invalid gauges stay `null` (apart from the documented running-request fallback);
+a reported zero stays `0`. The pool fraction is displayed as a percentage.
 
 vLLM uses `/v1/models`, with the same request bounds and cache intervals. Only after that succeeds,
 the same probe sends one `GET /metrics`, **never with a key**, and reads three gauges:

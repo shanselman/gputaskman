@@ -202,15 +202,21 @@ class ServerInfo:
     prompt_tok_s: float | None = None
     model_path: str | None = None  # llama-server: the file it says it loaded
     models: list[dict] = field(default_factory=list)  # normalized: name, type, quant, ctx, size, size_vram, path
-    # vLLM /metrics gauges: server-level runtime reports for one engine, never per-worker or per-GPU measurements.
+    # Server-level runtime reports, never per-process or per-GPU memory measurements.
     requests_running: int | None = None
     requests_waiting: int | None = None
-    kv_cache_usage: float | None = None  # fraction 0-1 of vLLM's own KV-cache pool, not of GPU memory
+    kv_cache_usage: float | None = None  # fraction 0-1 of KV-cache pool, not of GPU memory
 
 
 def _metric(text: str, name: str) -> float | None:
-    m = re.search(rf"^llamacpp:{name}\s+([\d.eE+-]+)", text, re.M)
-    return float(m[1]) if m else None
+    m = re.search(rf"^llamacpp:{name}\s+(\S+)", text, re.M)
+    if not m:
+        return None
+    try:
+        value = float(m[1])
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 _VLLM_GAUGES = {"vllm:num_requests_running": "requests_running",
@@ -271,13 +277,15 @@ def vllm_metrics(text: str, model_ids: list[str]) -> dict[str, int | float | Non
     return out
 
 
-def vllm_gauge_text(s: ServerInfo) -> str | None:
-    """One display line for the vLLM gauges, or None when none is known. Unknown shows as n/a, 0 as 0."""
-    if s.kind != "vllm" or all(v is None for v in (s.requests_running, s.requests_waiting, s.kv_cache_usage)):
+def server_gauge_text(s: ServerInfo) -> str | None:
+    """One runtime-gauge line, or None when none is known. Unknown shows as n/a, 0 as 0."""
+    if s.kind not in ("vllm", "llama-server") or all(
+            v is None for v in (s.requests_running, s.requests_waiting, s.kv_cache_usage)):
         return None
     running, waiting = ("n/a" if v is None else str(v) for v in (s.requests_running, s.requests_waiting))
     kv = "n/a" if s.kv_cache_usage is None else f"{s.kv_cache_usage * 100:.1f}%"
-    return f"vLLM /metrics (runtime-reported): requests running {running}, waiting {waiting}, KV-cache pool {kv}"
+    source = "vLLM /metrics" if s.kind == "vllm" else "llama-server"
+    return f"{source} (runtime-reported): requests running {running}, waiting {waiting}, KV-cache pool {kv}"
 
 
 def _model_entry(name, type_=None, quant=None, ctx=None, size=None, size_vram=None, path=None) -> dict:
@@ -386,10 +394,20 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
         if isinstance(slots, list):
             s.slots_total = len(slots)
             s.slots_busy = sum(1 for x in slots if x.get("is_processing"))
+            s.requests_running = s.slots_busy
         metrics = _get(base + "/metrics", key=key)
         if isinstance(metrics, str):
             s.gen_tok_s = _metric(metrics, "predicted_tokens_seconds")
             s.prompt_tok_s = _metric(metrics, "prompt_tokens_seconds")
+            kv_ratio = _metric(metrics, "kv_cache_usage_ratio")
+            if kv_ratio is not None and 0.0 <= kv_ratio <= 1.0:
+                s.kv_cache_usage = kv_ratio
+            req_proc = _metric(metrics, "requests_processing")
+            if req_proc is not None and req_proc >= 0 and req_proc.is_integer():
+                s.requests_running = int(req_proc)
+            req_def = _metric(metrics, "requests_deferred")
+            if req_def is not None and req_def >= 0 and req_def.is_integer():
+                s.requests_waiting = int(req_def)
         return s
     ps = _get(base + "/api/ps")
     if isinstance(ps, dict) and isinstance(ps.get("models"), list):
@@ -539,10 +557,14 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
         source = "parent process" if v.server_source == "parent" else "process's own listener"
         v.notes.append(f"vLLM API reported via {source}; model IDs do not prove this process's "
                        "model residency, weights, KV cache or GPU placement.")
-        if vllm_gauge_text(server):
+        if server_gauge_text(server):
             v.notes.append("vLLM /metrics gauges describe the API server's engine as a whole, not this process "
                            "or one GPU; KV-cache pool usage is a share of vLLM's own KV-cache allocation, "
                            "not of GPU memory.")
+    elif server and server.kind == "llama-server" and server_gauge_text(server):
+        v.notes.append("llama-server gauges are runtime-reported for the server as a whole, not one GPU; "
+                       "KV-cache pool usage is a share of the server's KV-cache allocation, not of GPU memory. "
+                       "Running requests fall back to busy /slots when no valid processing gauge is available.")
     elif server and server.kind == "foundry-local":
         v.notes.append("Foundry Local API reports loaded model IDs from this process's own listener, "
                        "not per-model GPU placement, weights or KV-cache bytes. "
