@@ -363,6 +363,7 @@ class HostRowTests(unittest.TestCase):
         c._host_restarted = time.time()
         c.tracker = ContextTracker(path=os.path.join(self.tmp.name, "ctx.json"), boot_id="boot", self_pid=os.getpid())
         c._own_start = time.time()
+        c.amdsmi = Mock(status="")
         return c
 
     def setUp(self):
@@ -413,6 +414,20 @@ class HostRowTests(unittest.TestCase):
         self.assertEqual((data["vram_inferred_bytes"], data["vram_inferred_by"]), (3.0 * GiB, "consistent"))
         self.assertEqual(snap.attributed, 3 * GiB)  # the Linux child is not added to the VM total again
 
+    def test_overlapping_host_rows_do_not_claim_an_attributed_total(self):
+        snap = self.snap()
+        snap.vram_total = 512 * MiB
+        snap.vram_used = 500 * MiB
+        c = self.collector(FakeStream(parse_line(SAMPLE, now=time.time())))
+        c._host_luid = RTX
+        c._add_host_rows(snap)
+        self.assertIsNone(snap.attributed)
+        data = to_dict(snap)
+        self.assertIsNone(data["attributed"])
+        self.assertEqual(data["vram_used"], 500 * MiB)
+        self.assertEqual(next(p["vram_bytes"] for p in data["processes"] if p["kind"] == "wsl-vm"),
+                         int(2.4 * GiB))
+
     def test_amd_monitor_context_uses_current_counter_scan_without_rescanning(self):
         for own_context in (True, False):
             with self.subTest(own_context=own_context):
@@ -435,7 +450,8 @@ class HostRowTests(unittest.TestCase):
                      for v in [0, 8 * GiB] + [MiB] * Collector.DEEP_TOP_N]
                     + [["dedicated usage", LUID, total]], {"24820": "vmwp"})
         c = self.collector(FakeStream(parse_line(busy, now=time.time())))
-        c.adapter, c.adapters, c.gpu_index, c.scan_budget = None, [], 0, None
+        c.adapter = Adapter(RTX, "NVIDIA", 0x10DE, 24 * GiB, 0, False)
+        c.adapters, c.gpu_index, c.scan_budget = [c.adapter], 0, None
         c.host_status = ""
         c.nvml = Mock(ok=False, driver="", cuda_version="")
         c.counters = Mock(outside={})

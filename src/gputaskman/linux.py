@@ -89,38 +89,45 @@ def enumerate_adapters() -> list[Adapter]:
 
 
 def _amdsmi_adapters() -> list[Adapter]:
-    from .amdsmi import _bdf, _import_amdsmi, _read_vram_bytes
+    from .amdsmi import _bdf, _import_amdsmi, _read_vram_bytes, amdsmi_session, set_discovery_status
     from .dxgi import VENDOR_AMD
 
+    set_discovery_status("")
+    if not os.path.exists("/dev/dxg"):
+        set_discovery_status("cannot access /dev/dxg; WSL GPU paravirtualization is unavailable")
+        return []
     api = _import_amdsmi()
     if api is None:
         return []
-    try:
-        api.amdsmi_init()
-    except Exception:
-        return []
     out = []
     try:
-        for i, h in enumerate(api.amdsmi_get_processor_handles()):
-            try:
-                bdf = str(api.amdsmi_get_gpu_device_bdf(h))
-                key = pci_key(bdf) if bdf else i + 1
+        with amdsmi_session(api):
+            for h in api.amdsmi_get_processor_handles():
+                try:
+                    bdf = str(api.amdsmi_get_gpu_device_bdf(h))
+                except Exception as error:
+                    set_discovery_status(f"could not read a GPU's PCI address ({type(error).__name__}: {error})")
+                    continue
                 pci_addr = _bdf(bdf)
-            except Exception:
-                key, pci_addr = i + 1, None
-            try:
-                asic = api.amdsmi_get_gpu_asic_info(h) or {}
-                name = str(asic.get("market_name") or "AMD GPU")
-            except Exception:
-                name = "AMD GPU"
-            total, _ = _read_vram_bytes(api, h)
-            out.append(Adapter(luid=key, name=name, vendor_id=VENDOR_AMD, dedicated_vram=total or 0,
-                               shared_system=0, software=False, pci_address=pci_addr))
-    finally:
-        try:
-            api.amdsmi_shut_down()
-        except Exception:
-            pass
+                if pci_addr is None:
+                    set_discovery_status("reported an unsupported or ambiguous PCI address; that GPU was skipped")
+                    continue
+                try:
+                    asic = api.amdsmi_get_gpu_asic_info(h) or {}
+                    name = str(asic.get("market_name") or "AMD GPU")
+                except Exception:
+                    name = "AMD GPU"
+                total, _ = _read_vram_bytes(api, h, wsl=True)
+                out.append(Adapter(luid=pci_key(bdf), name=name, vendor_id=VENDOR_AMD, dedicated_vram=total or 0,
+                                   shared_system=0, software=False, pci_address=pci_addr))
+        unique = [a for a in out if sum(b.pci_address == a.pci_address for b in out) == 1]
+        if len(unique) != len(out):
+            set_discovery_status("reported duplicate PCI addresses; ambiguous GPUs were skipped")
+        out = unique
+        if not out:
+            set_discovery_status("found no usable WSL GPU; the installed stack may not support this GPU or driver")
+    except Exception as error:
+        set_discovery_status(f"WSL discovery failed ({type(error).__name__}: {error})")
     return out
 
 

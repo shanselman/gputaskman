@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from textual.widgets import Footer, Select, Static
 
+from gputaskman import amdsmi
 from gputaskman.amdsmi import AmdSmi, _read_vram_bytes
 from gputaskman.adl import Adl, _Metrics
 from gputaskman.app import GpuTaskManager, spark, stacked_bar
@@ -69,6 +70,26 @@ def snapshot() -> Snapshot:
 
 
 class CliTests(unittest.TestCase):
+    def test_wsl_list_gpus_explains_missing_stack_without_installing(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch("sys.argv", ["gputaskman", "--list-gpus"]), \
+                patch("gputaskman.collector.BACKEND", "wsl"), \
+                patch("gputaskman.collector.enumerate_adapters", return_value=[]), \
+                patch("gputaskman.tcc.tcc_discovery_status", return_value=""), \
+                patch("subprocess.Popen") as popen, \
+                patch.object(amdsmi, "_discovery_status", ""), \
+                patch.object(amdsmi.importlib, "import_module", side_effect=ImportError("amdsmi missing")), \
+                patch.object(amdsmi.os.path, "isdir", return_value=False), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            self.assertIsNone(amdsmi._import_amdsmi())
+            main()
+            popen.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("amdsmi missing", errors.getvalue())
+        self.assertIn("rocdxg-amd-smi-lib", errors.getvalue())
+        self.assertIn("rocdxg-roct", errors.getvalue())
+        self.assertIn("never installs", errors.getvalue())
+
     def test_invalid_options_fail_before_collecting(self):
         for args in (["--gpu", "-1"], ["-i", "0"], ["-i", "-1"],
                      ["-i", "nan"], ["-i", "inf"]):
@@ -186,6 +207,7 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertIsNone(provider.sample())
         provider.close()
 
+    @patch("gputaskman.amdsmi.sys.platform", "linux")
     def test_amdsmi_prefers_memory_usage_over_uninitialized_rocm_wsl_vram_usage(self):
         amd = Adapter(1, "AMD Radeon RX 7900 XTX", 0x1002, 24 * GiB, 0, False, (3, 0, 0))
         api = SimpleNamespace(
@@ -225,6 +247,139 @@ class DeviceSelectionTests(unittest.TestCase):
             amdsmi_get_gpu_memory_usage=lambda h, t: 400 * GiB,
             amdsmi_get_gpu_vram_usage=lambda h: {"vram_total": 24576, "vram_used": 4096})
         self.assertEqual(_read_vram_bytes(api, "gpu"), (24 * GiB, None))
+
+    def test_wsl_never_uses_uninitialized_fallback_even_if_it_looks_plausible(self):
+        api = SimpleNamespace(
+            AmdSmiMemoryType=SimpleNamespace(VRAM=1),
+            amdsmi_get_gpu_memory_total=lambda h, t: 512 * MiB,
+            amdsmi_get_gpu_memory_usage=Mock(return_value=540 * MiB),
+            amdsmi_get_gpu_vram_usage=Mock(return_value={"vram_total": 512, "vram_used": 501}))
+        self.assertEqual(_read_vram_bytes(api, "gpu", wsl=True), (512 * MiB, None))
+        api.amdsmi_get_gpu_vram_usage.assert_not_called()
+        api.amdsmi_get_gpu_memory_usage.return_value = 0
+        self.assertEqual(_read_vram_bytes(api, "gpu", wsl=True), (512 * MiB, 0))
+
+    @patch("gputaskman.amdsmi.sys.platform", "linux")
+    def test_amdsmi_unsupported_sensor_and_power_cap_do_not_hide_valid_zeros(self):
+        amd = Adapter(1, "AMD", 0x1002, GiB, 0, False, (3, 0, 0))
+        api = SimpleNamespace(
+            amdsmi_init=lambda: None, amdsmi_shut_down=lambda: None,
+            amdsmi_get_processor_handles=lambda: ["gpu"],
+            amdsmi_get_gpu_device_bdf=lambda h: "0000:03:00.0",
+            amdsmi_get_power_info=lambda h: {"current_socket_power": 0, "average_socket_power": 10},
+            amdsmi_get_power_cap_info=Mock(),
+            AmdSmiTemperatureType=SimpleNamespace(EDGE=1),
+            AmdSmiTemperatureMetric=SimpleNamespace(CURRENT=1, CRITICAL=2),
+            amdsmi_get_temp_metric=Mock(return_value=0))
+        provider = AmdSmi(amd, [amd], api)
+        self.addCleanup(provider.close)
+        for cap in ((1 << 32) - 1, (1 << 64) - 1):
+            api.amdsmi_get_power_cap_info.return_value = {"power_cap": cap}
+            sample = provider.sample()
+            self.assertIsNone(sample.temp)
+            self.assertIsNone(sample.power_limit_w)
+            self.assertEqual(sample.power_w, 0)
+            self.assertIn("temperature is unsupported", provider.status)
+        api.amdsmi_get_temp_metric.side_effect = lambda h, sensor, metric: 90 if metric == 2 else 0
+        api.amdsmi_get_power_cap_info.return_value = {"power_cap": 5000}
+        sample = provider.sample()
+        self.assertEqual(sample.temp, 0)
+        self.assertEqual(sample.power_limit_w, 0.005)
+
+    def test_amdsmi_discovery_and_other_collectors_do_not_shutdown_live_handles(self):
+        from gputaskman.linux import _amdsmi_adapters
+
+        gpus = [Adapter(i, "AMD", 0x1002, GiB, 0, False, (i, 0, 0)) for i in (3, 4)]
+        running = False
+        def initialize():
+            nonlocal running
+            running = True
+        def shutdown():
+            nonlocal running
+            running = False
+        def activity(h):
+            if not running:
+                raise RuntimeError("uninitialized")
+            return {"gfx_activity": 42}
+        api = SimpleNamespace(
+            amdsmi_init=Mock(side_effect=initialize), amdsmi_shut_down=Mock(side_effect=shutdown),
+            amdsmi_get_processor_handles=lambda: [3, 4],
+            amdsmi_get_gpu_device_bdf=lambda h: f"0000:0{h}:00.0",
+            amdsmi_get_gpu_activity=activity)
+        first = AmdSmi(gpus[0], gpus, api)
+        second = AmdSmi(gpus[1], gpus, api)
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        with patch("gputaskman.amdsmi._import_amdsmi", return_value=api), \
+                patch("gputaskman.linux.os.path.exists", return_value=True):
+            self.assertEqual(len(_amdsmi_adapters()), 2)
+        self.assertEqual(first.sample().util_gpu, 42)
+        second.close()
+        self.assertEqual(first.sample().util_gpu, 42)
+        api.amdsmi_init.assert_called_once()
+        api.amdsmi_shut_down.assert_not_called()
+        first.close()
+        api.amdsmi_shut_down.assert_called_once()
+
+    def test_amdsmi_rejects_mismatched_wrapper_and_library_with_reason(self):
+        amd = Adapter(1, "AMD", 0x1002, GiB, 0, False, (3, 0, 0))
+        api = SimpleNamespace(
+            __version__="1.2.2", amdsmi_init=Mock(), amdsmi_shut_down=Mock(),
+            amdsmi_get_lib_version=lambda: {"major": 26, "minor": 5, "release": 0})
+        with patch("gputaskman.amdsmi.os.path.exists", return_value=True):
+            provider = AmdSmi(amd, [amd], api)
+        self.assertIsNone(provider.sample())
+        self.assertIn("different major versions", provider.status)
+        self.assertIn("matching WSL AMD SMI", provider.status)
+        api.amdsmi_shut_down.assert_called_once()
+
+    def test_amdsmi_import_failure_does_not_corrupt_json_stdout(self):
+        def load(_):
+            print("vendor library loader error")
+            raise OSError("library missing")
+        output = io.StringIO()
+        with patch.object(amdsmi, "_discovery_status", ""), \
+                patch.object(amdsmi.importlib, "import_module", side_effect=load), \
+                patch.object(amdsmi.os.path, "isdir", return_value=False), \
+                contextlib.redirect_stdout(output):
+            self.assertIsNone(amdsmi._import_amdsmi())
+            self.assertIn("library missing", amdsmi.amdsmi_status())
+        self.assertEqual(output.getvalue(), "")
+
+    def test_amdsmi_discovery_explains_missing_dxg_bridge_and_unsupported_hardware(self):
+        from gputaskman.linux import _amdsmi_adapters
+
+        with patch.object(amdsmi, "_discovery_status", ""), \
+                patch("gputaskman.linux.os.path.exists", return_value=False), \
+                patch.object(amdsmi, "_import_amdsmi") as load:
+            self.assertEqual(_amdsmi_adapters(), [])
+            self.assertIn("/dev/dxg", amdsmi.amdsmi_status())
+            load.assert_not_called()
+        api = SimpleNamespace(
+            amdsmi_init=Mock(), amdsmi_shut_down=Mock(), amdsmi_get_processor_handles=lambda: [])
+        with patch.object(amdsmi, "_discovery_status", ""), \
+                patch("gputaskman.linux.os.path.exists", return_value=True), \
+                patch.object(amdsmi, "_import_amdsmi", return_value=api):
+            self.assertEqual(_amdsmi_adapters(), [])
+            self.assertIn("no usable WSL GPU", amdsmi.amdsmi_status())
+            api.amdsmi_init.side_effect = RuntimeError("ROCDXG bridge unavailable")
+            self.assertEqual(_amdsmi_adapters(), [])
+            self.assertIn("ROCDXG bridge unavailable", amdsmi.amdsmi_status())
+            self.assertIn("rocdxg-roct", amdsmi.amdsmi_status())
+
+    def test_amdsmi_discovery_skips_bad_and_ambiguous_pci_identities(self):
+        from gputaskman.linux import _amdsmi_adapters
+
+        api = SimpleNamespace(
+            amdsmi_init=lambda: None, amdsmi_shut_down=lambda: None,
+            amdsmi_get_processor_handles=lambda: [0, 1, 2, 3],
+            amdsmi_get_gpu_device_bdf=lambda h: ["bad", "0000:03:00.0", "0000:03:00.0", "0000:04:00.0"][h])
+        with patch.object(amdsmi, "_discovery_status", ""), \
+                patch("gputaskman.linux.os.path.exists", return_value=True), \
+                patch.object(amdsmi, "_import_amdsmi", return_value=api):
+            adapters = _amdsmi_adapters()
+            self.assertEqual([a.pci_address for a in adapters], [(4, 0, 0)])
+            self.assertIn("duplicate PCI addresses", amdsmi.amdsmi_status())
 
     def test_mixed_vendor_adapters_are_selectable(self):
         amd = Adapter(2, "AMD GPU", 0x1002, 24 * GiB, 0, False)
@@ -268,6 +423,28 @@ class DeviceSelectionTests(unittest.TestCase):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_missing_wsl_stack_is_unknown_with_reason_in_text_json_and_ui(self):
+        c = Collector.__new__(Collector)
+        c.adapter, c.adapters = None, []
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.amdsmi = Mock(status="")
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = ({}, {})
+        c.inspector, c.prober = Mock(), Mock()
+        reason = "AMD SMI unavailable; install matching WSL AMD SMI and ROCDXG packages yourself."
+        with patch("gputaskman.collector.BACKEND", "wsl"), \
+                patch("gputaskman.collector.amdsmi_status", return_value=reason):
+            s = c.sample()
+        self.assertIsNone(s.attributed)
+        self.assertIsNone(s.vram_used)
+        self.assertEqual(to_dict(s)["counter_status"], reason)
+        self.assertIsNone(to_dict(s)["attributed"])
+        self.assertIn(reason, to_text(s))
+        output = io.StringIO()
+        Console(file=output, width=160).print(GpuTaskManager().render_device(s))
+        self.assertIn("AMD SMI unavailable", output.getvalue())
+
     def test_windows_counter_luid_mismatch_is_not_attributed_to_selected_adapter(self):
         c = Collector.__new__(Collector)
         c.adapter = Adapter(0x4bb7, "GPU", 0x10DE, 16 * GiB, 0, False)

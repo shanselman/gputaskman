@@ -10,7 +10,7 @@ from contextlib import ExitStack
 
 import psutil
 
-from .amdsmi import AmdSmi, _bdf
+from .amdsmi import AmdSmi, _bdf, amdsmi_status
 from .adl import Adl
 from .dxgi import (VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, VENDOR_QUALCOMM, Adapter,
                   adapter_driver_version)
@@ -152,7 +152,10 @@ class Snapshot:
         if not self.process_memory_available or self.counter_adapter_matched is False or any(
                 "dedicated" not in p.gpu.available for p in self.procs):
             return None
-        return int(sum(p.gpu.dedicated for p in self.procs))
+        total = int(sum(p.gpu.dedicated for p in self.procs))
+        if self.backend == "wsl" and self.host_data and self.vram_total and total > self.vram_total:
+            return None  # overlapping host counters cannot establish uniquely attributed bytes
+        return total
 
 
 def _is_live(g: ProcGpu) -> bool:
@@ -402,6 +405,10 @@ class Collector:
         )
 
         snap.host_status = self.host_status
+        if BACKEND == "wsl" and (not self.adapter or self.adapter.vendor_id == VENDOR_AMD):
+            snap.counter_status = " ".join(dict.fromkeys(filter(None, (amdsmi_status(), self.amdsmi.status))))
+            if self.adapter is None:
+                snap.process_memory_available = False
         if BACKEND == "wddm" and self.adapter:
             snap.counter_adapter_matched = luid in per_luid or luid in adapters
             if isinstance(self.adapter, TccAdapter):
@@ -449,6 +456,11 @@ class Collector:
                                       ProcDetail(pid, "(outside this container)"), host=True, origin="outside"))
         if self.host is not None:  # current inferred sizes drive both scan priority and the LLM breakdown
             self._add_host_rows(snap)
+        if (snap.backend == "wsl" and snap.host_data and snap.vram_total
+                and sum(r.gpu.dedicated for r in snap.procs) > snap.vram_total):
+            snap.counter_status = " ".join(filter(None, (
+                snap.counter_status, "Windows per-process counters exceed device capacity and may overlap; "
+                                     "attributed total is unknown. Use the adapter reading as the device total.")))
         local_rows = [r for r in snap.procs if not r.host]
         deep_pids = {r.pid for r in local_rows[: self.DEEP_TOP_N]} | {
             r.pid for r in local_rows if r.gpu.gpu_pct >= 2}
