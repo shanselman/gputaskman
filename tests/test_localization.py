@@ -169,7 +169,7 @@ class RussianUiTests(unittest.IsolatedAsyncioTestCase):
         with language("ru"):
             app = GpuTaskManager(system=False)
         # Callbacks run outside the construction context, as worker callbacks do.
-        with patch.object(GpuTaskManager, "poll"):
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.BACKEND", "wddm"):
             async with app.run_test(size=(150, 45)) as pilot:
                 await pilot.pause()
                 app.apply(snapshot())
