@@ -78,6 +78,8 @@ def record_main(argv: list[str]) -> None:
             count = run(sample, out, interval=args.interval, duration=args.duration)
     except KeyboardInterrupt:
         pass  # Ctrl+C while starting up: nothing was recorded yet
+    except OSError as error:
+        ap.exit(1, f"{ap.prog}: recording to {args.output} failed: {error}\n")
     print(f"Recorded {count} sample(s) to {args.output}", file=sys.stderr)
 
 

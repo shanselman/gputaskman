@@ -267,6 +267,7 @@ class LinuxCounters:
         self.ok = False
         self._devices: list[tuple[int, object]] = []
         self._last_ts: dict[int, int] = {}
+        self.dxg_holders: set[int] = set()
         self._matcher = PidMatcher()
         # {adapter key: {host pid: ProcGpu}}: NVML processes in another PID namespace that couldn't be
         # matched to a local process. Their PIDs must never be looked up in this /proc.
@@ -324,6 +325,7 @@ class LinuxCounters:
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
         self._compute_pids: set[int] = set()
+        self.dxg_holders = set()
         for key, h in self._devices:
             try:
                 adapters[key].dedicated = float(N.nvmlDeviceGetMemoryInfo(h).used)
@@ -354,7 +356,8 @@ class LinuxCounters:
         if not self.wsl:
             self._resolve_namespaces(procs)
         if self.wsl and (self._devices or self._wsl_keys):
-            users = dxg_pids(exclude={os.getpid()})
+            self.dxg_holders = dxg_pids()
+            users = self.dxg_holders - {os.getpid()}
             # WSL does not say which GPU a process uses; with one GPU (the common case) that's unambiguous.
             keys = [key for key, _ in self._devices]
             keys += [k for k in self._wsl_keys if k not in keys]

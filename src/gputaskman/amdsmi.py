@@ -52,10 +52,12 @@ def _read_vram_bytes(api, handle) -> tuple[int | None, int | None]:
                 vu = _number(vram.get("vram_used"))
                 if total is None and vt is not None and vt > 0:
                     total = int(vt * (1 << 20))
-                if used is None and vu is not None and vu >= 0 and (total is None or vu * (1 << 20) <= total):
+                if used is None and vu is not None and vu >= 0 and total is not None and vu * (1 << 20) <= total:
                     used = int(vu * (1 << 20))
         except Exception:
             pass
+    if total is not None and used is not None and used > total:
+        used = None
     return total, used
 
 

@@ -12,7 +12,8 @@ import psutil
 
 from .amdsmi import AmdSmi, _bdf
 from .adl import Adl
-from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, Adapter
+from .dxgi import (VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, VENDOR_QUALCOMM, Adapter,
+                  adapter_driver_version)
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
@@ -85,7 +86,8 @@ class ProcRow:
                 return f"Handy last log ({self.handy.last_event}): {self.handy.last_model.rsplit('/', 1)[-1]}"
             if self.handy.selected_model:
                 return f"Handy selected (not load proof): {self.handy.selected_model.rsplit('/', 1)[-1]}"
-        if self.llm and self.llm.server and self.llm.server.kind == "vllm" and self.llm.server.models:
+        if (self.llm and self.llm.server and self.llm.server.kind in ("vllm", "foundry-local")
+                and self.llm.server.models):
             source = "parent API" if self.llm.server_source == "parent" else "API"
             return f"reported ({source}): " + ", ".join(m["name"] for m in self.llm.server.models)
         if self.llm and self.llm.models:
@@ -202,8 +204,13 @@ def _llm_wanted(row, shared_is_spill: bool) -> bool:
     """Whether a process row gets an LLM breakdown: an AI-kind process with models (or kind LLM),
     not diffusion, and with measured GPU memory. Where spilled system memory is a counter of its own
     (WDDM, discrete DRM cards) both the dedicated and shared counters must be present; on an integrated
-    GPU system memory is the memory and there is no spill counter, so dedicated alone suffices."""
-    if row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.has_model_evidence or row.kind == "LLM"):
+    GPU system memory is the memory and there is no spill counter, so dedicated alone suffices.
+    Foundry Local can report loaded IDs even when memory counters and model files are unavailable."""
+    if row.detail.is_diffusion:
+        return False
+    if row.detail.foundry_local:
+        return True  # Loaded-model identity does not require memory counters or a mapped file.
+    if row.kind not in AI_KINDS or not (row.detail.has_model_evidence or row.kind == "LLM"):
         return False
     need = {"dedicated", "shared"} if shared_is_spill else {"dedicated"}
     return need <= row.gpu.available
@@ -227,6 +234,8 @@ class Collector:
                  adapters: list[Adapter] | None = None) -> None:
         self.adapters = [a for a in (enumerate_adapters() if adapters is None else adapters) if not a.software]
         self.adapter = select_adapter(self.adapters, gpu_index)
+        self._windows_driver = (adapter_driver_version(self.adapter.device_instance_id)
+                                if BACKEND == "wddm" and self.adapter else "")
         with ExitStack() as resources:
             if isinstance(self.adapter, TccAdapter):  # no Windows counters exist for it: NVML is the source
                 self.nvml = Nvml()
@@ -343,13 +352,16 @@ class Collector:
         luid = self.adapter.luid if self.adapter else (next(iter(per_luid), 0))
         procs = per_luid.get(luid, {})
         a = adapters.get(luid)
-        integrated_intel = BACKEND == "wddm" and self.adapter is not None and self.adapter.integrated_intel
-        if integrated_intel:
+        integrated_gpu = BACKEND == "wddm" and self.adapter is not None and self.adapter.integrated_gpu
+        integrated_local_pids = {
+            pid for pid, gpu in procs.items()
+            if integrated_gpu and "dedicated" in gpu.available and gpu.dedicated >= MiB
+        }
+        if integrated_gpu:
             for gpu in procs.values():
                 if "dedicated" in gpu.available and gpu.dedicated > 0:
                     gpu.shared += gpu.dedicated
                     gpu.dedicated = 0
-                    gpu.available.add("shared")
         if BACKEND == "metal":
             nv = self.counters.device  # IOKit's device stats in the shape the header renders (no NVML on macOS)
         elif self.drm_card is not None:
@@ -362,7 +374,8 @@ class Collector:
             # NVML can't describe this GPU, and a sweep of every NVIDIA device costs ~60 ms per device.
             if self.adapter.vendor_id == VENDOR_AMD:
                 nv = self.adl.sample() or self.amdsmi.sample()
-            elif self.adapter.vendor_id == VENDOR_INTEL and BACKEND == "wddm" and a and a.util_gpu is not None:
+            elif (self.adapter.vendor_id in (VENDOR_INTEL, VENDOR_QUALCOMM) and BACKEND == "wddm"
+                  and a and a.util_gpu is not None):
                 nv = DeviceTelemetry(index=self.gpu_index, source="Windows WDDM", util_gpu=round(a.util_gpu))
             else:
                 nv = None
@@ -375,13 +388,15 @@ class Collector:
             int(nv.mem_used) if BACKEND != "wddm" and nv and nv.mem_used is not None else None)
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
-            driver=self._mac_driver or (self.amdsmi.driver if nv and nv.source == "AMD SMI"
-                                        else self.nvml.driver if nv and nv.source == "NVML"
-                                        else f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else ""),
+            driver=(self._mac_driver
+                    or (self.amdsmi.driver if nv and nv.source == "AMD SMI" else "")
+                    or (self.nvml.driver if nv and nv.source == "NVML" else "")
+                    or (f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else "")
+                    or getattr(self, "_windows_driver", "")),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
             vram_used=used,
             shared_used=int(a.shared) if a and a.shared is not None else None, backend=self.backend,
-            shared_is_spill=not (integrated_intel or (self.drm_card is not None and self.drm_card.integrated)),
+            shared_is_spill=not (integrated_gpu or (self.drm_card is not None and self.drm_card.integrated)),
         )
 
         snap.host_status = self.host_status
@@ -419,7 +434,7 @@ class Collector:
         elif self.backend == "ascend":
             snap.process_memory_available = False
             snap.counter_status = "Ascend chip unavailable: npu-smi could not match the selected adapter"
-        live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
+        live = [(pid, g) for pid, g in procs.items() if _is_live(g) or pid in integrated_local_pids]
         live.sort(key=lambda x: -(x[1].shown_vram or 0))
         for pid, g in live:
             d = self.inspector.get(pid)
@@ -457,11 +472,17 @@ class Collector:
             if not _llm_wanted(row, snap.shared_is_spill):
                 continue
             ports = self.inspector.exclusive_ports(row.pid)
-            key = api_key(row.detail.cmdline)
+            foundry = row.detail.foundry_local
+            key = None if foundry else api_key(row.detail.cmdline)
             vllm = bool(row.detail.vllm_role)
-            kind = "vllm" if vllm else None
+            kind = "foundry-local" if foundry else "vllm" if vllm else None
             own_origin = ("process", row.pid, row.detail.create_time)
-            if vllm and (row.detail.vllm_ambiguous or len(ports) > 1 or
+            if foundry:
+                parent_ports = []
+                if (not row.detail.create_time or len(ports) != 1
+                        or set(ports) != set(row.detail.ports)):
+                    ports = []
+            elif vllm and (row.detail.vllm_ambiguous or len(ports) > 1 or
                          set(ports) != set(row.detail.ports)):
                 ports = []
                 parent_ports = []
@@ -541,12 +562,10 @@ class Collector:
         snap.procs = host_rows[:at] + snap.procs + host_rows[at:]
 
     def _attribute(self, snap: Snapshot, luid: int, contexts: list[float]) -> None:
-        from .linux import dxg_pids
-
         linux = [r for r in snap.procs if not r.host and not r.gpu.attributed]
         # This monitor holds a (0-byte) context too through NVML; AMD SMI only holds one if /dev/dxg stays open.
         holders = [(r.pid, r.detail.create_time) for r in linux]
-        if not (snap.adapter and snap.adapter.vendor_id == VENDOR_AMD) or os.getpid() in dxg_pids():
+        if not (snap.adapter and snap.adapter.vendor_id == VENDOR_AMD) or os.getpid() in self.counters.dxg_holders:
             holders.append((os.getpid(), self._own_start))
         guesses, reason = self.tracker.update(luid, contexts, holders)
         snap.wsl_split = reason

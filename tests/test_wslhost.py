@@ -11,6 +11,7 @@ from unittest.mock import Mock, mock_open, patch
 from gputaskman import collector as collector_mod
 from gputaskman import wslhost
 from gputaskman.collector import Collector, ProcRow, Snapshot
+from gputaskman.dxgi import Adapter, VENDOR_AMD
 from gputaskman.llm import LlmView
 from gputaskman.pdh import AdapterGpu, ProcGpu
 from gputaskman.procinfo import MappedModel, ProcDetail
@@ -411,6 +412,21 @@ class HostRowTests(unittest.TestCase):
         data = to_dict(snap)["processes"][1]
         self.assertEqual((data["vram_inferred_bytes"], data["vram_inferred_by"]), (3.0 * GiB, "consistent"))
         self.assertEqual(snap.attributed, 3 * GiB)  # the Linux child is not added to the VM total again
+
+    def test_amd_monitor_context_uses_current_counter_scan_without_rescanning(self):
+        for own_context in (True, False):
+            with self.subTest(own_context=own_context):
+                c = self.collector(None)
+                c.counters = Mock(dxg_holders={os.getpid()} if own_context else set())
+                c.tracker = Mock()
+                c.tracker.update.return_value = ({}, "test")
+                snap = self.snap()
+                snap.adapter = Adapter(1, "AMD", VENDOR_AMD, 24 * GiB, 0, False)
+                with patch("gputaskman.linux.dxg_pids", side_effect=AssertionError("second fd walk")):
+                    c._attribute(snap, RTX, [0.0, 3.0 * GiB])
+                holders = c.tracker.update.call_args.args[2]
+                self.assertEqual(os.getpid() in {pid for pid, _ in holders}, own_context)
+                self.assertIn(2744, {pid for pid, _ in holders})
 
     def test_current_inferred_vram_sets_first_sample_scan_priority(self):
         big_pid = Collector.DEEP_TOP_N + 1

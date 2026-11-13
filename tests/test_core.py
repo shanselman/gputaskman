@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from textual.widgets import Footer, Select, Static
 
-from gputaskman.amdsmi import AmdSmi
+from gputaskman.amdsmi import AmdSmi, _read_vram_bytes
 from gputaskman.adl import Adl, _Metrics
 from gputaskman.app import GpuTaskManager, spark, stacked_bar
 from gputaskman.cli import main
@@ -208,6 +208,24 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertEqual((sample.power_w, sample.power_limit_w, sample.power_kind), (38, 430.0, "socket"))
         provider.close()
 
+    def test_amdsmi_unreliable_vram_fallback_requires_a_total(self):
+        for total, used, expected in ((None, 435000, (None, None)),
+                                      (24576, 435000, (24 * GiB, None)),
+                                      (24576, 4096, (24 * GiB, 4 * GiB)),
+                                      (24576, 0, (24 * GiB, 0))):
+            api = SimpleNamespace(
+                amdsmi_get_gpu_vram_usage=lambda h: {"vram_total": total, "vram_used": used})
+            with self.subTest(total=total, used=used):
+                self.assertEqual(_read_vram_bytes(api, "gpu"), expected)
+
+    def test_amdsmi_rechecks_usage_against_a_fallback_total(self):
+        api = SimpleNamespace(
+            AmdSmiMemoryType=SimpleNamespace(VRAM=1),
+            amdsmi_get_gpu_memory_total=lambda h, t: 0,
+            amdsmi_get_gpu_memory_usage=lambda h, t: 400 * GiB,
+            amdsmi_get_gpu_vram_usage=lambda h: {"vram_total": 24576, "vram_used": 4096})
+        self.assertEqual(_read_vram_bytes(api, "gpu"), (24 * GiB, None))
+
     def test_mixed_vendor_adapters_are_selectable(self):
         amd = Adapter(2, "AMD GPU", 0x1002, 24 * GiB, 0, False)
         nvidia = Adapter(1, "NVIDIA GPU", 0x10DE, 8 * GiB, 0, False)
@@ -317,6 +335,21 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("GPU 42%", to_text(s))
         self.assertEqual(to_dict(s)["device"]["util_gpu"], 42)
 
+    def test_windows_pnp_driver_version_fills_missing_telemetry_version(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "Intel GPU", 0x8086, 12 * GiB, 8 * GiB, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c._windows_driver = "32.0.163.2"
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(util_gpu=41.6)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertEqual(s.driver, "32.0.163.2")
+        self.assertEqual(to_dict(s)["driver"], "32.0.163.2")
+
     def test_integrated_intel_wddm_keeps_system_memory_out_of_vram(self):
         memory = 776 * MiB
         adapter = Adapter(1, "Intel Iris Xe Graphics", 0x8086, 128 * MiB, 8 * GiB, False)
@@ -339,8 +372,8 @@ class MemoryTests(unittest.TestCase):
         self.assertIsNone(s.nv.temp)
         self.assertIsNone(s.nv.power_w)
         self.assertIsNone(s.nv.sm_clock)
-        self.assertTrue(adapter.integrated_intel)
-        self.assertFalse(Adapter(2, "Intel Arc B580", 0x8086, 12 * GiB, 8 * GiB, False).integrated_intel)
+        self.assertTrue(adapter.integrated_gpu)
+        self.assertFalse(Adapter(2, "Intel Arc B580", 0x8086, 12 * GiB, 8 * GiB, False).integrated_gpu)
         gpu = s.procs[0].gpu
         self.assertEqual((gpu.dedicated, gpu.shared), (0, memory))
         data = to_dict(s)
@@ -350,6 +383,82 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("VRAM 0 MB / 128 MB", text)
         self.assertIn("SHARED", text)
         self.assertIn("shared (in system RAM) 776 MB", text)
+
+    def test_qualcomm_wddm_reports_shared_memory_and_engine_activity(self):
+        memory = 45 * GiB
+        adapter = Adapter(1, "Qualcomm Adreno X2-85", 0x4D4F4351, 128 * MiB, 48 * GiB, False)
+        c = Collector.__new__(Collector)
+        c.adapter = adapter
+        c.adapters = [adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {1: {42: ProcGpu(dedicated=memory, shared=0, committed=memory)}},
+            {1: AdapterGpu(dedicated=0, shared=memory, util_gpu=41.6)})
+        c.inspector, c.prober = Mock(), Mock()
+        c.inspector.get.return_value = ProcDetail(42, "example.exe")
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+
+        self.assertEqual(adapter.vendor, "Qualcomm")
+        self.assertTrue(adapter.integrated_gpu)
+        self.assertEqual((s.vram_total, s.vram_used, s.shared_used), (128 * MiB, 0, memory))
+        self.assertFalse(s.shared_is_spill)
+        self.assertEqual((s.nv.source, s.nv.util_gpu), ("Windows WDDM", 42))
+        self.assertEqual(s.attributed, 0)
+        self.assertEqual((s.procs[0].gpu.dedicated, s.procs[0].gpu.shared), (0, memory))
+        data = to_dict(s)
+        self.assertEqual((data["processes"][0]["vram_bytes"], data["processes"][0]["shared_bytes"]), (0, memory))
+        self.assertIn("VRAM 0 MB / 128 MB", to_text(s))
+        self.assertIn("shared (in system RAM) 45.00 GB", to_text(s))
+        output = io.StringIO()
+        Console(file=output, width=160).print(GpuTaskManager().render_device(s))
+        self.assertNotIn("free 128 MB", output.getvalue())
+
+    def test_integrated_wddm_small_local_process_is_not_filtered_after_remap(self):
+        adapter = Adapter(1, "Qualcomm Adreno", 0x4D4F4351, 128 * MiB, 8 * GiB, False)
+        c = Collector.__new__(Collector)
+        c.adapter = adapter
+        c.adapters = [adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {1: {
+                42: ProcGpu(dedicated=5 * MiB, shared=0),
+                43: ProcGpu(dedicated=0, shared=5 * MiB),
+            }},
+            {1: AdapterGpu(dedicated=0, shared=10 * MiB)})
+        c.inspector, c.prober = Mock(), Mock()
+        c.inspector.get.side_effect = lambda pid: ProcDetail(pid, f"process-{pid}.exe")
+
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+
+        self.assertEqual([row.pid for row in s.procs], [42])
+        self.assertEqual((s.procs[0].gpu.dedicated, s.procs[0].gpu.shared), (0, 5 * MiB))
+
+    def test_integrated_wddm_missing_nonlocal_counter_stays_unknown(self):
+        adapter = Adapter(1, "Qualcomm Adreno", 0x4D4F4351, 128 * MiB, 8 * GiB, False)
+        c = Collector.__new__(Collector)
+        c.adapter = adapter
+        c.adapters = [adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {1: {42: ProcGpu(dedicated=5 * MiB, shared=0, available={"dedicated", "committed", "engine"})}},
+            {1: AdapterGpu(dedicated=0, shared=5 * MiB)})
+        c.inspector, c.prober = Mock(), Mock()
+        c.inspector.get.return_value = ProcDetail(42, "process.exe")
+
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+
+        self.assertEqual([row.pid for row in s.procs], [42])
+        self.assertNotIn("shared", s.procs[0].gpu.available)
+        self.assertIsNone(to_dict(s)["processes"][0]["shared_bytes"])
 
     def test_lost_nvml_telemetry_is_explained_not_silent(self):
         c = Collector.__new__(Collector)

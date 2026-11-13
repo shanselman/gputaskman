@@ -17,7 +17,7 @@ from textual.widgets import Static
 
 from gputaskman.app import GpuTaskManager
 from gputaskman.collector import Collector
-from gputaskman.llm import ServerProber, probe_server, vllm_models
+from gputaskman.llm import ServerProber, probe_server, vllm_metrics, vllm_models
 from gputaskman.pdh import AdapterGpu, ProcGpu
 from gputaskman.procinfo import ProcDetail, ProcInspector, classify
 from gputaskman.report import to_dict, to_text
@@ -28,9 +28,31 @@ LAUNCH = ["vllm", "serve", "org/model"]
 # utils/system_utils.py:set_process_title, v1/executor/multiproc_executor.py:setup_proc_title_and_log_prefix,
 # entrypoints/cli/serve.py:cmd, and entrypoints/launchers/api_server/entry.py:run_server.
 
+# Constructed (not captured from a live server) from vllm/v1/metrics/loggers.py PrometheusStatLogger:
+# gauges and counters labelled model_name/engine; prometheus_client adds _total and _created to counters.
+METRICS = """\
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="org/model"} 3.0
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine="0",model_name="org/model"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="org/model",reason="capacity"} 0.0
+# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0",model_name="org/model"} 0.42
+# TYPE vllm:prompt_tokens counter
+vllm:prompt_tokens_total{engine="0",model_name="org/model"} 1234.0
+vllm:prompt_tokens_created{engine="0",model_name="org/model"} 1.7e+09
+# TYPE vllm:e2e_request_latency_seconds histogram
+vllm:e2e_request_latency_seconds_bucket{engine="0",le="0.3",model_name="org/model"} 1.0
+vllm:e2e_request_latency_seconds_count{engine="0",model_name="org/model"} 2.0
+"""
+NO_GAUGES = {"requests_running": None, "requests_waiting": None, "kv_cache_usage": None}
+
 
 @contextlib.contextmanager
-def listener(*, locked=False, redirect=False):
+def listener(*, locked=False, redirect=False, metrics=None):
     seen = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -38,8 +60,11 @@ def listener(*, locked=False, redirect=False):
 
         def do_GET(self):
             seen.append((self.path, self.headers.get("Authorization")))
-            body = json.dumps({"data": [{"id": "org/model", "root": "/not/a/model/file",
-                                         "max_model_len": 8192, "size": 999999}]}).encode()
+            if self.path == "/metrics" and metrics is not None:
+                body = metrics.encode()
+            else:
+                body = json.dumps({"data": [{"id": "org/model", "root": "/not/a/model/file",
+                                             "max_model_len": 8192, "size": 999999}]}).encode()
             status = 401 if locked and not self.headers.get("Authorization") else 302 if redirect else 200
             self.send_response(status)
             self.send_header("Content-Length", str(len(body) if status == 200 else 0))
@@ -180,23 +205,125 @@ class VllmTests(unittest.TestCase):
             parent = ("parent", ((1, 100),))
             self.assertIsNotNone(p.get([port], "private-key", kind="vllm", origin=own))
             self.assertIsNotNone(p.get([port], "private-key", kind="vllm", origin=own))
-            self.assertEqual(len(seen), 1)
+            self.assertEqual(len(seen), 2)  # /v1/models, then a keyless /metrics
             self.assertIsNone(p.get([port], kind="vllm", origin=parent))
             self.assertIsNone(p.get([port], kind="vllm", origin=parent))
             self.assertEqual(p.locked_port([port], kind="vllm", origin=parent), port)
             self.assertIsNone(p.locked_port([port], "private-key", kind="vllm", origin=own))
-            self.assertEqual(len(seen), 2)
+            self.assertEqual(len(seen), 3)  # a 401 on /v1/models stops before /metrics
             self.assertIsNone(seen[-1][1])
             self.assertIsNotNone(p.get([port], "different-key", kind="vllm", origin=own))
-            self.assertEqual(len(seen), 3)  # changed keys do not use the previous cache
+            self.assertEqual(len(seen), 5)  # changed keys do not use the previous cache
             self.assertIsNotNone(p.get([port], "private-key", kind="vllm", origin=("process", 1, 101)))
-            self.assertEqual(len(seen), 4)  # reused PID/port does not use old identity
-            self.assertEqual({path for path, _ in seen}, {"/v1/models"})
+            self.assertEqual(len(seen), 7)  # reused PID/port does not use old identity
+            self.assertEqual({path for path, _ in seen}, {"/v1/models", "/metrics"})
+            self.assertTrue(all(auth is None for path, auth in seen if path == "/metrics"))
             self.assertNotIn("private-key", repr(vars(p)))
             with patch("gputaskman.llm.time.time", return_value=time.time() + 31):
                 self.assertIsNone(p.get([port], kind="vllm", origin=parent))
-            self.assertEqual(len(seen), 5)
+            self.assertEqual(len(seen), 8)
             self.assertEqual(p.locked_port([port], kind="vllm", origin=parent), port)
+
+    def test_metrics_gauges_zero_stays_zero(self):
+        self.assertEqual(vllm_metrics(METRICS, ["org/model"]),
+                         {"requests_running": 3, "requests_waiting": 0, "kv_cache_usage": 0.42})
+
+    def test_metrics_served_model_aliases(self):
+        # vLLM labels metrics with the first --served-model-name; /v1/models lists every alias.
+        text = METRICS.replace('model_name="org/model"', 'model_name="production-llm"')
+        self.assertEqual(vllm_metrics(text, ["production-llm", "my-model"])["requests_running"], 3)
+        self.assertEqual(vllm_metrics(text, ["my-model", "production-llm"])["requests_running"], 3)
+        self.assertEqual(vllm_metrics(text, ["org/model"]), NO_GAUGES)
+
+    def test_metrics_identity_must_be_one_engine_and_one_model(self):
+        cases = {
+            "second engine": METRICS + 'vllm:num_requests_running{engine="1",model_name="org/model"} 1\n',
+            "second model": METRICS + 'vllm:num_requests_running{engine="0",model_name="other"} 1\n',
+            "no model label": METRICS.replace(',model_name="org/model"} 3.0', "} 3.0"),
+            "no engine label anywhere": METRICS.replace('engine="0",', ""),
+            "one sample without engine": METRICS.replace('engine="0",model_name="org/model"} 3.0',
+                                                         'model_name="org/model"} 3.0'),
+            "empty engine label": METRICS.replace('engine="0"', 'engine=""'),
+            "empty model label": METRICS.replace('model_name="org/model"', 'model_name=""'),
+            "malformed labels": METRICS.replace('engine="0",model_name="org/model"} 3.0', 'engine=0} 3.0'),
+            "no gauges": "# nothing here\nvllm:prompt_tokens_total{engine=\"0\",model_name=\"org/model\"} 1\n",
+            "empty": "",
+        }
+        for reason, text in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(vllm_metrics(text, ["org/model", "other"]), NO_GAUGES)
+
+    def test_metrics_invalid_samples_stay_unknown_individually(self):
+        run = 'vllm:num_requests_running{engine="0",model_name="org/model"} 3.0'
+        kv = 'vllm:kv_cache_usage_perc{engine="0",model_name="org/model"} 0.42'
+        cases = [
+            (METRICS.replace(run, run + "\n" + run), "requests_running"),  # duplicate sample
+            (METRICS.replace(run, run.replace("3.0", "-1")), "requests_running"),
+            (METRICS.replace(run, run.replace("3.0", "2.5")), "requests_running"),
+            (METRICS.replace(run, run.replace("3.0", "abc")), "requests_running"),
+            (METRICS.replace(run + "\n", ""), "requests_running"),  # missing
+            (METRICS.replace(kv, kv.replace("0.42", "NaN")), "kv_cache_usage"),
+            (METRICS.replace(kv, kv.replace("0.42", "+Inf")), "kv_cache_usage"),
+            (METRICS.replace(kv, kv.replace("0.42", "42")), "kv_cache_usage"),  # a percent, not a fraction
+            (METRICS.replace(kv, kv.replace("0.42", "-0.1")), "kv_cache_usage"),
+        ]
+        for text, key in cases:
+            with self.subTest(text=text.splitlines()[2:3], key=key):
+                gauges = vllm_metrics(text, ["org/model"])
+                self.assertIsNone(gauges[key])
+                self.assertEqual(gauges["requests_waiting"], 0)  # other gauges are unaffected
+
+    def test_metrics_exposition_details(self):
+        cases = [
+            METRICS.replace('engine="0",model_name="org/model"}', 'engine="0",model_name="org/model",}'),
+            METRICS.replace('"org/model"} 3.0', '"org/model"} 3.0 1700000000000'),  # timestamp
+            METRICS.replace('engine="0",model_name="org/model"', 'model_name="org/model",engine="0"'),
+        ]
+        for text in cases:
+            with self.subTest(text=text.splitlines()[2]):
+                self.assertEqual(vllm_metrics(text, ["org/model"])["requests_running"], 3)
+        quoted = METRICS.replace('model_name="org/model"', r'model_name="org/\"q\"\\x"')
+        self.assertEqual(vllm_metrics(quoted, ['org/"q"\\x'])["kv_cache_usage"], 0.42)
+
+    def test_metrics_probe_is_keyless_and_only_after_models(self):
+        with listener(metrics=METRICS) as (port, seen):
+            server = probe_server(port, key="own-key", kind="vllm")
+        self.assertEqual(seen, [("/v1/models", "Bearer own-key"), ("/metrics", None)])
+        self.assertEqual((server.requests_running, server.requests_waiting, server.kv_cache_usage), (3, 0, 0.42))
+        with listener(locked=True, metrics=METRICS) as (port, seen):
+            server = probe_server(port, key="own-key", kind="vllm")
+        self.assertEqual(server.models[0]["name"], "org/model")  # a locked /metrics keeps the model IDs
+        self.assertEqual((server.requests_running, server.requests_waiting, server.kv_cache_usage), (None,) * 3)
+        with listener(metrics=METRICS) as (port, seen), patch("gputaskman.llm.vllm_models", return_value=None):
+            self.assertIsNone(probe_server(port, kind="vllm"))
+        self.assertEqual([path for path, _ in seen], ["/v1/models"])
+
+    def test_metrics_reported_with_provenance_and_no_memory_change(self):
+        with listener(metrics=METRICS) as (port, _):
+            details = {10: ProcDetail(10, "VLLM::EngineCore", create_time=2),
+                       20: ProcDetail(20, "python", cmdline=LAUNCH, create_time=1)}
+            _, snap = self.sample(details, {20: [port]}, {10: 20})
+        row = snap.procs[0]
+        self.assertEqual(snap.attributed, 512 * MiB)
+        self.assertEqual([(s.kind, s.bytes) for s in row.llm.segments], [("unknown", 512 * MiB)])
+        server = to_dict(snap)["processes"][0]["llm"]["server"]
+        self.assertEqual((server["requests_running"], server["requests_waiting"], server["kv_cache_usage"]),
+                         (3, 0, 0.42))
+        text = to_text(snap)
+        self.assertIn("vLLM /metrics (runtime-reported): requests running 3, waiting 0, KV-cache pool 42.0%", text)
+        self.assertIn("not of GPU memory", text)
+        self.assertIn("server source: parent process", text)
+
+    def test_unknown_gauges_are_null_and_not_displayed(self):
+        with listener() as (port, _):  # /metrics answers JSON, not Prometheus text
+            details = {10: ProcDetail(10, "VLLM::EngineCore", create_time=2),
+                       20: ProcDetail(20, "python", cmdline=LAUNCH, create_time=1)}
+            _, snap = self.sample(details, {20: [port]}, {10: 20})
+        server = to_dict(snap)["processes"][0]["llm"]["server"]
+        self.assertEqual({k: server[k] for k in NO_GAUGES}, NO_GAUGES)
+        text = to_text(snap)
+        self.assertNotIn("vLLM /metrics", text)
+        self.assertNotIn("KV-cache pool", text)
 
     def test_unauthenticated_parent_redirect_is_not_followed(self):
         with listener(redirect=True) as (port, seen):
@@ -224,7 +351,7 @@ class VllmTests(unittest.TestCase):
         self.assertEqual(row.llm.server_source, "parent")
         self.assertEqual(row.llm.server.models[0]["name"], "org/model")
         self.assertIn("reported (parent API): org/model", row.inside)
-        self.assertEqual(seen, [("/v1/models", None)])
+        self.assertEqual(seen, [("/v1/models", None), ("/metrics", None)])
         self.assertEqual(row.gpu.dedicated, 512 * MiB)
         self.assertEqual(snap.attributed, 512 * MiB)
         self.assertEqual([(s.kind, s.bytes) for s in row.llm.segments], [("unknown", 512 * MiB)])
@@ -253,7 +380,7 @@ class VllmTests(unittest.TestCase):
                     _, snap = self.sample(details, {30: [port]}, parents)
                     self.assertEqual(snap.procs[0].llm.server_source, "parent")
                     self.assertEqual(snap.procs[0].llm.server.models[0]["name"], "org/model")
-            self.assertEqual(seen, [("/v1/models", None)] * 4)
+            self.assertEqual(seen, [("/v1/models", None), ("/metrics", None)] * 4)
 
     def test_unclear_ancestry_or_listeners_never_probe(self):
         for reason in ("two servers", "shared port", "two ports", "unrelated parent",
@@ -308,9 +435,10 @@ class VllmTests(unittest.TestCase):
             c, snap = self.sample(details, {20: [port]}, {10: 20}, prober=prober)
         self.assertIsNone(snap.procs[0].llm.server)
         self.assertIn("Parent-process API locked (401)", " ".join(snap.procs[0].llm.notes))
-        self.assertEqual([path for path, _ in seen], ["/v1/models", "/v1/models"])
+        self.assertEqual([path for path, _ in seen], ["/v1/models", "/metrics", "/v1/models"])
         self.assertIsNotNone(seen[0][1])
-        self.assertIsNone(seen[1][1])
+        self.assertIsNone(seen[1][1])  # /metrics never receives a key, even on the own port
+        self.assertIsNone(seen[2][1])
         self.assertNotIn("private-worker-key", json.dumps(to_dict(snap)))
         self.assertNotIn("private-worker-key", to_text(snap))
         self.assertNotIn("private-worker-key", repr(vars(c.prober)))
@@ -321,7 +449,7 @@ class VllmTests(unittest.TestCase):
             _, snap = self.sample(details, {10: [port]}, {})
         self.assertEqual(snap.procs[0].llm.server_source, "process")
         self.assertIn("reported (API): org/model", snap.procs[0].inside)
-        self.assertEqual(seen, [("/v1/models", None)])
+        self.assertEqual(seen, [("/v1/models", None), ("/metrics", None)])
 
     def test_api_unavailable_does_not_change_measured_memory(self):
         for response in (None, {"error": "disabled"}, {"data": [None]}):
@@ -363,7 +491,7 @@ class VllmTests(unittest.TestCase):
                     again = c.sample()
                 self.assertEqual(snap.procs[0].llm.server_source, "parent")
                 self.assertEqual(again.procs[0].llm.server.models[0]["name"], "org/model")
-                self.assertEqual(seen, [("/v1/models", None)])
+                self.assertEqual(seen, [("/v1/models", None), ("/metrics", None)])
             finally:
                 child.terminate()
                 child.wait(timeout=5)
@@ -385,3 +513,20 @@ class VllmUiTests(unittest.IsolatedAsyncioTestCase):
                                  app.query_one("#inspector", Static).content.renderables)
                 self.assertIn("parent process; API report, not worker residency", text)
                 self.assertIn("API-reported model ID: org/model", text)
+                self.assertNotIn("vLLM /metrics", text)
+
+    async def test_metrics_gauges_in_inspector(self):
+        with listener(metrics=METRICS) as (port, _):
+            details = {10: ProcDetail(10, "VLLM::EngineCore", create_time=2),
+                       20: ProcDetail(20, "python", cmdline=LAUNCH, create_time=1)}
+            _, snap = VllmTests().sample(details, {20: [port]}, {10: 20})
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.BACKEND", "nvml"):
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 50)) as pilot:
+                app.apply(snap)
+                await pilot.pause()
+                text = "\n".join(getattr(line, "plain", "") for line in
+                                 app.query_one("#inspector", Static).content.renderables)
+                self.assertIn("vLLM /metrics (runtime-reported): requests running 3, waiting 0, "
+                              "KV-cache pool 42.0%", text)

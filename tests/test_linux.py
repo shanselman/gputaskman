@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -190,10 +191,15 @@ class LinuxCountersTests(unittest.TestCase):
             self.assertEqual(linux.enumerate_adapters(), [amd])
             c = linux.LinuxCounters()
         self.assertTrue(c.ok)
-        with patch.object(linux, "dxg_pids", return_value={6020, 229213}):
-            procs, _ = c.sample()
-        self.assertEqual(set(procs[0x3000]), {6020, 229213})
-        self.assertTrue(all(not g.attributed for g in procs[0x3000].values()))
+        for own_context in (True, False):
+            holders = {6020, 229213} | ({os.getpid()} if own_context else set())
+            with self.subTest(own_context=own_context), \
+                    patch.object(linux, "dxg_pids", return_value=holders) as scan:
+                procs, _ = c.sample()
+                scan.assert_called_once_with()
+                self.assertEqual(c.dxg_holders, holders)
+                self.assertEqual(set(procs[0x3000]), {6020, 229213})
+                self.assertTrue(all(not g.attributed for g in procs[0x3000].values()))
 
     def test_adapters_come_from_nvml(self):
         with patch.object(linux, "N", FakeNvml()):

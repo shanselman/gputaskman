@@ -77,13 +77,16 @@ During desktop/browser activity, WDDM reported per-process VRAM and AMD ADL repo
 clocks, and ASIC power; temperature, memory activity, and PCIe readings were unavailable. Vulkan/ROCm
 workloads were not tested on this machine.
 
-Intel adapters on Windows can use WDDM's per-process memory and engine counters. When those counters are
-available, device GPU activity is the busiest WDDM engine after combining its process counters. An Intel
-adapter reporting at most 512 MiB of dedicated memory and more shared system memory is treated as integrated:
-per-process local usage is shown as Shared RAM, not VRAM, while device dedicated and shared counters remain
-separate. This is a DXGI-capacity heuristic. Intel temperature, power, clocks, and memory activity are not
-currently available on Windows. Arc B580 behavior is covered by mocked counters but has not been validated
-on Intel hardware.
+Intel and Qualcomm adapters on Windows can use WDDM's per-process memory and engine counters. When those
+counters are available, device GPU activity is the busiest WDDM engine after combining its process counters.
+An Intel or Qualcomm adapter reporting at most 512 MiB of dedicated memory and more shared system memory is
+treated as integrated: per-process local usage is shown as Shared RAM, not VRAM, while device dedicated and
+shared counters remain separate. This is a DXGI-capacity heuristic. Qualcomm GPU activity uses the WDDM
+adapter counter; temperature, power, clocks, and memory activity are not currently available on Windows.
+Arc B580 behavior is covered by mocked counters but has not been validated on Intel hardware.
+When a Windows telemetry provider does not supply a version, gputaskman reads the selected adapter's
+`DriverVersion` from its exact PnP device's driver registry key. If that value is unavailable, the
+driver remains unknown.
 
 Install [Git for Windows](https://git-scm.com/downloads/win) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. With WinGet:
@@ -323,7 +326,17 @@ to WSL alone. `--no-host` turns the host stream off; without interop you get dev
 and a list of the Linux processes that hold `/dev/dxg`, with VRAM shown as `n/a`. On AMD GPUs in WSL,
 device discovery and telemetry use ROCm's `amdsmi` Python bindings (`/opt/rocm-wsl/share/amd_smi` or
 `/opt/rocm/share/amd_smi`), reading VRAM via `amdsmi_get_gpu_memory_total` / `amdsmi_get_gpu_memory_usage`
-(since `amdsmi_get_gpu_vram_usage` in `rocm-wsl` leaves `vram_used` uninitialized).
+(the contributor observed uninitialized `vram_used` from `amdsmi_get_gpu_vram_usage` in their
+`rocm-wsl` build). That fallback's usage is accepted only with a known total and within that total.
+The existing per-refresh `/dev/dxg` holder scan also records whether the monitor holds a context;
+host attribution reuses it rather than scanning every process's file descriptors again.
+
+Contributor-reported AMD WSL check: Windows 11, Ubuntu 24.04 under WSL2 kernel
+6.6.87.2-microsoft-standard-WSL2, Radeon RX 7900 XTX 24 GB, Adrenalin 26.20.15.07 and
+amd-smi 1.2.2 under `/opt/rocm-wsl`, with three llama-server instances and PyTorch/HIP.
+The contributor reported device telemetry and host VM/context matching. This has not been
+independently repeated; multi-adapter WSL behavior, probe latency, and the shared Windows AMD
+sampling path still need validation on the revised code.
 
 ### How WSL per-process VRAM is matched
 
@@ -809,7 +822,8 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state; exercised live |
 | Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
 | LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
-| vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
+| vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Running/waiting requests and KV-cache pool usage from `/metrics`, labelled runtime-reported for the server's engine, not per worker, per GPU or GPU memory. Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
+| Foundry Local | Recognized `foundrylocald` daemon; `/models/loaded` IDs from its own listener, labelled API-reported. No catalog-as-loaded fallback, model byte estimates or per-GPU placement claim. Live-checked with Foundry Local 0.14 on Snapdragon; see below |
 | stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
 | Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
@@ -840,6 +854,28 @@ when applicable. JSON has `llm.server_source` (`"process"`, `"parent"`, or `null
 `llm.server.models[].name`. A reported ID is not a model file or evidence that a worker holds
 that model; it adds no weights, KV-cache, context-size or GPU-placement estimate. Measured memory
 and attributed totals are unchanged.
+
+Foundry Local discovery requires the exact daemon name (`foundrylocald.exe` or `foundrylocald`),
+a known process creation time and one exclusively owned listening port. Only that process's
+`GET /models/loaded` is queried; parent processes, shared/multiple listeners and redirects are
+not followed. `/v1/models` lists the catalog, not loaded models, so it is never used as loading
+evidence. The table, inspector, text and JSON label returned IDs as API-reported, even when no
+model file is mapped or GPU memory counters are unavailable. CPU/NPU models may also be loaded;
+the list does not prove which GPU holds an individual model. No model files, weight sizes or
+KV-cache estimates are invented from these IDs.
+
+Live identification check: Windows 11 ARM64 build 28000.3231 on a Snapdragon X2 Elite with
+Qualcomm Adreno X2-85, driver 32.0.163.2 (WDDM 3.2), Foundry Local 0.14.0. The running daemon's
+own loaded-model endpoint returned `Phi-3.5-mini-instruct-generic-gpu:2`, matching
+`foundry model list --loaded --output json` (WebGPU execution provider). gputaskman displayed the
+same ID with `server_source: "process"` and unknown model sizes/context left `null`.
+This was a read-only check of an already-loaded model, not an inference or active-engine test.
+The same machine's WDDM adapter counters reported 128 MiB of dedicated capacity, 0 dedicated bytes in use,
+and 48.5 GB of shared system memory while Phi Mini was loaded. The Foundry process's local-usage counter
+is therefore displayed as shared RAM, not added to dedicated VRAM; its bytes are not added again to the
+adapter total. gputaskman and Task Manager both showed the workload's GPU memory use growing, though their
+samples can differ in timing. This memory behavior has been validated only on the Snapdragon X2 Elite;
+other Snapdragon Elite models are not yet validated.
 
 GPU-backed WinML and Studio Effects paths have **not been validated on a Copilot+ PC**. A future
 hardware check should compare idle versus active workload samples, record the actual GPU adapter
@@ -933,6 +969,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 |---|---|---|
 | Process list, command line, listening ports | under 1 ms | Once per process / every 5 s |
 | Windows adapter discovery (DXGI + exact-LUID PnP identity + PCI location, no telemetry sample) | ~0.86 ms median, 2.60 ms max in 30 warm reads, 26.1 ms first/cold call (Windows 11 build 28000, RTX Spark N1X, driver 32.0.16.2114); same machine without the PnP probe: ~0.36 ms median | Once at startup; TUI rediscovery every 5 s. PnP uses fixed buffers, one interface lookup per adapter and at most two name-property reads, no path/device enumeration or retries. Synchronous OS calls are not a hard latency bound. Other drivers, virtual displays and multi-GPU laptops unmeasured; provider reconstruction has additional driver-dependent cost |
+| Windows PnP driver-version lookup | 0.016 ms median, 0.019 ms max in 30 reads; first query 0.044 ms (Windows 11 ARM64 build 28000.3231, Snapdragon X2 Elite / Adreno X2-85, driver 32.0.163.2) | Once when a collector is created; reads the selected adapter's exact PnP `Driver` and `DriverVersion` registry values. Missing values stay unknown; other systems unmeasured |
 | Windows NVML handle reacquisition (no telemetry sample) | ~8.7 ms median, 9.3 ms max in 30 reads (Windows 11 build 26340, RTX 4080 SUPER, NVIDIA 630.20) | Every 5 s per active collector; retries initialization after NVML session-loss errors. Other drivers unmeasured |
 | Windows TCC discovery (NVML init, device count, one driver-model read per GPU, shutdown) | First call in 15 fresh processes on the same machine, one WDDM GPU: median 37.6 ms, 27.8-43.8 ms. About 15 ms of that is the first `nvmlInit` (it loads `nvml.dll`), which NVML readings pay anyway; the added cost is one extra init-to-shutdown cycle, median 20.7 ms (13.3-30.3 ms). Later calls are cached (about 3 µs). A TCC GPU adds PCI, name and memory reads, which are unmeasured (no TCC hardware here) | Once per process on Windows, including `--list-gpus`; never repeated while running |
 | Memory-map scan (DLLs + mapped files) | 1-50 ms per process | New processes, a 64 MiB / 10% memory change, or every 2 min; at most 150 ms per refresh |
@@ -940,8 +977,11 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | vLLM `/v1/models` | 1.32 ms median, 21.36 ms max in 30 loopback fixture GETs; cached lookup ~0.0004 ms (Windows 11 build 28000, ARM64; no vLLM runtime/GPU workload) | One GET, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects; actual Linux/vLLM latency unmeasured |
+| vLLM `/metrics` gauges | Whole probe (`/v1/models` + `/metrics` + parse) 1.37 ms median, 1.44 ms max in 30 loopback runs; `/metrics` GET alone 0.48 ms median; parsing a constructed 49 KB, 511-line exposition (all counters, 16 histograms) 0.41 ms median (Fedora Linux 45, i7-10850H, Python 3.13.18; no vLLM runtime/GPU workload) | One extra keyless GET inside the same cached probe, only after `/v1/models` succeeds; same timeout, cap, no redirects. Real vLLM payload size and latency unmeasured |
+| Foundry Local `/models/loaded` | 7.37 ms median, 15.93 ms max in 10 warm reads; first read 9.04 ms (Windows 11 ARM64 build 28000.3231, Snapdragon X2 Elite / Adreno X2-85, driver 32.0.163.2, Foundry Local 0.14.0 with Phi-3.5-mini loaded) | One GET to the daemon's own listener, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects, catalog requests or inference |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
+| AMD on WSL: AMD SMI discovery and device telemetry | Not measured on the revised code; a hardware validation requirement, not a latency claim | Startup discovery and per-refresh telemetry; host attribution reuses the current `/dev/dxg` holder scan |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
@@ -976,7 +1016,14 @@ gputaskman does not open a path taken from another process's command line, and a
 can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
 one rejected request every 30 seconds, and the inspector says why server details are missing.
 
-vLLM uses only `/v1/models`, with the same request bounds and cache intervals. Parent-discovered
+vLLM uses `/v1/models`, with the same request bounds and cache intervals. Only after that succeeds,
+the same probe sends one `GET /metrics`, **never with a key**, and reads three gauges:
+`vllm:num_requests_running`, `vllm:num_requests_waiting` and `vllm:kv_cache_usage_perc` (a 0-1
+fraction of vLLM's own KV-cache pool, shown as a percent; not GPU memory). They are accepted only
+when every sample names one `engine` and one `model_name`, and that name is one of the `/v1/models`
+IDs: vLLM labels metrics with the first `--served-model-name`, while `/v1/models` lists every alias.
+A reported 0 stays 0; a missing, duplicated, malformed or out-of-range value, or a refused or
+unreadable `/metrics`, stays unknown (`null`) without affecting the model IDs. Parent-discovered
 ports are **always unauthenticated**, even when parent and worker launch arguments match:
 the worker's key is never sent there. A 401 is shown as **Parent-process API locked**.
 Probe caches separate own/parent origins, process creation times, runtime and credentials, so
