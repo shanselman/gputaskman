@@ -11,6 +11,7 @@ from unittest.mock import Mock, mock_open, patch
 from gputaskman import collector as collector_mod
 from gputaskman import wslhost
 from gputaskman.collector import Collector, ProcRow, Snapshot
+from gputaskman.dxgi import Adapter, VENDOR_AMD
 from gputaskman.llm import LlmView
 from gputaskman.pdh import AdapterGpu, ProcGpu
 from gputaskman.procinfo import MappedModel, ProcDetail
@@ -362,6 +363,7 @@ class HostRowTests(unittest.TestCase):
         c._host_restarted = time.time()
         c.tracker = ContextTracker(path=os.path.join(self.tmp.name, "ctx.json"), boot_id="boot", self_pid=os.getpid())
         c._own_start = time.time()
+        c.amdsmi = Mock(status="")
         return c
 
     def setUp(self):
@@ -412,6 +414,35 @@ class HostRowTests(unittest.TestCase):
         self.assertEqual((data["vram_inferred_bytes"], data["vram_inferred_by"]), (3.0 * GiB, "consistent"))
         self.assertEqual(snap.attributed, 3 * GiB)  # the Linux child is not added to the VM total again
 
+    def test_overlapping_host_rows_do_not_claim_an_attributed_total(self):
+        snap = self.snap()
+        snap.vram_total = 512 * MiB
+        snap.vram_used = 500 * MiB
+        c = self.collector(FakeStream(parse_line(SAMPLE, now=time.time())))
+        c._host_luid = RTX
+        c._add_host_rows(snap)
+        self.assertIsNone(snap.attributed)
+        data = to_dict(snap)
+        self.assertIsNone(data["attributed"])
+        self.assertEqual(data["vram_used"], 500 * MiB)
+        self.assertEqual(next(p["vram_bytes"] for p in data["processes"] if p["kind"] == "wsl-vm"),
+                         int(2.4 * GiB))
+
+    def test_amd_monitor_context_uses_current_counter_scan_without_rescanning(self):
+        for own_context in (True, False):
+            with self.subTest(own_context=own_context):
+                c = self.collector(None)
+                c.counters = Mock(dxg_holders={os.getpid()} if own_context else set())
+                c.tracker = Mock()
+                c.tracker.update.return_value = ({}, "test")
+                snap = self.snap()
+                snap.adapter = Adapter(1, "AMD", VENDOR_AMD, 24 * GiB, 0, False)
+                with patch("gputaskman.linux.dxg_pids", side_effect=AssertionError("second fd walk")):
+                    c._attribute(snap, RTX, [0.0, 3.0 * GiB])
+                holders = c.tracker.update.call_args.args[2]
+                self.assertEqual(os.getpid() in {pid for pid, _ in holders}, own_context)
+                self.assertIn(2744, {pid for pid, _ in holders})
+
     def test_current_inferred_vram_sets_first_sample_scan_priority(self):
         big_pid = Collector.DEEP_TOP_N + 1
         total = 8 * GiB + Collector.DEEP_TOP_N * MiB
@@ -419,7 +450,8 @@ class HostRowTests(unittest.TestCase):
                      for v in [0, 8 * GiB] + [MiB] * Collector.DEEP_TOP_N]
                     + [["dedicated usage", LUID, total]], {"24820": "vmwp"})
         c = self.collector(FakeStream(parse_line(busy, now=time.time())))
-        c.adapter, c.adapters, c.gpu_index, c.scan_budget = None, [], 0, None
+        c.adapter = Adapter(RTX, "NVIDIA", 0x10DE, 24 * GiB, 0, False)
+        c.adapters, c.gpu_index, c.scan_budget = [c.adapter], 0, None
         c.host_status = ""
         c.nvml = Mock(ok=False, driver="", cuda_version="")
         c.counters = Mock(outside={})

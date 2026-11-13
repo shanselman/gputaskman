@@ -158,7 +158,7 @@ Ascend container and PID-namespace behavior is not validated.
 
 | | Native Linux | WSL, interop on (default) | WSL, interop off or `--no-host` |
 |---|---|---|---|
-| Device totals, load, temperature, power, clocks | NVML | NVML | NVML |
+| Device totals, load, temperature, power, clocks | NVML / DRM | NVML / AMD SMI | NVML / AMD SMI |
 | Per-process VRAM | NVML, measured (in a container: owner matched, `*` or `?`) | Matched from the Windows host, marked `*` or `?` | `n/a` |
 | Per-process GPU load | NVML (SM, encoder, decoder) | `n/a` for Linux processes | `n/a` |
 | Spill / Paged | Not available (blank) | Windows rows only | Not available |
@@ -319,11 +319,53 @@ through the same PDH array API as the Windows backend and streams them back once
 - **Linux rows** get a size by matching `vmwp.exe`'s GPU contexts to Linux processes (below).
 
 The first host sample takes about 2.5 s; the TUI shows `starting` until then, and `--once` waits
-for it. The host adapter is paired with the NVML device by memory usage, because WSL's adapter
+for it. The host adapter is paired with the NVML or AMD SMI device by memory usage, because WSL's adapter
 LUIDs differ from the host's. An ambiguous pairing shows `unmatched` instead of guessing. With other
 Hyper-V VMs or Windows Sandbox running, the row is labeled `VM worker` because it cannot be tied
 to WSL alone. `--no-host` turns the host stream off; without interop you get device-wide numbers
-and a list of the Linux processes that hold `/dev/dxg`, with VRAM shown as `n/a`.
+and a list of the Linux processes that hold `/dev/dxg`, with VRAM shown as `n/a`. On AMD GPUs in WSL,
+device discovery and telemetry use ROCm's `amdsmi` Python bindings (`/opt/rocm-wsl/share/amd_smi` or
+`/opt/rocm/share/amd_smi`), reading VRAM via `amdsmi_get_gpu_memory_total` / `amdsmi_get_gpu_memory_usage`
+(the contributor observed uninitialized `vram_used` from `amdsmi_get_gpu_vram_usage` in their
+`rocm-wsl` build). That fallback is never used in WSL, even when its bytes happen to fit.
+Missing or out-of-range usage stays `null`/`N/A`, not a cached value or a clamped zero.
+The existing per-refresh `/dev/dxg` holder scan also records whether the monitor holds a context;
+host attribution reuses it rather than scanning every process's file descriptors again.
+
+**AMD WSL prerequisites are user-managed.** Native Linux ROCm/AMD SMI packages alone do not provide
+the WSL bridge. Check AMD's supported GPU and Windows-driver matrix, then follow the official
+[ROCDXG instructions](https://github.com/ROCm/librocdxg#readme) for matching `rocdxg-amd-smi-lib`
+and `rocdxg-roct` packages. An AMD CPU alone does not establish support. gputaskman does not install
+packages, change drivers, enable WSL, or modify loader configuration. `--list-gpus` prints a
+discovery failure and recommendation to stderr; the TUI and one-shot reports expose it as
+`counter_status` (JSON: a string, or `null` when there is no warning). Missing bindings/libraries,
+initialization failures, no usable device, and a wrapper/library major-version mismatch are
+distinguished. The wrapper loads its own library; gputaskman never preloads a replacement.
+
+AMD SMI sessions are shared across discovery and live collectors, so constructing or closing one
+does not shut down another's library session. An edge-temperature critical limit of zero means
+unsupported, following AMD's CLI; a measured current temperature of zero with a supported limit
+remains zero. Unsigned unknown power-cap sentinels are not watts. Windows host process counters
+can overlap on some drivers: if their sum exceeds device capacity, WSL's JSON `attributed` is
+`null` with a warning. Raw per-process readings are retained; the adapter reading remains the
+device total, and inferred Linux children are never added to their VM row.
+
+Contributor-reported AMD WSL check: Windows 11, Ubuntu 24.04 under WSL2 kernel
+6.6.87.2-microsoft-standard-WSL2, Radeon RX 7900 XTX 24 GB, Adrenalin 26.20.15.07 and
+amd-smi 1.2.2 under `/opt/rocm-wsl`, with three llama-server instances and PyTorch/HIP.
+The contributor reported device telemetry and host VM/context matching; those workloads have not
+been independently repeated.
+
+Maintainer read-only check on the revised code (2026-11-13): Windows 11 build 26300, Radeon 860M
+(`1002:1114`), Windows driver 32.0.22050.1003; Ubuntu 26.04 under WSL2, native x86_64 Python 3.14,
+matching WSL AMD SMI wrapper/library 1.2.2 and ROCDXG 1.2.2. `--list-gpus`, `--once`, and JSON
+identified the adapter; host pairing succeeded. Thirty device samples had no failures (median
+6.27 ms, max 9.09 ms); first discovery was 71.87 ms. Unsupported edge temperature and power cap
+stayed unknown; zero memory activity stayed zero. Creating and closing a second collector for
+the same adapter did not break the first. No new GPU workload was launched: real multi-adapter
+hardware, model-load/context attribution, and AMD SMI on Windows remain unvalidated (the Windows
+smoke check used ADL). The raw driver readings can exceed physical VRAM or overlap across host
+processes; these checks do not establish that the driver reports uniquely attributed bytes.
 
 ### How WSL per-process VRAM is matched
 
@@ -968,6 +1010,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Foundry Local `/models/loaded` | 7.37 ms median, 15.93 ms max in 10 warm reads; first read 9.04 ms (Windows 11 ARM64 build 28000.3231, Snapdragon X2 Elite / Adreno X2-85, driver 32.0.163.2, Foundry Local 0.14.0 with Phi-3.5-mini loaded) | One GET to the daemon's own listener, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects, catalog requests or inference |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
+| AMD on WSL: AMD SMI discovery and device telemetry | Radeon 860M, WSL AMD SMI/ROCDXG 1.2.2, Windows driver 32.0.22050.1003: 71.87 ms first discovery; 30 warm device samples, median 6.27 ms, max 9.09 ms, no failures | Startup discovery and per-refresh telemetry; host attribution reuses the current `/dev/dxg` holder scan. Shared sessions keep later discovery/collectors from shutting down live handles; multiple physical adapters unmeasured |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |

@@ -10,7 +10,7 @@ from contextlib import ExitStack
 
 import psutil
 
-from .amdsmi import AmdSmi, _bdf
+from .amdsmi import AmdSmi, _bdf, amdsmi_status
 from .adl import Adl
 from .dxgi import (VENDOR_AMD, VENDOR_NVIDIA, VENDOR_HUAWEI, VENDOR_INTEL, VENDOR_QUALCOMM, Adapter,
                   adapter_driver_version)
@@ -152,7 +152,10 @@ class Snapshot:
         if not self.process_memory_available or self.counter_adapter_matched is False or any(
                 "dedicated" not in p.gpu.available for p in self.procs):
             return None
-        return int(sum(p.gpu.dedicated for p in self.procs))
+        total = int(sum(p.gpu.dedicated for p in self.procs))
+        if self.backend == "wsl" and self.host_data and self.vram_total and total > self.vram_total:
+            return None  # overlapping host counters cannot establish uniquely attributed bytes
+        return total
 
 
 def _is_live(g: ProcGpu) -> bool:
@@ -386,6 +389,8 @@ class Collector:
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
+        used = int(a.dedicated) if a and a.dedicated is not None else (
+            int(nv.mem_used) if BACKEND != "wddm" and nv and nv.mem_used is not None else None)
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
             driver=(self._mac_driver
@@ -394,12 +399,16 @@ class Collector:
                     or (f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else "")
                     or getattr(self, "_windows_driver", "")),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
-            vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
+            vram_used=used,
             shared_used=int(a.shared) if a and a.shared is not None else None, backend=self.backend,
             shared_is_spill=not (integrated_gpu or (self.drm_card is not None and self.drm_card.integrated)),
         )
 
         snap.host_status = self.host_status
+        if BACKEND == "wsl" and (not self.adapter or self.adapter.vendor_id == VENDOR_AMD):
+            snap.counter_status = " ".join(dict.fromkeys(filter(None, (amdsmi_status(), self.amdsmi.status))))
+            if self.adapter is None:
+                snap.process_memory_available = False
         if BACKEND == "wddm" and self.adapter:
             snap.counter_adapter_matched = luid in per_luid or luid in adapters
             if isinstance(self.adapter, TccAdapter):
@@ -447,6 +456,11 @@ class Collector:
                                       ProcDetail(pid, "(outside this container)"), host=True, origin="outside"))
         if self.host is not None:  # current inferred sizes drive both scan priority and the LLM breakdown
             self._add_host_rows(snap)
+        if (snap.backend == "wsl" and snap.host_data and snap.vram_total
+                and sum(r.gpu.dedicated for r in snap.procs) > snap.vram_total):
+            snap.counter_status = " ".join(filter(None, (
+                snap.counter_status, "Windows per-process counters exceed device capacity and may overlap; "
+                                     "attributed total is unknown. Use the adapter reading as the device total.")))
         local_rows = [r for r in snap.procs if not r.host]
         deep_pids = {r.pid for r in local_rows[: self.DEEP_TOP_N]} | {
             r.pid for r in local_rows if r.gpu.gpu_pct >= 2}
@@ -563,8 +577,10 @@ class Collector:
 
     def _attribute(self, snap: Snapshot, luid: int, contexts: list[float]) -> None:
         linux = [r for r in snap.procs if not r.host and not r.gpu.attributed]
-        # This monitor holds a (0-byte) context too, through NVML.
-        holders = [(r.pid, r.detail.create_time) for r in linux] + [(os.getpid(), self._own_start)]
+        # This monitor holds a (0-byte) context too through NVML; AMD SMI only holds one if /dev/dxg stays open.
+        holders = [(r.pid, r.detail.create_time) for r in linux]
+        if not (snap.adapter and snap.adapter.vendor_id == VENDOR_AMD) or os.getpid() in self.counters.dxg_holders:
+            holders.append((os.getpid(), self._own_start))
         guesses, reason = self.tracker.update(luid, contexts, holders)
         snap.wsl_split = reason
         for r in linux:

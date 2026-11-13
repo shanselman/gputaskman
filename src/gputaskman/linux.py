@@ -69,10 +69,13 @@ def _nvml_devices() -> list[tuple[int, object]]:
 
 
 def enumerate_adapters() -> list[Adapter]:
-    """NVIDIA GPUs through NVML, plus (native Linux only) AMD and Intel GPUs through DRM,
-    and Huawei Ascend NPUs through npu-smi."""
+    """NVIDIA GPUs through NVML, plus AMD GPUs through AMD SMI in WSL (or DRM on native Linux),
+    Intel GPUs through DRM, and Huawei Ascend NPUs through npu-smi."""
     out = _nvml_adapters()
-    if not is_wsl():
+    if is_wsl():
+        seen = {a.luid for a in out}
+        out += [a for a in _amdsmi_adapters() if a.luid not in seen]
+    else:
         from . import drm
 
         seen = {a.luid for a in out}
@@ -82,6 +85,49 @@ def enumerate_adapters() -> list[Adapter]:
 
         seen |= {a.luid for a in out}
         out += [a for a in ascend.cached_chips_adapters() if a.luid not in seen]
+    return out
+
+
+def _amdsmi_adapters() -> list[Adapter]:
+    from .amdsmi import _bdf, _import_amdsmi, _read_vram_bytes, amdsmi_session, set_discovery_status
+    from .dxgi import VENDOR_AMD
+
+    set_discovery_status("")
+    if not os.path.exists("/dev/dxg"):
+        set_discovery_status("cannot access /dev/dxg; WSL GPU paravirtualization is unavailable")
+        return []
+    api = _import_amdsmi()
+    if api is None:
+        return []
+    out = []
+    try:
+        with amdsmi_session(api):
+            for h in api.amdsmi_get_processor_handles():
+                try:
+                    bdf = str(api.amdsmi_get_gpu_device_bdf(h))
+                except Exception as error:
+                    set_discovery_status(f"could not read a GPU's PCI address ({type(error).__name__}: {error})")
+                    continue
+                pci_addr = _bdf(bdf)
+                if pci_addr is None:
+                    set_discovery_status("reported an unsupported or ambiguous PCI address; that GPU was skipped")
+                    continue
+                try:
+                    asic = api.amdsmi_get_gpu_asic_info(h) or {}
+                    name = str(asic.get("market_name") or "AMD GPU")
+                except Exception:
+                    name = "AMD GPU"
+                total, _ = _read_vram_bytes(api, h, wsl=True)
+                out.append(Adapter(luid=pci_key(bdf), name=name, vendor_id=VENDOR_AMD, dedicated_vram=total or 0,
+                                   shared_system=0, software=False, pci_address=pci_addr))
+        unique = [a for a in out if sum(b.pci_address == a.pci_address for b in out) == 1]
+        if len(unique) != len(out):
+            set_discovery_status("reported duplicate PCI addresses; ambiguous GPUs were skipped")
+        out = unique
+        if not out:
+            set_discovery_status("found no usable WSL GPU; the installed stack may not support this GPU or driver")
+    except Exception as error:
+        set_discovery_status(f"WSL discovery failed ({type(error).__name__}: {error})")
     return out
 
 
@@ -228,6 +274,7 @@ class LinuxCounters:
         self.ok = False
         self._devices: list[tuple[int, object]] = []
         self._last_ts: dict[int, int] = {}
+        self.dxg_holders: set[int] = set()
         self._matcher = PidMatcher()
         # {adapter key: {host pid: ProcGpu}}: NVML processes in another PID namespace that couldn't be
         # matched to a local process. Their PIDs must never be looked up in this /proc.
@@ -243,13 +290,18 @@ class LinuxCounters:
             self.drm = drm if drm.ok else None
         # A Collector attaches an Ascend provider only when an Ascend chip is selected.
         self.ascend = None
+        self._wsl_keys = [a.luid for a in _amdsmi_adapters()] if self.wsl else []
+        self._nvml_ok = False
         if N is None:
+            self.ok = bool(self._wsl_keys)
             return
         try:
             N.nvmlInit()
         except Exception:
+            self.ok = bool(self._wsl_keys)
             return
         self.ok = True
+        self._nvml_ok = True
         try:
             self._devices = _nvml_devices()
         except Exception:
@@ -280,6 +332,7 @@ class LinuxCounters:
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
         self._compute_pids: set[int] = set()
+        self.dxg_holders = set()
         for key, h in self._devices:
             try:
                 adapters[key].dedicated = float(N.nvmlDeviceGetMemoryInfo(h).used)
@@ -309,10 +362,13 @@ class LinuxCounters:
                 g.engines["decode"] += float(s.decUtil)
         if not self.wsl:
             self._resolve_namespaces(procs)
-        if self.wsl and self._devices:
-            users = dxg_pids(exclude={os.getpid()})
+        if self.wsl and (self._devices or self._wsl_keys):
+            self.dxg_holders = dxg_pids()
+            users = self.dxg_holders - {os.getpid()}
             # WSL does not say which GPU a process uses; with one GPU (the common case) that's unambiguous.
-            for key, _ in self._devices:
+            keys = [key for key, _ in self._devices]
+            keys += [k for k in self._wsl_keys if k not in keys]
+            for key in keys:
                 for pid in users:
                     procs[key][pid] = ProcGpu(attributed=False)
         if self.drm is not None:
@@ -363,9 +419,10 @@ class LinuxCounters:
             self.drm.close()
         if self.ascend is not None:
             self.ascend.close()
-        if self.ok:
+        if self._nvml_ok:
             try:
                 N.nvmlShutdown()
             except Exception:
                 pass
-            self.ok = False
+            self._nvml_ok = False
+        self.ok = False

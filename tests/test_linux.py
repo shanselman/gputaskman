@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,16 +18,19 @@ from gputaskman.report import to_dict, to_text
 GiB = 1 << 30
 _no_drm = patch("gputaskman.drm.cards", return_value=[])  # keep the test machine's real AMD GPUs out of NVML tests
 _no_ascend = patch("gputaskman.ascend.probe", return_value=[])  # and its real Ascend NPUs out too
+_no_amdsmi = patch("gputaskman.linux._amdsmi_adapters", return_value=[])  # and its WSL AMD GPUs out too
 
 
 def setUpModule() -> None:
     _no_drm.start()
     _no_ascend.start()
+    _no_amdsmi.start()
 
 
 def tearDownModule() -> None:
     _no_drm.stop()
     _no_ascend.stop()
+    _no_amdsmi.stop()
 
 NOT_AVAILABLE = (1 << 64) - 1  # NVML_VALUE_NOT_AVAILABLE as an unsigned long long
 
@@ -179,6 +183,23 @@ class LinuxCountersTests(unittest.TestCase):
         self.assertEqual(set(procs[KEY]), {4242})
         self.assertFalse(procs[KEY][4242].attributed)
         self.assertEqual(fake.util_calls, [])
+
+    def test_wsl_amd_collects_dxg_pids_without_nvml(self):
+        amd = Adapter(0x3000, "AMD Radeon RX 7900 XTX", 0x1002, 24 * GiB, 0, False, (3, 0, 0))
+        with patch.object(linux, "N", None), patch.object(linux, "is_wsl", return_value=True), \
+                patch.object(linux, "_amdsmi_adapters", return_value=[amd]):
+            self.assertEqual(linux.enumerate_adapters(), [amd])
+            c = linux.LinuxCounters()
+        self.assertTrue(c.ok)
+        for own_context in (True, False):
+            holders = {6020, 229213} | ({os.getpid()} if own_context else set())
+            with self.subTest(own_context=own_context), \
+                    patch.object(linux, "dxg_pids", return_value=holders) as scan:
+                procs, _ = c.sample()
+                scan.assert_called_once_with()
+                self.assertEqual(c.dxg_holders, holders)
+                self.assertEqual(set(procs[0x3000]), {6020, 229213})
+                self.assertTrue(all(not g.attributed for g in procs[0x3000].values()))
 
     def test_adapters_come_from_nvml(self):
         with patch.object(linux, "N", FakeNvml()):
