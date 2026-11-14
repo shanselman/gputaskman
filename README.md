@@ -342,7 +342,8 @@ sudo "$(command -v python)" tools/check_intel_telemetry.py --pci 0000:04:00.0 > 
 ```
 
 This changes no permissions or driver settings. Success in the administrator report distinguishes
-an access restriction from missing driver support. A first sample can be unknown; inspect the
+an access restriction from missing driver support. The audit disables host-feed imports so an
+already-running privileged reader cannot conceal native access restrictions. A first sample can be unknown; inspect the
 second sample and its `metric_status` / `metric_sources`. Hardware validation under load still
 requires running a workload separately and comparing the measurements.
 

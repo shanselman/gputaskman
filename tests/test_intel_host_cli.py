@@ -16,6 +16,30 @@ from tools import intel_host_reader as cli
 
 
 class HostReaderCliTests(unittest.TestCase):
+    def test_native_audit_cannot_borrow_an_existing_privileged_feed(self):
+        from tools import check_intel_telemetry as audit
+
+        card = drm.DrmCard(key=1, pdev='0000:04:00.0', sysfs='/fixture', driver='xe',
+                           vendor_id=0x8086, device_id=0xe222, name='Intel',
+                           vram_total=1024, integrated=False, intel=True)
+        def read(card, index):
+            self.assertEqual(os.environ.get('GPUTASKMAN_DISABLE_HOST_FEED'), '1')
+            return DeviceTelemetry(index=index, source='Intel sysfs', pci_bus=card.pdev)
+        with patch.dict(os.environ, {'GPUTASKMAN_DISABLE_HOST_FEED': '0'}), \
+                patch.object(sys, 'argv', ['check', '--pci', card.pdev]), \
+                patch.object(drm, 'cards', return_value=[card]), \
+                patch.object(Path, 'glob', return_value=[]), \
+                patch.object(drm, 'read_device', side_effect=read) as reads, \
+                patch.object(drm, 'DrmCounters') as counters, \
+                patch.object(audit.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()) as output:
+            audit.main()
+        import json
+        report = json.loads(output.getvalue())
+        self.assertEqual(reads.call_count, 2)
+        self.assertIn('host-feed imports disabled', report['scope'])
+        self.assertIsNone(report['samples'][1]['mem_read_bps'])
+        counters.return_value.close.assert_called_once()
+
     def run_reader(self, *, record=False, wrong_gpu=False, writer_busy=False):
         card = drm.DrmCard(key=1, pdev='0000:04:00.0', sysfs='/fixture', driver='xe',
                            vendor_id=0x8086, device_id=0xE222, name='Intel', vram_total=1024, integrated=False, intel=True)

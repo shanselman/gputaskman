@@ -17,6 +17,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pci", required=True, help="full GPU PCI address, for example 0000:04:00.0")
     args = parser.parse_args()
+    # This audit compares native access as a user versus administrator. Importing
+    # an already-running privileged reader would conceal the access restriction.
+    os.environ['GPUTASKMAN_DISABLE_HOST_FEED'] = '1'
     found = [card for card in drm.cards() if card.pdev.lower() == args.pci.lower() and card.driver == "xe"]
     if len(found) != 1:
         parser.error("no unique Xe GPU at that PCI address")
@@ -42,7 +45,7 @@ def main():
         drm.DrmCounters([card]).close()
     json.dump({"pci": card.pdev, "driver": card.driver, "kernel": os.uname().release,
                "effective_uid": os.geteuid(), "pmt_endpoints": endpoints, "samples": samples,
-               "scope": "Device counters only; no process scan, inference or workload was started."},
+               "scope": "Native device counters only; host-feed imports disabled. No process scan, inference or workload was started."},
               sys.stdout, indent=2)
     print()
 
