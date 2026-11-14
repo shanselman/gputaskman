@@ -23,7 +23,7 @@ from .llm import gb, redact_cmdline, server_gauge_text
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_shared_counters, has_wddm_counters,
-                     device_metric_notes, device_metric_sources, inferred_note, intel_memory_note, memory_bandwidth_label,
+                     auxiliary_temperature_label, device_metric_notes, device_metric_sources, inferred_note, intel_memory_note, memory_bandwidth_label,
                      vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
@@ -649,6 +649,8 @@ class GpuTaskManager(App):
             if is_intel and nv.pcie_gen is not None and nv.pcie_width is not None:
                 st.append(f"  PCIe gen{nv.pcie_gen} x{nv.pcie_width}")
             lines.append(st)
+            if auxiliary_temperature_label(nv):
+                lines.append(Text(auxiliary_temperature_label(nv), style="grey70"))
             if nv.metric_status and not self.monitoring:
                 lines.append(Text("Metric availability: " + device_metric_notes(nv), style="grey62"))
             if device_metric_sources(nv) and not self.monitoring:

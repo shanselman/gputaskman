@@ -125,6 +125,17 @@ def device_metric_notes(nv) -> str:
     return "; ".join(f"{'/'.join(names)}: {reason}" for reason, names in reasons.items())
 
 
+def auxiliary_temperature_label(nv) -> str:
+    sensors = nv.temperature_sensors_c
+    parts = [f"{label} {sensors[key]:g}°C" for key, label in
+             (("mctrl", "Memory controller"), ("pcie", "PCIe")) if key in sensors]
+    channels = {key: value for key, value in sensors.items() if key.startswith("vram_ch_")}
+    if channels:
+        hottest = max(channels, key=channels.get)
+        parts.append(f"VRAM channels: hottest {hottest.removeprefix('vram_ch_')} {channels[hottest]:g}°C ({len(channels)} read)")
+    return "  ".join(parts)
+
+
 def memory_bandwidth_label(nv) -> str:
     if nv.mem_read_bps is None or nv.mem_write_bps is None:
         return ""
@@ -265,6 +276,8 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
             sensors.append(f"video {format_metric(nv.video, unit='%')}{kind}")
         if sensors:
             out.append("  ".join(sensors))
+        if auxiliary_temperature_label(nv):
+            out.append(auxiliary_temperature_label(nv))
         if memory_bandwidth_label(nv):
             out.append(memory_bandwidth_label(nv))
         if nv.mem_clock is not None and is_intel:

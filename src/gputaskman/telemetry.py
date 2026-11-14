@@ -40,6 +40,7 @@ class DeviceTelemetry:
     source: str = "NVML"
     fan_rpm: int | None = None
     vram_temp: float | None = None
+    temperature_sensors_c: dict[str, float] = field(default_factory=dict)  # named auxiliary hwmon sensors, Celsius
     util_kind: str = ""  # nonempty when load covers only the visible DRM clients
     video_kind: str = ""
     memory_note: str = ""  # provider-specific provenance of device memory figures

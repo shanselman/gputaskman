@@ -396,6 +396,15 @@ new load test or an independent calibration. Fan RPM included a zero readback, p
 reported. Fan percentage remains unavailable without a maximum-RPM sensor; separate encode/decode
 load, NVIDIA memory busy time and NVIDIA-specific fields are not fabricated.
 
+Xe also reads labelled auxiliary hwmon temperatures when present: memory controller (`mctrl`),
+PCIe (`pcie`), and VRAM channels (`vram_ch_0` through `vram_ch_15`). JSON retains each reading in
+`device.temperature_sensors_c`; text and the dashboard show controller/PCIe temperatures and the
+hottest reported channel with the number of channels read. Missing or unreadable sensors are
+omitted, never zero-filled; the aggregate `vram_temp` remains the driver's separate sensor.
+Native readings take precedence over fresh host-reader values for the same sensor. During the
+contributor's running QLoRA training on the same B65 on 2026-11-14, all 18 auxiliary sensors
+were readable; this does not establish availability on other cards.
+
 Live check, reported by the contributor and not repeated by the maintainer: Linux 6.12, an Arc A770 (discrete, 16 GiB
 BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and selectable with `--gpu`; the Arc showed
 per-process VRAM and engine load, and the TUI rendered both. The fdinfo formats of both drivers, taken from the kernel
@@ -1151,6 +1160,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | Intel Xe device sysfs (labelled GPU temperature, board energy, primary-GT frequency/throttle) | 0.43 ms median, 0.79 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic | Every refresh for the selected Xe card; energy sampling needs two readings, primed at startup. Host process/fd scans were unavailable in this agent's process namespace and are not included |
+| Intel Xe aggregate VRAM and auxiliary temperatures | 0.388 ms median, 0.603 ms max across 100 live reads on the same B65 during training, 2026-11-14 | Selected Xe card, once per refresh. Includes labelled aggregate VRAM, memory controller, PCIe and 16 VRAM-channel reads; no process scan |
 | Intel Xe extended provider (sensors, media clock, memory query and PMU fallback) | 1.56 ms median, 1.83 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic, 2026-11-12 | Selected card only; render-node access was unavailable, so this measures cached query failure plus sysfs sensors. Successful device-query/PMU cost and host fd scans remain unmeasured |
 | Intel Xe PMT/config/Sysman additions | 2.11 ms first call; 0.268 ms median, 0.320 ms max across 30 warm reads on the same B65, 2026-11-12. Whole `read_device` with these additions: 1.52 ms median, 2.90 ms max | PMT read denied, upstream PCI config truncated, optional loader absent; these are cached failure-path costs including bridge identity checks. Successful PMT/Sysman cost remains unmeasured. PMT discovery/open retries every 5 s; failed Sysman initialization/domain discovery every 30 s. PMT reads at most three 16 KiB frames per endpoint per refresh; PCI config reads at most 256 bytes |
 | Intel host device-file handoff | 100 fixture reads of a saved B65 sample in a temporary directory, 2026-11-14: read/validate median 0.025 ms, max 0.082 ms; atomic publish median 0.030 ms, max 0.054 ms | Selected Xe card, once per refresh; at most 64 KiB. These are file/validation costs, not new live GPU measurements. The default reader reuses native device probes without process scans; `--record` adds the standard snapshot work. Live producer collection cost remains unmeasured |

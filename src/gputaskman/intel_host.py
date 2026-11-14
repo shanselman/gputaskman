@@ -138,6 +138,12 @@ class HostDeviceFeed:
                 if not isinstance(value, str) or len(value) > 256:
                     raise ValueError(f'invalid host {key}')
             throttle = device.get('throttle')
+            temperatures = device.get('temperature_sensors_c', {})
+            if (not isinstance(temperatures, dict) or len(temperatures) > 18
+                    or any(not isinstance(key, str) or not re.fullmatch(r'mctrl|pcie|vram_ch_(?:[0-9]|1[0-5])', key)
+                           or type(value) not in (int, float) or not -273.15 <= value <= 1000
+                           for key, value in temperatures.items())):
+                raise ValueError('invalid host auxiliary temperatures')
             if throttle is not None and (not isinstance(throttle, list) or len(throttle) > 64
                     or any(not isinstance(flag, str) or len(flag) > 128 for flag in throttle)):
                 raise ValueError('invalid host throttle state')
@@ -159,6 +165,15 @@ class HostDeviceFeed:
                 device.metric_status['host_feed'] = reason
             return
         sources = host.get('metric_sources', {})
+        imported_temperatures = False
+        for key, value in host.get('temperature_sensors_c', {}).items():
+            if key not in device.temperature_sensors_c:
+                device.temperature_sensors_c[key] = value
+                imported_temperatures = True
+        if imported_temperatures:
+            native_source = device.metric_sources.get('temperature_sensors_c')
+            device.metric_sources['temperature_sensors_c'] = (
+                (native_source + ' + ' if native_source else '') + 'Intel hwmon via host reader')
         def put(key, value):
             setattr(device, key, value)
             if value is not None:

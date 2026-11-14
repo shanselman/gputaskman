@@ -428,6 +428,26 @@ def _hwmon_temp(hwmon: str, intel: bool = False) -> int | None:
     return _milli(os.path.join(hwmon, "temp1_input"))
 
 
+def _xe_temperatures(hwmon: str) -> tuple[int | None, dict[str, float]]:
+    """Aggregate VRAM and explicitly labelled auxiliary sensors; never invent absent channels."""
+    try:
+        labels = sorted(os.listdir(hwmon))
+    except OSError:
+        return None, {}
+    vram, sensors = None, {}
+    for filename in labels:
+        if not re.fullmatch(r"temp\d+_label", filename):
+            continue
+        label = _read(os.path.join(hwmon, filename))
+        if label == "vram":
+            vram = _milli(os.path.join(hwmon, filename[:-6] + "_input"))
+        elif label in ("mctrl", "pcie") or re.fullmatch(r"vram_ch_(?:[0-9]|1[0-5])", label or ""):
+            value = _int(os.path.join(hwmon, filename[:-6] + "_input"))
+            if value is not None and -273150 <= value <= 1000000:
+                sensors[label] = value / 1000
+    return vram, sensors
+
+
 def _cpu_package_temp(hwmon_root: str = "/sys/class/hwmon") -> int | None:
     """The CPU package temperature from coretemp, for an integrated GPU with no sensor of its own.
 
@@ -602,14 +622,9 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
                     dev.metric_sources[field] = kind or 'Xe PMU engine counters'
             dev.power_limit_w = _microwatts(os.path.join(hwmon, "power1_cap")) if hwmon else None
             if hwmon:
-                try:
-                    labels = sorted(os.listdir(hwmon))
-                except OSError:
-                    labels = []
-                for filename in labels:
-                    if filename.endswith("_label") and _read(os.path.join(hwmon, filename)) == "vram":
-                        dev.vram_temp = _milli(os.path.join(hwmon, filename[:-6] + "_input"))
-                        break
+                dev.vram_temp, dev.temperature_sensors_c = _xe_temperatures(hwmon)
+                if dev.temperature_sensors_c:
+                    dev.metric_sources["temperature_sensors_c"] = "Intel hwmon (Celsius)"
             # The media GT is separate on B65. Find it by its engine classes, not by a guessed GT index.
             for tile in sorted(Path(d).glob("tile[0-9]*")):
                 for media_gt in sorted(tile.glob("gt[0-9]*")):

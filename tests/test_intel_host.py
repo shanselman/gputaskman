@@ -65,6 +65,21 @@ class HostFeedTests(unittest.TestCase):
         self.reader.apply(self.card, device)
         self.assertEqual((device.util_gpu, device.temp, device.fan_rpm, device.power_w), (0, 30, 0, 0))
 
+    def test_auxiliary_temperatures_fill_only_missing_sensors(self):
+        self.publish(temperature_sensors_c={'mctrl': 48, 'pcie': 66, 'vram_ch_0': 78})
+        device = DeviceTelemetry(index=0, temperature_sensors_c={'mctrl': 0})
+        self.reader.apply(self.card, device)
+        self.assertEqual(device.temperature_sensors_c, {'mctrl': 0, 'pcie': 66, 'vram_ch_0': 78})
+        self.assertIn('via host reader', device.metric_sources['temperature_sensors_c'])
+
+    def test_invalid_auxiliary_temperatures_reject_the_sample(self):
+        for value in (None, [], {'pcie': True}, {'pcie': float('nan')}, {'pcie': -274},
+                      {'pcie': 10**500}, {'vram_ch_16': 50}, {'untrusted': 50}):
+            with self.subTest(value=value):
+                self.publish()
+                self.edit(lambda body: body['device'].update(temperature_sensors_c=value))
+                self.assertIsNone(self.reader.read()[0])
+
     def test_measured_load_supersedes_visible_client_estimate(self):
         self.publish(util_gpu=0, video=0)
         device = DeviceTelemetry(index=0, util_gpu=70, video=20,

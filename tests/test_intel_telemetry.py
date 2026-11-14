@@ -19,7 +19,8 @@ class ProviderIntegrationTests(unittest.TestCase):
 
     def collect(self, card, **fields):
         dev = DeviceTelemetry(index=0, **fields)
-        with patch("gputaskman.intel_pmt.pci_link", return_value=({}, "truncated config")):
+        with patch("gputaskman.intel_pmt.pci_link", return_value=({}, "truncated config")), \
+                patch.dict('os.environ', {'GPUTASKMAN_DISABLE_HOST_FEED': '1'}):
             drm._xe_extra_telemetry(card, dev)
         return dev
 

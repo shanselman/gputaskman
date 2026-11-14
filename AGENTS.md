@@ -107,6 +107,9 @@ on the same B65 (`xe`, Linux 7.0.0-43-generic); ten normal-user JSON reports con
 fresh samples and populated all supported device metrics, with protected counters labeled
 `via host reader`. This validates the live handoff, not independent counter accuracy or a new
 load test. Unit fixtures and recorded-sample UI integration do not validate additional hardware.
+Auxiliary Xe temperatures retain their hwmon labels in `temperature_sensors_c` (Celsius).
+Omit unreadable sensors, preserve measured zero, and summarize only the channels actually read;
+do not replace the driver's aggregate VRAM temperature with a derived channel maximum.
 
 ## Where to change things
 
