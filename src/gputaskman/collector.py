@@ -433,6 +433,13 @@ class Collector:
             snap.counter_status = " ".join(filter(None, (snap.counter_status, self.adapter.identity_status)))
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
+            if nv is not None and nv.source == "Mali DRM":
+                snap.counter_status = (
+                    "Mali uses unified system memory, not dedicated VRAM. Per-process VRAM shows only "
+                    "provably private resident DRM buffers; reachable system bytes are a reference, never summed. "
+                    "Device-wide memory and load are unavailable. Per-process engine timing requires kernel "
+                    "fdinfo support and profiling enabled by the administrator; gputaskman never enables it."
+                )
             if self.drm_card.intel and nv is not None:
                 from .drm import intel_counter_status
 

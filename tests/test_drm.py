@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 from gputaskman import drm
@@ -278,6 +278,245 @@ class Clock:
 
     def tick(self, seconds: float = 1.0) -> None:
         self.t += int(seconds * 1_000_000_000)
+
+
+class MaliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+        self.clock = Clock()
+
+    def make_card(self, driver="panfrost", address="fbe40000.gpu", node=0, render_only=False):
+        device = self.root / "devices" / address
+        device.mkdir(parents=True)
+        (device / "uevent").write_text(f"DRIVER={driver}\n")
+        for name in ([f"renderD{128 + node}"] if render_only else [f"card{node}", f"renderD{128 + node}"]):
+            entry = self.root / "drm" / name
+            entry.mkdir(parents=True)
+            os.symlink(device, entry / "device")
+        return device
+
+    def counters(self):
+        counters = drm.DrmCounters(drm.cards(str(self.root / "drm")), proc=str(self.proc), clock=self.clock)
+        counters.scan_budget = None
+        return counters
+
+    @staticmethod
+    def fdinfo(driver="panfrost", client=1, resident="8 MiB", shared="0", engine=None):
+        # Synthetic standard DRM memory fields, not a hardware capture. Platform GPUs have no drm-pdev.
+        text = f"drm-driver:\t{driver}\ndrm-client-id:\t{client}\n"
+        if resident is not None:
+            text += f"drm-resident-memory:\t{resident}\n"
+        if shared is not None:
+            text += f"drm-shared-memory:\t{shared}\n"
+        if engine is not None:
+            text += f"drm-engine-fragment:\t{engine} ns\n"
+        return text
+
+    def test_platform_discovery_deduplicates_card_and_render_node(self):
+        self.make_card()
+        self.make_card("panthor", "fb000000.gpu", 1, render_only=True)
+        found = drm.cards(str(self.root / "drm"))
+        self.assertEqual(len(found), 2)
+        self.assertEqual(len({c.key for c in found}), 2)
+        self.assertEqual([c.key for c in found], [c.key for c in drm.cards(str(self.root / "drm"))])
+        for card, adapter in zip(found, drm.adapters(found)):
+            self.assertLess(card.key, 0)
+            self.assertTrue(card.integrated)
+            self.assertEqual(card.vendor_id, 0x13B5)
+            self.assertEqual(adapter.vendor, "ARM")
+            self.assertIn("Mali", card.name)
+            self.assertEqual(card.vram_total, 0)
+        self.assertEqual(found[0].nodes, ("card0", "renderD128"))
+
+    def test_two_platform_gpus_are_matched_by_node_not_driver_or_client_id(self):
+        self.make_card()
+        self.make_card(address="fb000000.gpu", node=1)
+        _write_fd(self.proc, 10, 3, self.fdinfo(), target="/dev/dri/renderD128")
+        _write_fd(self.proc, 20, 3, self.fdinfo(resident="4 MiB"), target="/dev/dri/renderD129")
+        _write_fd(self.proc, 30, 3, self.fdinfo(), target="/dev/dri/renderD130")
+        counters = self.counters()
+        procs, _ = counters.sample()
+        self.assertEqual(procs[counters.cards[0].key][10].dedicated, 8 * MiB)
+        self.assertEqual(procs[counters.cards[1].key][20].dedicated, 4 * MiB)
+        self.assertEqual(sum(len(rows) for rows in procs.values()), 2)
+
+    def test_driver_must_match_node(self):
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo("panthor"))
+        counters = self.counters()
+        self.assertEqual(counters.sample()[0][counters.cards[0].key], {})
+
+    def test_private_unified_memory_and_unknown_device_totals(self):
+        for driver in drm.MALI_DRIVERS:
+            with self.subTest(driver=driver):
+                info = drm.parse_fdinfo(self.fdinfo(driver))
+                self.assertEqual(info["gtt"], 8 * MiB)
+                self.assertEqual(info["shared"], 0)
+                self.assertIsNone(info["vram"])
+                self.assertIsNone(info["engines"])
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo())
+        counters = self.counters()
+        rows, adapters = counters.sample()
+        gpu = rows[counters.cards[0].key][10]
+        self.assertEqual(gpu.dedicated, 8 * MiB)
+        self.assertEqual(gpu.resident_gtt, 8 * MiB)
+        self.assertTrue(gpu.attributed)
+        self.assertNotIn("shared", gpu.available)
+        self.assertNotIn("engine", gpu.available)
+        self.assertIsNone(adapters[counters.cards[0].key].dedicated)
+        device = drm.read_device(counters.cards[0], 0)
+        self.assertEqual(device.source, "Mali DRM")
+        self.assertEqual(device.pci_bus, "")
+        self.assertIsNone(device.mem_used)
+        self.assertIsNone(device.mem_total)
+        self.assertIsNone(device.util_gpu)
+
+    def test_shared_missing_and_malformed_stats_never_charge_memory(self):
+        self.make_card()
+        cases = [
+            (dict(shared="1 MiB"), drm.REASON_SHARED_BUFFERS),
+            (dict(shared=None), drm.REASON_LEGACY),
+            (dict(shared="invalid"), drm.REASON_LEGACY),
+            (dict(resident=None), drm.REASON_LEGACY),
+            (dict(resident="invalid"), drm.REASON_LEGACY),
+            (dict(resident="-1 MiB"), drm.REASON_LEGACY),
+            (dict(shared="-1 MiB"), drm.REASON_LEGACY),
+        ]
+        counters = self.counters()
+        for args, reason in cases:
+            with self.subTest(args=args):
+                _write_fd(self.proc, 10, 3, self.fdinfo(**args))
+                gpu = counters.sample()[0][counters.cards[0].key][10]
+                self.assertFalse(gpu.attributed)
+                self.assertEqual(gpu.drm_reason, reason)
+                self.assertNotIn("dedicated", gpu.available)
+        # An unknown extra shared region also closes the gate.
+        info = drm.parse_fdinfo(self.fdinfo() + "drm-shared-other:\tbad\n")
+        self.assertIsNone(info["shared"])
+        info = drm.parse_fdinfo(self.fdinfo().replace("drm-client-id:\t1\n", ""))
+        self.assertIsNone(info["shared"])
+
+    def test_measured_zero_stays_zero(self):
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo(resident="0"))
+        counters = self.counters()
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertTrue(gpu.attributed)
+        self.assertEqual(gpu.shown_vram, 0)
+
+    def test_shared_client_and_primary_node_are_not_private(self):
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo())
+        _write_fd(self.proc, 20, 3, self.fdinfo())
+        _write_fd(self.proc, 30, 3, self.fdinfo(client=2), target="/dev/dri/card0")
+        counters = self.counters()
+        rows = counters.sample()[0][counters.cards[0].key]
+        for pid in (10, 20):
+            self.assertEqual(rows[pid].drm_reason, drm.REASON_SHARED_CLIENT)
+            self.assertNotIn("engine", rows[pid].available)
+        self.assertEqual(rows[30].drm_reason, drm.REASON_PRIMARY)
+
+    def test_engine_rates_and_missing_timing_are_independent_of_memory(self):
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo(shared="1 MiB", engine=100))
+        counters = self.counters()
+        counters.sample()
+        self.clock.tick()
+        _write_fd(self.proc, 10, 3, self.fdinfo(shared="1 MiB", engine=500000100))
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertFalse(gpu.attributed)
+        self.assertIn("engine", gpu.available)
+        self.assertAlmostEqual(gpu.gpu_pct, 50)
+        self.clock.tick()
+        _write_fd(self.proc, 10, 3, self.fdinfo())
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertTrue(gpu.attributed)
+        self.assertNotIn("engine", gpu.available)
+        self.clock.tick()
+        _write_fd(self.proc, 10, 3, self.fdinfo(engine=900000100))
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertNotIn("engine", gpu.available)  # profiling resumed: a new baseline, not a rate over a gap
+
+    def test_overlapping_engine_times_are_not_added(self):
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo(engine=0) + "drm-engine-vertex-tiler:\t0 ns\n")
+        counters = self.counters()
+        counters.sample()
+        self.clock.tick()
+        _write_fd(self.proc, 10, 3, self.fdinfo(engine=500000000)
+                  + "drm-engine-vertex-tiler:\t500000000 ns\n")
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertEqual(gpu.engines, {"fragment": 50, "vertex-tiler": 50})
+        self.assertEqual(gpu.gpu_pct, 50)
+
+    def test_panthor_timing_and_cycles_only(self):
+        self.make_card("panthor")
+        timing = self.fdinfo("panthor", engine=0).replace("engine-fragment", "engine-panthor")
+        _write_fd(self.proc, 10, 3, timing)
+        counters = self.counters()
+        counters.sample()
+        self.clock.tick()
+        _write_fd(self.proc, 10, 3, timing.replace("0 ns", "250000000 ns"))
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertEqual(gpu.engines, {"panthor": 25})
+        self.clock.tick()
+        _write_fd(self.proc, 10, 3, self.fdinfo("panthor") + "drm-cycles-panthor:\t10000\n")
+        gpu = counters.sample()[0][counters.cards[0].key][10]
+        self.assertNotIn("engine", gpu.available)
+
+    def test_deferred_scan_revalidates_reused_fd_target(self):
+        self.make_card()
+        self.make_card(address="fb000000.gpu", node=1)
+        _write_fd(self.proc, 10, 3, self.fdinfo())
+        counters = self.counters()
+        counters.sample()
+        link = self.proc / "10" / "fd" / "3"
+        link.unlink()
+        os.symlink("/dev/dri/renderD129", link)
+        counters.scan_budget = 0  # reuse cached targets, but read current fdinfo
+        rows = counters.sample()[0]
+        self.assertEqual(rows[counters.cards[0].key], {})
+        self.assertIn(10, rows[counters.cards[1].key])
+        self.assertEqual(rows[counters.cards[1].key][10].drm_reason, drm.REASON_PARTIAL_SCAN)
+
+    def test_collector_text_and_json_keep_provenance_and_nulls(self):
+        from gputaskman import collector, report
+        from gputaskman.procinfo import ProcDetail
+
+        self.make_card()
+        _write_fd(self.proc, 10, 3, self.fdinfo())
+        counters = self.counters()
+        wrapper = SimpleNamespace(drm=counters, sample=counters.sample, close=counters.close)
+        inspector = Mock()
+        inspector.get.return_value = ProcDetail(pid=10, name="graphics-app")
+        inspector.needs_scan.return_value = False
+        with (patch.object(collector, "BACKEND", "nvml"),
+              patch.object(collector, "GpuCounters", return_value=wrapper),
+              patch.object(collector, "Nvml"),
+              patch.object(collector, "AmdSmi"),
+              patch.object(collector, "Adl"),
+              patch.object(collector, "ProcInspector", return_value=inspector)):
+            monitor = collector.Collector(adapters=drm.adapters(counters.cards), host=False)
+            self.addCleanup(monitor.close)
+            snap = monitor.sample()
+        data = report.to_dict(snap)
+        self.assertEqual(data["backend"], "drm")
+        self.assertFalse(data["shared_is_spill"])
+        self.assertEqual(data["attributed"], 8 * MiB)
+        for key in ("vram_used", "vram_total", "shared_used"):
+            self.assertIsNone(data[key])
+        row = data["processes"][0]
+        self.assertEqual(row["vram_bytes"], 8 * MiB)
+        self.assertEqual(row["gtt_resident_bytes"], 8 * MiB)
+        for key in ("gpu_pct", "engines", "shared_bytes", "committed_bytes", "paged_out_bytes"):
+            self.assertIsNone(row[key])
+        self.assertIn("unified system memory", data["counter_status"])
+        self.assertIn(data["counter_status"], report.to_text(snap))
 
 
 class ParseTests(unittest.TestCase):

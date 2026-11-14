@@ -101,7 +101,12 @@ VRAM. On an integrated GPU a provably private client's system memory is its GPU 
 `xe` cards are detected but their per-process fdinfo isn't
 decoded yet (rows show `n/a`). With no device-wide memory counter, an Intel card's VRAM used is a sum over the processes
 it can inspect (local memory on a discrete card, system memory on an integrated GPU; shared buffers can be counted twice; kernel-owned memory and uninspectable processes are missing), its total is
-the size of the card's local-memory PCI window (an estimate; unknown on an integrated GPU), and free memory is not shown. Only processes you can inspect are
+the size of the card's local-memory PCI window (an estimate; unknown on an integrated GPU), and free memory is not shown.
+**ARM Mali** (`panfrost`/`panthor`) uses DRM fdinfo too: provably private resident system RAM is shown in
+the VRAM column, not dedicated VRAM; Shared/Paged and device-wide memory/load stay unavailable.
+Engine timing requires kernel support and administrator-enabled profiling; the monitor never enables it.
+Proprietary `/dev/mali*` and `lima` drivers are not supported. Mali hardware is not yet validated.
+Only processes you can inspect are
 listed, and the header says how many it couldn't; run with `sudo` to see other users'. Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL

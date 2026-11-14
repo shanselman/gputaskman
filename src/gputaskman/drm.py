@@ -1,4 +1,4 @@
-"""Linux AMD and Intel GPU backend: cards from sysfs and per-process memory/engine use from DRM fdinfo.
+"""Linux DRM GPU backend: cards from sysfs and per-process memory/engine use from DRM fdinfo.
 
 The amdgpu and i915/xe drivers charge each DRM client's resident memory and accumulated engine time to
 the fds that hold a render node open. /proc/<pid>/fdinfo lists those clients, so a process can be
@@ -6,12 +6,15 @@ attributed its VRAM and the engine time that elapsed between two samples -- the 
 WDDM's per-process counters. Device-wide numbers come from sysfs: amdgpu reports VRAM, clocks,
 temperature and power directly; i915/xe expose temperature (hwmon), frequency (gt nodes) and an energy
 counter, and have no per-process or device-wide memory sysfs beyond a discrete card's resizable BAR.
+Panfrost/panthor expose Mali's unified system-memory buffers and optional engine timing through fdinfo;
+platform devices are paired by their DRM nodes, and device-wide memory stays unknown.
 """
 
 from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
 import platform
 import re
@@ -21,7 +24,7 @@ from bisect import bisect_left
 from dataclasses import dataclass, field
 from functools import lru_cache
 
-from .dxgi import VENDORS, Adapter
+from .dxgi import VENDORS, VENDOR_ARM, Adapter
 from .linux import pci_key
 from .telemetry import DeviceTelemetry
 from .pdh import AdapterGpu, ProcGpu
@@ -30,7 +33,8 @@ from .pdh import AdapterGpu, ProcGpu
 # is the UHD 730's window, a multi-GB BAR is a discrete card's local VRAM. Check before trusting.
 _LOCAL_BAR_MIN = 1 << 30  # 1 GiB: smallest real local-memory BAR we accept (Arc A310 is 4 GiB)
 
-DRIVERS = ("amdgpu", "i915", "xe")
+MALI_DRIVERS = ("panfrost", "panthor")
+DRIVERS = ("amdgpu", "i915", "xe", *MALI_DRIVERS)
 SCAN_BUDGET = 0.05  # seconds per refresh for listing process fds (one-shot output: no limit)
 
 _SIZE_UNITS = {
@@ -70,6 +74,7 @@ class DrmCard:
     # shared buffers can double-count); None = no readable client, unknown.
     vram_used: int | None = None
     pmu_state: dict = field(default_factory=dict, repr=False)
+    nodes: tuple[str, ...] = ()  # Mali has no drm-pdev: match the exact device's DRM nodes instead
 
 
 def _read(path: str) -> str | None:
@@ -152,6 +157,20 @@ def parse_fdinfo(text: str) -> dict | None:
         except (ValueError, IndexError):
             engines = None  # a torn or malformed counter: this client's load is unknown, not 0
             break
+    if fields["drm-driver"] in MALI_DRIVERS:
+        resident = parse_size(fields.get("drm-resident-memory"))
+        return {
+            "driver": fields["drm-driver"],
+            "client_id": client_id,
+            "pdev": "",  # platform device identity comes from the fd's node, not an optional PCI field
+            "vram": None,
+            "gtt": resident if resident is not None and resident >= 0 else None,
+            "shared": (sum(shared_values) if "drm-shared-memory" in fields
+                       and client_id is not None and all(v is not None and v >= 0 for v in shared_values) else None),
+            "cpu": None,
+            # Profiling disabled / older kernel: absent timing is unknown, not idle.
+            "engines": (engines or None) if client_id is not None else None,
+        }
     if fields.get("drm-driver") in ("i915", "xe"):
         if not engines:
             # i915 (gen8+) prints a drm-engine-<class> line for each engine class the device has, even at 0 ns;
@@ -281,7 +300,7 @@ def _card_name(device: str, vendor_id: int, device_id: int, pci_ids: str | None)
 
 
 def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmCard]:
-    """DRM cards backed by an amdgpu PCI device, discrete first then by VRAM desc."""
+    """Supported DRM devices, discrete first then by VRAM desc."""
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name)
     except OSError:
@@ -289,18 +308,22 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
     found: list[DrmCard] = []
     seen: set[str] = set()
     for entry in entries:
-        if not re.fullmatch(r"card\d+", entry.name):
+        if not re.fullmatch(r"card\d+|renderD\d+", entry.name):
             continue
         device = os.path.join(entry.path, "device")
         driver = _driver(device)
         if driver not in DRIVERS:
             continue
+        mali = driver in MALI_DRIVERS
+        if not mali and entry.name.startswith("renderD"):
+            continue
         uevent = _uevent(device)
-        pdev = uevent.get("PCI_SLOT_NAME") or os.path.basename(os.path.realpath(device))
+        pdev = ("platform:" + os.path.realpath(device) if mali else
+                uevent.get("PCI_SLOT_NAME") or os.path.basename(os.path.realpath(device)))
         if pdev in seen:
             continue
         seen.add(pdev)
-        vendor_id = _hex_id(os.path.join(device, "vendor"))
+        vendor_id = VENDOR_ARM if mali else _hex_id(os.path.join(device, "vendor"))
         device_id = _hex_id(os.path.join(device, "device"))
         intel = vendor_id == 0x8086 and driver in ("i915", "xe")
         vram_total = _int(os.path.join(device, "mem_info_vram_total")) or 0
@@ -320,13 +343,15 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
                     break
             vram_total = bar if bar >= _LOCAL_BAR_MIN else 0
         found.append(DrmCard(
-            key=pci_key(pdev),
+            # A separate key space: platform addresses are not PCI addresses, and must not be
+            # passed through pci_key's hex stripping (which can alias unrelated devices).
+            key=-int.from_bytes(hashlib.blake2b(pdev.encode(), digest_size=8).digest(), "big") - 1 if mali else pci_key(pdev),
             pdev=pdev,
             sysfs=device,
             driver=driver,
             vendor_id=vendor_id,
             device_id=device_id,
-            name=_card_name(device, vendor_id, device_id, pci_ids),
+            name=f"ARM Mali ({driver})" if mali else _card_name(device, vendor_id, device_id, pci_ids),
             vram_total=vram_total,
             # amdgpu reports the VRAM chips' vendor only for a discrete card; an APU's "VRAM" is a RAM
             # carve-out. Intel reports no vendor node at all: a card with a local-memory BAR is discrete,
@@ -334,13 +359,16 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
             integrated=(vram_total == 0) if intel else not os.path.exists(os.path.join(device, "mem_info_vram_vendor")),
             unified_video=_vcn_major(device) >= 4,
             intel=intel,
+            nodes=tuple(e.name for e in entries
+                        if re.fullmatch(r"card\d+|renderD\d+", e.name)
+                        and os.path.realpath(os.path.join(e.path, "device")) == os.path.realpath(device)) if mali else (),
         ))
     found.sort(key=lambda c: (c.integrated, -c.vram_total))
     return found
 
 
 def adapters(found: list[DrmCard]) -> list[Adapter]:
-    """AMD and Intel cards as bare adapters (per-process data comes from DrmCounters)."""
+    """DRM cards as bare adapters (per-process data comes from DrmCounters)."""
     return [
         Adapter(
             luid=c.key,
@@ -467,7 +495,10 @@ def _intel_throttle(gt: str) -> list[str] | None:
 
 
 def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
-    """NVIDIA-shaped device metrics for one AMD or Intel card, read from sysfs."""
+    """NVIDIA-shaped device metrics for one DRM card, read from sysfs."""
+    if card.driver in MALI_DRIVERS:
+        return DeviceTelemetry(index=index, name=card.name, driver_model=card.driver, source="Mali DRM",
+                               throttle=None)
     d = card.sysfs
     hwmon = _hwmon_dir(d)
     dev = DeviceTelemetry(
@@ -812,7 +843,11 @@ def _vcn_major(device: str) -> int:
     return _int(os.path.join(device, "ip_discovery", "die", "0", "UVD", "0", "major")) or 0
 
 
-def _engine_key(name: str, unified_video: bool = False, intel: bool = False) -> str:
+def _engine_key(name: str, unified_video: bool = False, intel: bool = False, mali: bool = False) -> str:
+    if mali:
+        # Fragment and vertex/tiler jobs can overlap: retain separate counters so GPU% takes
+        # their maximum, not a sum masquerading as whole-GPU busy time. Panthor is one mixed engine.
+        return name
     if intel:
         lowered = name.lower()
         # i915's fdinfo names whole engine classes: render, copy, video, video-enhance, compute. The command-streamer
@@ -991,6 +1026,7 @@ class DrmCounters:
         fd handed to an already-running process shows up a refresh or two late.
         """
         by_pdev = {c.pdev: c.key for c in self.cards}
+        mali_nodes = {node: c for c in self.cards if c.driver in MALI_DRIVERS for node in c.nodes}
         clients: dict[tuple, list] = {}
         kfd: set[int] = set()
         incomplete: set[int] = set()
@@ -1049,6 +1085,16 @@ class DrmCounters:
                     continue  # closed since the listing
                 read_at = self._clock()
                 info = parse_fdinfo(text)
+                if info and info["driver"] in MALI_DRIVERS:
+                    try:
+                        target = os.readlink(os.path.join(self._proc, str(pid), "fd", name))
+                    except OSError:
+                        incomplete.add(pid)
+                        continue
+                    card = mali_nodes.get(os.path.basename(target))
+                    if not target.startswith("/dev/dri/") or card is None or card.driver != info["driver"]:
+                        continue  # never pair by driver/name or by an assumed GPU index
+                    info["pdev"] = card.pdev
                 if not info or info["driver"] not in DRIVERS or info["pdev"] not in by_pdev:
                     continue
                 client_id = info["client_id"]
@@ -1077,6 +1123,7 @@ class DrmCounters:
         by_key = {c.key: c for c in self.cards}
         unified = {c.pdev for c in self.cards if c.unified_video}
         intel_pdevs = {c.pdev for c in self.cards if c.intel}
+        mali_pdevs = {c.pdev for c in self.cards if c.driver in MALI_DRIVERS}
         procs: dict[int, dict[int, ProcGpu]] = {c.key: {} for c in self.cards}
         clients, kfd, incomplete = self._clients()
         self._stamp_intel_memory(clients)
@@ -1092,10 +1139,12 @@ class DrmCounters:
         for client_key, (owners, info, _render, read_at) in clients.items():
             old = self._prev.get(client_key)
             if info["engines"] is None:
-                if old is not None:
+                if old is not None and info["pdev"] not in mali_pdevs:
                     current[client_key] = old
                 continue
             high = dict(old[0]) if old else {}
+            if info["pdev"] in mali_pdevs and high.keys() != info["engines"].keys():
+                high = {}  # changed profiling fields need a fresh baseline, not a stale engine set
             for name, ns in info["engines"].items():
                 high[name] = max(ns, high.get(name, 0))  # the DRM spec allows a counter to step back briefly
             current[client_key] = (high, read_at)
@@ -1109,11 +1158,12 @@ class DrmCounters:
             infos = [c[1] for _k, c in held]
             vram = [i["vram"] for i in infos]
             gtt = [i["gtt"] for i in infos]
-            # An integrated Intel GPU has no local memory: system0 is its memory, not spill and not
+            # An integrated Intel or Mali GPU has no local memory: system RAM is its memory, not spill and not
             # dedicated VRAM, so there is no shared (spill) counter for it. The bytes it holds are charged
             # as the process's GPU memory in the VRAM column when provably private (below).
-            integrated_intel = by_key[key].intel and by_key[key].integrated
-            if integrated_intel:
+            unified_memory = ((by_key[key].intel and by_key[key].integrated)
+                              or by_key[key].driver in MALI_DRIVERS)
+            if unified_memory:
                 proc.available.discard("shared")
             # Every buffer this process can reach, shared ones included: a reference, never summed (rule 1).
             complete = pid not in incomplete  # otherwise any sum would be a partial total that looks whole
@@ -1134,7 +1184,7 @@ class DrmCounters:
                 reason = REASON_SHARED_BUFFERS
             elif not all(c[2] for _k, c in held):
                 reason = REASON_PRIMARY
-            elif proc.resident_gtt is None or (proc.resident_vram is None and not integrated_intel):
+            elif proc.resident_gtt is None or (proc.resident_vram is None and not unified_memory):
                 # No local memory on an integrated GPU, so only the system figure has to be known.
                 reason = REASON_LEGACY
             elif self.partial:
@@ -1143,7 +1193,7 @@ class DrmCounters:
             if reason:
                 proc.attributed = False
                 proc.available -= {"dedicated", "shared"}
-            elif integrated_intel:
+            elif unified_memory:
                 # Unified memory: the same system bytes are the charge (vram_bytes) and the reachable
                 # reference (gtt_resident_bytes). Both are measured and labelled; diff.py compares
                 # per-field and never sums them.
@@ -1156,7 +1206,8 @@ class DrmCounters:
             for client_key, (owners, info, _render, read_at) in held:
                 old = self._prev.get(client_key)
                 if (proc.kfd or not complete or self.partial or len(owners) > 1 or info["engines"] is None
-                        or old is None or read_at - old[1] <= 0):
+                        or old is None or read_at - old[1] <= 0
+                        or (info["pdev"] in mali_pdevs and info["engines"].keys() != old[0].keys())):
                     engines = {}
                     proc.available.discard("engine")  # unknown, not 0 (rule 2)
                     break
@@ -1164,14 +1215,15 @@ class DrmCounters:
                 for name, ns in current[client_key][0].items():
                     # amdgpu omits an engine until it has run, so a missing earlier value really is 0.
                     pct = min(100.0, max(0.0, 100.0 * (ns - old[0].get(name, 0)) / delta))
-                    engine = _engine_key(name, info["pdev"] in unified, info["pdev"] in intel_pdevs)
+                    engine = _engine_key(name, info["pdev"] in unified, info["pdev"] in intel_pdevs,
+                                         info["pdev"] in mali_pdevs)
                     engines[engine] = min(100.0, engines.get(engine, 0.0) + pct)
             for engine, pct in engines.items():
                 proc.engines[engine] = pct
             procs[key][pid] = proc
 
         for client_key, value in self._prev.items():  # keep baselines of clients a deferred scan missed, briefly
-            if client_key not in current and now - value[1] < _PRUNE_NS:
+            if client_key not in current and client_key[0] not in mali_pdevs and now - value[1] < _PRUNE_NS:
                 current[client_key] = value
         self._prev = current
         return procs, adapters
