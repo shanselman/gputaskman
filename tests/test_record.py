@@ -512,6 +512,23 @@ class CliTests(FileTestCase):
         self.assertIn("cannot write", err.getvalue())
         self.assertEqual(self.calls, [])
 
+    def test_output_failure_after_open_reports_a_recording_error(self):
+        for operation in ("flush", "__exit__"):
+            with self.subTest(operation=operation):
+                output = MagicMock()
+                getattr(output, operation).side_effect = OSError(errno.ENOSPC, "No space left")
+                err = io.StringIO()
+                with self.fake_source(), patch("sys.argv", [
+                    "gputaskman", "record", "-o", self.path, "--duration", "0.5",
+                ]), patch("gputaskman.record.append_to", return_value=output), \
+                        contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+                    main()
+                self.assertEqual(stop.exception.code, 1)
+                self.assertIn(f"recording to {self.path} failed", err.getvalue())
+                self.assertIn("No space left", err.getvalue())
+                self.assertNotIn("Recorded ", err.getvalue())
+                output.__exit__.assert_called_once()
+
     def test_help_finds_record_from_the_main_command(self):
         for argv, expected in ((["gputaskman", "--help"], "gputaskman record -o FILE"),
                                (["gputaskman", "record", "--help"], "--duration")):

@@ -149,6 +149,10 @@ class ProcDetail:
         return _is_diffusion_cmdline(self.cmdline)
 
     @property
+    def foundry_local(self) -> bool:
+        return self.name.lower() in ("foundrylocald.exe", "foundrylocald")
+
+    @property
     def vllm_role(self) -> str:
         """A process signature, not evidence that a model is resident in this process."""
         if any(_VLLM_WORKER.fullmatch(s) for s in (self.name, *self.cmdline[:1])):
@@ -595,6 +599,8 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "decision?"
     if d.vllm_role or "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
         return "LLM"
+    if d.foundry_local:
+        return "AI"
     video = engines.get("decode", 0) + engines.get("encode", 0) + engines.get("video", 0) > 1
     if d.is_ai and not video:
         return "AI"

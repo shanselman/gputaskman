@@ -68,6 +68,37 @@ class ProviderIntegrationTests(unittest.TestCase):
         self.assertIsNone(card.pmt_provider)
         self.assertIsNone(card.sysman_provider)
 
+    def test_xe_device_memory_keeps_precedence_over_client_totals_after_upstream_merge(self):
+        from gputaskman.collector import Collector
+        from gputaskman.dxgi import Adapter
+        from gputaskman.pdh import AdapterGpu
+
+        gib = 1024**3
+        card = self.card(({}, {}, {}), ({}, {}, {}))
+        for device_used in (27 * gib, 0, None):
+            with self.subTest(device_used=device_used):
+                collector = Collector.__new__(Collector)
+                collector.adapter = Adapter(1, "Intel Arc Pro B65", 0x8086, 32 * gib, 0, False)
+                collector.adapters = [collector.adapter]
+                collector.drm_card = card
+                collector.gpu_index, collector.scan_budget = 0, None
+                collector.host, collector.host_status = None, ""
+                collector.nvml, collector.amdsmi = Mock(ok=False), Mock()
+                collector.counters = Mock(outside={})
+                collector.counters.drm.status = None
+                collector.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=3 * gib)})
+                collector.inspector, collector.prober = Mock(), Mock()
+                device = DeviceTelemetry(index=0, source="Intel sysfs", mem_total=31 * gib,
+                                         mem_used=device_used, memory_note="Xe query: driver-reported usable VRAM")
+                with patch("gputaskman.collector.BACKEND", "nvml"), \
+                        patch("gputaskman.collector.os.uname", create=True, return_value=Mock(release="test-kernel")), \
+                        patch.object(drm, "read_device", return_value=device), \
+                        patch.object(drm, "intel_counter_status", return_value=""):
+                    snapshot = collector.sample()
+                self.assertEqual(snapshot.vram_used, device_used)
+                self.assertEqual(snapshot.vram_total, 31 * gib)
+                self.assertEqual(snapshot.driver, "kernel test-kernel")
+
 
 if __name__ == "__main__":
     unittest.main()

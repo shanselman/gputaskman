@@ -10,7 +10,7 @@ analysis = Analysis(
 )
 
 # These belong to the operating system or the installed GPU driver, not the portable app.
-driver_libs = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "dxgi.dll", "pdh.dll",
+driver_libs = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "librocdxg.so", "dxgi.dll", "pdh.dll",
                "libnvidia-ml.so", "libcuda.so", "libdxcore.so", "libze_loader.so", "libze_intel_gpu.so",
                "ze_loader.dll", "ze_intel_gpu64.dll")
 

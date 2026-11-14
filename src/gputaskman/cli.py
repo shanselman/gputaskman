@@ -78,6 +78,8 @@ def record_main(argv: list[str]) -> None:
             count = run(sample, out, interval=args.interval, duration=args.duration)
     except KeyboardInterrupt:
         pass  # Ctrl+C while starting up: nothing was recorded yet
+    except OSError as error:
+        ap.exit(1, f"{ap.prog}: recording to {args.output} failed: {error}\n")
     print(f"Recorded {count} sample(s) to {args.output}", file=sys.stderr)
 
 
@@ -107,10 +109,12 @@ def main() -> None:
     _check_platform()
 
     if args.list_gpus:
-        from .collector import enumerate_adapters, ordered_adapters
+        from .collector import BACKEND, enumerate_adapters, ordered_adapters
+        from .dxgi import VENDOR_AMD
         from .tcc import TccAdapter, tcc_discovery_status
 
-        for i, adapter in enumerate(ordered_adapters(enumerate_adapters())):
+        adapters = ordered_adapters(enumerate_adapters())
+        for i, adapter in enumerate(adapters):
             if isinstance(adapter, TccAdapter):  # its LUID is made up from the PCI identity, so show the address
                 bus, device, function = adapter.pci_address
                 pci = f"{adapter.pci_domain:08x}:" if adapter.pci_domain else ""
@@ -123,6 +127,11 @@ def main() -> None:
         status = tcc_discovery_status()
         if status:
             print(f"TCC discovery: {status}", file=sys.stderr)
+        if BACKEND == "wsl" and (not adapters or any(a.vendor_id == VENDOR_AMD for a in adapters)):
+            from .amdsmi import amdsmi_status
+
+            if status := amdsmi_status():
+                print(status, file=sys.stderr)
         return
 
     _check_gpu(ap, args.gpu)

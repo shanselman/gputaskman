@@ -34,10 +34,11 @@ _IID_IDXGIFactory1 = _GUID(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(0xA8
 VENDOR_NVIDIA = 0x10DE
 VENDOR_AMD = 0x1002
 VENDOR_INTEL = 0x8086
+VENDOR_QUALCOMM = 0x4D4F4351
 VENDOR_HUAWEI = 0x19E5  # Ascend NPUs (telemetry via npu-smi, not DRM)
-_INTEL_INTEGRATED_MAX_DEDICATED = 512 << 20
+_INTEGRATED_MAX_DEDICATED = 512 << 20
 VENDORS = {0x10DE: "NVIDIA", 0x1002: "AMD", VENDOR_INTEL: "Intel", 0x19E5: "Ascend",
-           0x1414: "Microsoft", 0x5143: "Qualcomm"}
+           0x1414: "Microsoft", 0x5143: "Qualcomm", VENDOR_QUALCOMM: "Qualcomm"}
 
 
 @dataclass
@@ -63,10 +64,28 @@ class Adapter:
         return VENDORS.get(self.vendor_id, hex(self.vendor_id))
 
     @property
-    def integrated_intel(self) -> bool:
-        return (self.vendor_id == VENDOR_INTEL
-                and self.dedicated_vram <= _INTEL_INTEGRATED_MAX_DEDICATED
+    def integrated_gpu(self) -> bool:
+        return (self.vendor_id in (VENDOR_INTEL, VENDOR_QUALCOMM)
+                and self.dedicated_vram <= _INTEGRATED_MAX_DEDICATED
                 and self.shared_system > self.dedicated_vram)
+
+
+def adapter_driver_version(device_instance_id: str) -> str:
+    """Read the installed driver version for this exact PnP adapter, or leave it unknown."""
+    if not device_instance_id:
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Enum\{device_instance_id}") as device:
+            driver_key, _ = winreg.QueryValueEx(device, "Driver")
+        if not isinstance(driver_key, str) or not driver_key:
+            return ""
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Control\Class\{driver_key}") as driver:
+            version, _ = winreg.QueryValueEx(driver, "DriverVersion")
+    except (ImportError, OSError):
+        return ""
+    return version.strip() if isinstance(version, str) else ""
 
 
 def _vcall(obj: ctypes.c_void_p, index: int, restype, *argtypes):

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import zipfile
 import hashlib
+import ast
 
 import os
 import stat
@@ -14,6 +15,15 @@ from tools.build_portable import (architecture, check_elf, check_executable, cre
 
 
 class PortableTests(unittest.TestCase):
+    def test_build_and_packager_exclude_the_same_driver_libraries(self):
+        from tools.build_portable import FORBIDDEN
+
+        spec = Path(__file__).resolve().parents[1] / "tools" / "portable.spec"
+        assignment = next(node for node in ast.parse(spec.read_text()).body
+                          if isinstance(node, ast.Assign) and any(
+                              isinstance(target, ast.Name) and target.id == "driver_libs" for target in node.targets))
+        self.assertEqual(set(ast.literal_eval(assignment.value)), set(FORBIDDEN))
+
     def write_executable(self, path, machine):
         header = bytearray(64)
         header[:2] = b"MZ"
@@ -136,7 +146,8 @@ class LinuxPortableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.write_elf(root / "gputaskman", 0x3E)
-            for lib in ("libnvidia-ml.so.1", "libcuda.so.1", "libamd_smi.so.0", "libze_loader.so.1", "libze_intel_gpu.so.1"):
+            for lib in ("libnvidia-ml.so.1", "libcuda.so.1", "libamd_smi.so.0", "librocdxg.so.1",
+                        "libze_loader.so.1", "libze_intel_gpu.so.1"):
                 (root / lib).write_bytes(b"driver")
                 with self.assertRaisesRegex(ValueError, "must not be distributed"):
                     create_linux_archive(root, root / "output", "0.1.0", "x64")

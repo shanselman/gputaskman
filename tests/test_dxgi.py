@@ -266,3 +266,29 @@ class AdapterIdentityTests(unittest.TestCase):
                 Console(file=output, width=200).print(GpuTaskManager().render_device(s))
                 self.assertIn(STARDESK, output.getvalue())
                 self.assertIn(reason, output.getvalue())
+
+
+class AdapterDriverVersionTests(unittest.TestCase):
+    def test_reads_version_from_the_exact_device_driver_key(self):
+        registry = Mock()
+        device, driver = Mock(), Mock()
+        registry.OpenKey.side_effect = [contextlib.nullcontext(device), contextlib.nullcontext(driver)]
+        registry.HKEY_LOCAL_MACHINE = "HKLM"
+        registry.QueryValueEx.side_effect = [(r"{4d36e968-e325-11ce-bfc1-08002be10318}\0002", 1),
+                                             ("32.0.163.2", 1)]
+        with patch.dict(sys.modules, {"winreg": registry}):
+            version = dxgi.adapter_driver_version("PCI\\VEN_4D4F&DEV_1234\\DEVICE")
+
+        self.assertEqual(version, "32.0.163.2")
+        self.assertEqual(registry.OpenKey.call_args_list[0].args[1],
+                         r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_4D4F&DEV_1234\DEVICE")
+        self.assertEqual(registry.OpenKey.call_args_list[1].args[1],
+                         r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0002")
+
+    def test_unavailable_registry_values_remain_unknown(self):
+        registry = Mock()
+        registry.HKEY_LOCAL_MACHINE = "HKLM"
+        registry.OpenKey.side_effect = OSError("not available")
+        with patch.dict(sys.modules, {"winreg": registry}):
+            self.assertEqual(dxgi.adapter_driver_version("PCI\\VEN_4D4F&DEV_1234\\DEVICE"), "")
+        self.assertEqual(dxgi.adapter_driver_version(""), "")

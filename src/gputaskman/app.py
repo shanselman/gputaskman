@@ -19,7 +19,7 @@ from textual.worker import get_current_worker
 
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
 from .host import HostSample, HostSampler
-from .llm import gb, redact_cmdline
+from .llm import gb, redact_cmdline, server_gauge_text
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_shared_counters, has_wddm_counters,
@@ -568,7 +568,7 @@ class GpuTaskManager(App):
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
             legend.append(f"unattributed {gb(other)}  ")
-        if s.vram_used is not None and s.vram_total and not intel_memory_note(s):
+        if s.vram_used is not None and s.vram_total and s.shared_is_spill and not intel_memory_note(s):
             legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
         if s.shared_used is not None and s.shared_used > 64 << 20:
             legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")
@@ -925,8 +925,10 @@ class GpuTaskManager(App):
                 for m in sv.models[:4]:
                     if sv.kind == "lmstudio":
                         st.append(f"\n  loaded: {m['name']} {m.get('type') or ''} {m.get('quant') or ''} ctx {m.get('ctx') or '?'}")
-                    elif sv.kind == "vllm":
+                    elif sv.kind in ("vllm", "foundry-local"):
                         st.append(f"\n  API-reported model ID: {m['name']}")
+                if gauges := server_gauge_text(sv):
+                    st.append(f"\n  {gauges}")
                 out.append(st)
             for n in v.notes:
                 out.append(Text("• " + n, style="bold red" if n.startswith("!") else "grey70"))
