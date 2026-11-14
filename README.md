@@ -564,7 +564,10 @@ for a privacy consent prompt.
 - **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power,
   video-engine clock, and responsive history charts with an all-charts or single-metric view.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
-  engine activity, and detected runtimes such as CUDA, HIP, Vulkan, Direct3D, ggml and ONNX Runtime.
+  engine activity, and detected runtimes such as CUDA, HIP, SYCL, Level Zero, Vulkan, Direct3D,
+  ggml and ONNX Runtime. Intel PyTorch XPU libraries are recognized as PyTorch. Library tags
+  describe what is loaded; they do not prove model identity, GPU placement or training. The
+  Level Zero management loader alone does not classify a process as a compute or AI job.
 - **System RAM and CPU:** a panel plus RAM and CPU% columns, as the OS reports them: machine memory
   and load, never GPU memory (see [System RAM and CPU](#system-ram-and-cpu)).
 - **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
