@@ -70,7 +70,7 @@ def _nvml_devices() -> list[tuple[int, object]]:
 
 def enumerate_adapters() -> list[Adapter]:
     """NVIDIA GPUs through NVML, plus AMD GPUs through AMD SMI in WSL (or DRM on native Linux),
-    Intel GPUs through DRM, and Huawei Ascend NPUs through npu-smi."""
+    Intel and ARM Mali GPUs through DRM, and Huawei Ascend NPUs through npu-smi."""
     out = _nvml_adapters()
     if is_wsl():
         seen = {a.luid for a in out}
