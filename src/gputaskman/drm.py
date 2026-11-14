@@ -74,6 +74,7 @@ class DrmCard:
     xe_provider: object | None = field(default=None, repr=False)
     pmt_provider: object | None = field(default=None, repr=False)
     sysman_provider: object | None = field(default=None, repr=False)
+    host_device_feed: object | None = field(default=None, repr=False)
     sysman_retry_at: float = 0.0
     client_util: float | None = None
     client_video: float | None = None
@@ -571,14 +572,22 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
         dev.util_gpu = util
         dev.video = video
         if xe:
+            from .intel_host import CLIENT_USED, PCI_TOTAL, XE_TOTAL, XE_USED
+
+            if dev.mem_total is not None:
+                dev.metric_sources['mem_total'] = PCI_TOTAL
+            if dev.mem_used is not None:
+                dev.metric_sources['mem_used'] = CLIENT_USED
             provider = _xe_device(card)
             total, used = provider.memory()
             if total is not None:
                 card.integrated = False  # a queried local VRAM region also proves a small-BAR card is discrete
                 dev.mem_total = total
+                dev.metric_sources['mem_total'] = XE_TOTAL
                 dev.memory_note = "Xe query: driver-reported usable VRAM; "
                 if used is not None:
                     dev.mem_used = used
+                    dev.metric_sources['mem_used'] = XE_USED
                     dev.memory_note += "used VRAM is the driver's privileged device-wide estimate."
                 else:
                     dev.memory_note += ("used VRAM is the visible clients' resident sum (shared buffers may "
@@ -588,6 +597,9 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
                 dev.util_gpu, dev.util_kind = card.client_util, "visible DRM clients (estimated)"
             if dev.video is None and card.client_video is not None:
                 dev.video, dev.video_kind = card.client_video, "visible DRM clients (estimated)"
+            for field, kind in (('util_gpu', dev.util_kind), ('video', dev.video_kind)):
+                if getattr(dev, field) is not None:
+                    dev.metric_sources[field] = kind or 'Xe PMU engine counters'
             dev.power_limit_w = _microwatts(os.path.join(hwmon, "power1_cap")) if hwmon else None
             if hwmon:
                 try:
@@ -896,13 +908,14 @@ def intel_counter_status(card: DrmCard, nv=None) -> str:
     if pmu_fail is None and _INTEL_RAPL_FAIL is None:
         return ""
     parts = []
-    if pmu_fail == "denied":
+    load_unknown = nv is None or getattr(nv, 'util_gpu', None) is None or getattr(nv, 'video', None) is None
+    if pmu_fail == "denied" and load_unknown:
         para = _read("/proc/sys/kernel/perf_event_paranoid") or "?"
         parts.append(f"GPU and video load need perf privileges this user lacks (perf_event_paranoid={para})")
-    elif pmu_fail == "missing":
+    elif pmu_fail == "missing" and load_unknown:
         parts.append(("Xe device-wide load unavailable: " + _xe_device(card).pmu_error)
                      if card.driver == "xe" else "no readable supported i915 performance counters for this GPU")
-    elif pmu_fail == "shared":
+    elif pmu_fail == "shared" and load_unknown:
         parts.append("performance counters can't attribute load with multiple Intel GPUs")
     hwmon_power = nv is not None and nv.power_kind == "Board"
     if card.integrated and not hwmon_power:
@@ -984,6 +997,12 @@ def _xe_extra_telemetry(card: DrmCard, dev: DeviceTelemetry) -> None:
     dev.metric_sources.update(sources)
     if dev.mem_read_bps is not None or "mem_read_bps" in sources:
         dev.metric_status["util_mem"] = "busy-time percentage unavailable; see measured memory bandwidth"
+    if os.environ.get('GPUTASKMAN_DISABLE_HOST_FEED') != '1':
+        if card.host_device_feed is None:
+            from .intel_host import HostDeviceFeed
+
+            card.host_device_feed = HostDeviceFeed(card.pdev, card.vendor_id, card.device_id)
+        card.host_device_feed.apply(card, dev)
 
 
 def _vcn_major(device: str) -> int:
@@ -1418,7 +1437,7 @@ class DrmCounters:
     def close(self) -> None:
         """Close this collector's Intel PMU file descriptors, leaving other collectors alone."""
         for card in self.cards:
-            for provider in ("xe_provider", "pmt_provider", "sysman_provider"):
+            for provider in ("xe_provider", "pmt_provider", "sysman_provider", "host_device_feed"):
                 instance = getattr(card, provider)
                 if instance is not None:
                     instance.close()

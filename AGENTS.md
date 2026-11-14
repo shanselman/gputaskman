@@ -94,6 +94,17 @@ private per-process fdinfo bytes across 66 samples (README records the values). 
 accuracy has no independent reference comparison; Sysman's success path still has synthetic
 coverage only. The v0.4.1 integration replayed the capture without starting a new live workload.
 
+`intel_host.py` optionally imports fresh device-only samples from an explicitly started
+`tools/intel_host_reader.py`. Require owner-controlled regular files, matching boot/full PCI/vendor/device
+identity and a sample age at most six seconds. Never import process rows or fabricate unsupported
+Intel equivalents. Prefer current native measurements; only stronger host memory/load provenance
+may replace visible-client estimates. Keep byte-rate families coherent. Writer publication is atomic,
+single-publisher, and device-only; full process records go only to the caller's private stdout trace.
+The publisher disables host imports to prevent feedback and publishes a stopped marker on clean exit.
+No monitor code may elevate itself or auto-start the privileged reader. Public files under
+`/run/gputaskman` contain device telemetry only. Live handoff validation is pending; unit fixtures
+and recorded-sample UI integration do not substitute for running the reader on hardware.
+
 ## Where to change things
 
 | Change | Start in | Notes |

@@ -346,6 +346,45 @@ an access restriction from missing driver support. A first sample can be unknown
 second sample and its `metric_status` / `metric_sources`. Hardware validation under load still
 requires running a workload separately and comparing the measurements.
 
+For protected counters in a normal-user monitor, start the optional read-only host reader in
+one terminal, using the Python environment where gputaskman is installed:
+
+```bash
+sudo "$(command -v python)" tools/intel_host_reader.py --pci 0000:04:00.0
+# In another terminal, run gputaskman normally:
+gputaskman
+```
+
+The reader publishes device counters to `/run/gputaskman/intel-0000_04_00.0.json`. The monitor
+connects automatically for that PCI device. It checks the boot ID, full PCI address, vendor/device
+IDs, file ownership/permissions, schema and numeric values. Samples more than six seconds old,
+future-dated samples and stopped-reader markers are rejected with a reason. Files are replaced
+atomically, with one publisher per card. Device counters are readable locally; process/model
+details are excluded from this public file. No root service, socket server, driver changes or
+workload requests are installed or started by the monitor.
+
+Current native readings are preferred. A privileged host device-memory estimate or measured engine
+load can replace the weaker visible-client approximation, with its provenance retained. Counter
+families stay together, measured zeros remain zero, and unknowns stay unknown. Imported sources
+say `via host reader`; process attribution and private-client memory rules are unchanged. Only
+metrics actually reported by the card are forwarded. After changing the monitor's source code,
+restart its running UI so it can load this support. Stop the host reader with Ctrl+C; unsupported
+or inaccessible native counters then return to unknown with a host-reader availability reason.
+
+The default reader collects device sensors only. To also record the full standard snapshot,
+including process rows, use `--record` with a bounded duration and redirect stdout into a private
+file. Recording can run alongside an existing publisher without replacing or stopping it:
+
+```bash
+umask 077
+sudo "$(command -v python)" tools/intel_host_reader.py --pci 0000:04:00.0 --record --duration 180 > run.jsonl
+```
+
+For native-only diagnostics, set `GPUTASKMAN_DISABLE_HOST_FEED=1` on the monitor. The reader sets
+this itself so its output can never feed back into its own collection. The handoff's correctness
+and failure handling are fixture-tested; live end-to-end validation still requires starting this
+new reader on the GPU host.
+
 Live check, reported by the contributor and not repeated by the maintainer: Linux 6.12, an Arc A770 (discrete, 16 GiB
 BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and selectable with `--gpu`; the Arc showed
 per-process VRAM and engine load, and the TUI rendered both. The fdinfo formats of both drivers, taken from the kernel
@@ -1103,6 +1142,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Intel Xe device sysfs (labelled GPU temperature, board energy, primary-GT frequency/throttle) | 0.43 ms median, 0.79 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic | Every refresh for the selected Xe card; energy sampling needs two readings, primed at startup. Host process/fd scans were unavailable in this agent's process namespace and are not included |
 | Intel Xe extended provider (sensors, media clock, memory query and PMU fallback) | 1.56 ms median, 1.83 ms max across 30 warm reads on Arc Pro B65, Linux 7.0.0-43-generic, 2026-11-12 | Selected card only; render-node access was unavailable, so this measures cached query failure plus sysfs sensors. Successful device-query/PMU cost and host fd scans remain unmeasured |
 | Intel Xe PMT/config/Sysman additions | 2.11 ms first call; 0.268 ms median, 0.320 ms max across 30 warm reads on the same B65, 2026-11-12. Whole `read_device` with these additions: 1.52 ms median, 2.90 ms max | PMT read denied, upstream PCI config truncated, optional loader absent; these are cached failure-path costs including bridge identity checks. Successful PMT/Sysman cost remains unmeasured. PMT discovery/open retries every 5 s; failed Sysman initialization/domain discovery every 30 s. PMT reads at most three 16 KiB frames per endpoint per refresh; PCI config reads at most 256 bytes |
+| Intel host device-file handoff | 100 fixture reads of a saved B65 sample in a temporary directory, 2026-11-14: read/validate median 0.025 ms, max 0.082 ms; atomic publish median 0.030 ms, max 0.054 ms | Selected Xe card, once per refresh; at most 64 KiB. These are file/validation costs, not new live GPU measurements. The default reader reuses native device probes without process scans; `--record` adds the standard snapshot work. Live producer collection cost remains unmeasured |
 | AMD on WSL: AMD SMI discovery and device telemetry | Radeon 860M, WSL AMD SMI/ROCDXG 1.2.2, Windows driver 32.0.22050.1003: 71.87 ms first discovery; 30 warm device samples, median 6.27 ms, max 9.09 ms, no failures | Startup discovery and per-refresh telemetry; host attribution reuses the current `/dev/dxg` holder scan. Shared sessions keep later discovery/collectors from shutting down live handles; multiple physical adapters unmeasured |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |

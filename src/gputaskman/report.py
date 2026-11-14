@@ -118,7 +118,7 @@ def device_metric_notes(nv) -> str:
               "util_gpu": "GPU load", "video": "video load"}
     labels.update({"mem_read_bps": "memory reads", "mem_write_bps": "memory writes",
                    "mem_bandwidth_pct": "bandwidth utilization", "mem_bandwidth_max_bps": "maximum bandwidth",
-                   "sysman": "optional Sysman"})
+                   "sysman": "optional Sysman", "host_feed": "host GPU reader"})
     reasons: dict[str, list[str]] = {}
     for metric, reason in nv.metric_status.items():
         reasons.setdefault(reason, []).append(labels.get(metric, metric))
