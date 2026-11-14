@@ -27,6 +27,28 @@ def diff_main(argv: list[str]) -> None:
     print(json.dumps(result, indent=2) if args.json else to_text(result))
 
 
+def summary_main(argv: list[str]) -> None:
+    import json
+
+    ap = argparse.ArgumentParser(prog="gputaskman summary",
+                                 description="Summarize a gputaskman record file: average and peak readings per run, "
+                                             "and the top processes by peak measured VRAM.")
+    ap.add_argument("file", help="JSON Lines file written by gputaskman record")
+    ap.add_argument("--json", action="store_true", help="print the summary as JSON")
+    args = ap.parse_args(argv)
+
+    from .summary import load, summarize, to_text
+
+    try:
+        samples, skipped = load(args.file)
+    except (OSError, UnicodeError) as error:
+        ap.error(str(error))
+    if not samples:
+        ap.error(f"{args.file} has no gputaskman record snapshots")
+    result = summarize(samples, skipped)
+    print(json.dumps(result, indent=2) if args.json else to_text(result))
+
+
 def _check_platform() -> None:
     if sys.platform not in ("win32", "darwin") and not sys.platform.startswith("linux"):
         sys.exit("gputaskman supports Windows (WDDM), Linux/WSL (NVML, or amdgpu/Intel DRM) and macOS (Apple Silicon) only.")
@@ -88,9 +110,12 @@ def main() -> None:
         return diff_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "record":
         return record_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "summary":
+        return summary_main(sys.argv[2:])
     ap = argparse.ArgumentParser(prog="gputaskman", description="What's inside your GPU: per-process VRAM, engines, and LLM weights/KV-cache breakdown.",
                                  epilog="gputaskman diff BEFORE.json AFTER.json compares two --json snapshots; "
-                                        "gputaskman record -o FILE appends one --json snapshot per interval to FILE.")
+                                        "gputaskman record -o FILE appends one --json snapshot per interval to FILE; "
+                                        "gputaskman summary FILE summarizes a record file.")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit (no TUI)")
     ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit (implies --once)")
     ap.add_argument("--gpu", type=int, help="show only this GPU (TUI default: all; one-shot default: 0)")

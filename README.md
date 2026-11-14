@@ -516,6 +516,7 @@ uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
 uv run --locked gputaskman diff before.json after.json   # compare two --json snapshots
 uv run --locked gputaskman record -o session.jsonl --duration 300   # append one --json snapshot per second for 5 minutes
+uv run --locked gputaskman summary session.jsonl   # average and peak readings and top processes of a recording
 uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
 uv run --locked gputaskman --no-system  # don't sample system RAM/CPU: no panel, columns, or JSON section
 uv run --locked gputaskman --help
@@ -789,7 +790,27 @@ uv run --locked gputaskman diff first.json last.json
 ```
 
 On Linux, WSL, and macOS use `head -n 1 session.jsonl > first.json` and `tail -n 1 session.jsonl > last.json`.
-Replaying or summarizing a whole recording is not built yet.
+
+`summary` reads a whole recording and, like `diff`, collects nothing:
+
+```powershell
+uv run --locked gputaskman summary session.jsonl          # add --json for machine-readable output
+```
+
+It prints the GPU, the number of samples and the time span, then the average and peak of VRAM used,
+shared memory, GPU load, temperature and power (from the `device` section), plus system RAM and CPU
+when the file has a `system` section. Values are shown exactly as recorded, never capped: Windows can
+report a process's engine above 100% for one interval when work spills into the next. A `null` is
+skipped, not counted as 0, and the `READINGS` column says how many samples had a value; a metric
+with no readings is left out. The top processes are ranked by peak VRAM, using only the measured
+`vram_bytes` (rows with the same name are added together within each sample; WSL host rows stay
+separate), with their peak GPU load. A process that never had measured bytes shows `n/a`. Lines that
+do not parse, such as a last line cut short, are skipped and counted.
+
+Because `record` appends, one file can hold several recordings, and `summary` reports each run on its own.
+A new run starts when the GPU or backend changes, when `taken` goes backwards (a clock change), or when
+two samples are further apart than ten times the file's median interval or 60 seconds, whichever is longer.
+A slow sample or two stays inside its run; recording again tomorrow into the same file is a second run.
 
 ## How can it know what's inside?
 
@@ -1206,6 +1227,7 @@ downloads are bundled in this repository.
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
 | `diff.py` | Before/after comparison of two `--json` snapshots |
 | `record.py` | `gputaskman record`: appends one `--json` snapshot per interval to a JSON Lines file |
+| `summary.py` | `gputaskman summary`: average and peak readings and top processes per run of a record file |
 
 ## Next
 
@@ -1220,7 +1242,7 @@ downloads are bundled in this repository.
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
-- Replay and summaries of a `gputaskman record` file; today any one line works with `diff`.
+- Interactive replay of a `gputaskman record` file (`gputaskman summary` already summarizes one).
 - Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX
   app), correlated with the process's VRAM jump at load time.
 - Data-driven app adapters (settings path plus load/unload log patterns) once a second app needs one.
