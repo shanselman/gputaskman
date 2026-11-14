@@ -3,7 +3,7 @@
 **An `htop` for what's inside your GPU, not just how full it is.**
 
 Windows with NVIDIA/AMD telemetry and Intel WDDM activity, plus Linux and WSL support (NVIDIA
-everywhere, AMD and Intel on native Linux; see
+everywhere, AMD, Intel, and ARM Mali on native Linux; see
 [Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
@@ -131,6 +131,7 @@ skips the consistency check, so do not use it after changing dependencies.
 Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
 `gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
 or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver, an Intel GPU on `i915`,
+an ARM Mali GPU on `panfrost`/`panthor`,
 or a Huawei Ascend 310P with `npu-smi`). NVIDIA works natively, in containers, and in WSL:
 
 ```bash
@@ -198,6 +199,35 @@ against 1218 MiB, and `gputaskman diff` put the device change at +1.20 GB, again
 `-lv 4 --log-file` the exact CUDA0 buffer sizes (935 MB weights, 112 MB KV cache) matched the
 GGUF-based estimates. During generation the TUI showed the server at 96% GPU% against 95% from
 `nvidia-smi pmon`.
+
+**ARM Mali GPUs on native Linux** are detected with the upstream `panfrost` and `panthor` DRM
+drivers, including render-only devices. This does not support proprietary `/dev/mali*` drivers or
+older Mali GPUs using `lima`. ARM64 CPU support alone does not imply support for its GPU.
+No vendor library or extra package is needed.
+
+Mali uses unified system RAM, not dedicated VRAM. A client's `drm-resident-memory` bytes appear
+in the VRAM column only when its `drm-shared-memory` (and every other reported shared region)
+is zero, it has one visible holder, and it was opened through a render node. Otherwise VRAM is
+`n/a`; reachable system bytes remain available as `gtt_resident_bytes` in JSON and in the inspector,
+never summed. Missing or malformed counters are unknown, not zero. Device-wide used/total memory,
+free memory, and GPU load remain unavailable rather than treating system RAM as GPU capacity or
+summing clients. Shared and Paged stay unavailable.
+
+Per-process load uses `drm-engine-*` nanosecond deltas when supplied by the kernel. Older kernels
+or disabled profiling may provide no timing counters, so load stays `n/a` independently of memory.
+Profiling is administrator-managed; gputaskman never writes sysfs settings or enables it.
+Panfrost's kernel timings include CPU scheduling/interrupt latency, not just hardware execution time.
+Platform GPUs have no PCI address: processes are paired through the exact device's DRM nodes,
+not the driver name or GPU index. GPU model names remain generic when the driver exposes no model.
+Interfaces: [DRM fdinfo](https://docs.kernel.org/gpu/drm-usage-stats.html),
+[Panfrost](https://docs.kernel.org/gpu/panfrost.html), and
+[Panthor](https://docs.kernel.org/gpu/panthor.html).
+
+**Not validated on Mali hardware.** Tests use synthetic sysfs/fdinfo fixtures based on upstream
+kernel interfaces. To validate a board, include its GPU/SoC, distribution, kernel and driver,
+`gputaskman --list-gpus`, and `--json` output while idle and during a known graphics workload.
+Review process names and paths before sharing output. Compare the process counters with its
+`/proc/<pid>/fdinfo/<fd>`; unavailable counters are expected on older/vendor kernels.
 
 **AMD GPUs on native Linux** (the `amdgpu` driver) need no ROCm, AMD SMI, or extra package: the
 kernel already exposes what's needed.
@@ -1009,7 +1039,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | vLLM `/metrics` gauges | Whole probe (`/v1/models` + `/metrics` + parse) 1.37 ms median, 1.44 ms max in 30 loopback runs; `/metrics` GET alone 0.48 ms median; parsing a constructed 49 KB, 511-line exposition (all counters, 16 histograms) 0.41 ms median (Fedora Linux 45, i7-10850H, Python 3.13.18; no vLLM runtime/GPU workload) | One extra keyless GET inside the same cached probe, only after `/v1/models` succeeds; same timeout, cap, no redirects. Real vLLM payload size and latency unmeasured |
 | Foundry Local `/models/loaded` | 7.37 ms median, 15.93 ms max in 10 warm reads; first read 9.04 ms (Windows 11 ARM64 build 28000.3231, Snapdragon X2 Elite / Adreno X2-85, driver 32.0.163.2, Foundry Local 0.14.0 with Phi-3.5-mini loaded) | One GET to the daemon's own listener, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects, catalog requests or inference |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
-| AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
+| AMD, Intel, and Mali on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel and Mali not measured) | Every refresh, only when a DRM card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | AMD on WSL: AMD SMI discovery and device telemetry | Radeon 860M, WSL AMD SMI/ROCDXG 1.2.2, Windows driver 32.0.22050.1003: 71.87 ms first discovery; 30 warm device samples, median 6.27 ms, max 9.09 ms, no failures | Startup discovery and per-refresh telemetry; host attribution reuses the current `/dev/dxg` holder scan. Shared sessions keep later discovery/collectors from shutting down live handles; multiple physical adapters unmeasured |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
@@ -1191,7 +1221,7 @@ downloads are bundled in this repository.
 |---|---|
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
-| `drm.py` | AMD and Intel on native Linux: amdgpu and i915 cards and device readings from sysfs, per-process VRAM/GTT/engine time from DRM fdinfo |
+| `drm.py` | AMD, Intel, and Mali on native Linux: sysfs discovery, per-process resident memory/engine time from DRM fdinfo; device readings where available |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
