@@ -1942,20 +1942,17 @@ class IntelNoteTests(unittest.TestCase):
 
         return "\n".join(item.plain for item in GpuTaskManager().render_device(snapshot).renderables)
 
-    def test_text_carries_the_note_for_intel_only(self):
-        from gputaskman.report import INTEL_MEMORY_NOTE, to_text
+    def test_text_carries_no_memory_note_for_any_vendor(self):
+        from gputaskman.report import to_text
 
-        self.assertIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs")))
-        self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("AMD sysfs")))  # amdgpu has a device counter
-        # Nothing derived from the client sum or the window is shown (N/A used, unknown total): no caveat to make.
-        self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs", vram_used=None, vram_total=0)))
+        for source in ("Intel sysfs", "AMD sysfs"):
+            self.assertNotIn("PCI window", to_text(self._snapshot(source)))
+            self.assertNotIn("no device-wide counter", to_text(self._snapshot(source)))
 
-    def test_device_panel_carries_the_note_for_intel_only(self):
-        from gputaskman.report import INTEL_MEMORY_NOTE
-
-        self.assertIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("Intel sysfs")))
-        self.assertNotIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("AMD sysfs")))
-        self.assertNotIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("Intel sysfs", vram_used=None, vram_total=0)))
+    def test_device_panel_carries_no_memory_note_for_any_vendor(self):
+        for source in ("Intel sysfs", "AMD sysfs"):
+            self.assertNotIn("PCI window", self._panel(self._snapshot(source)))
+            self.assertNotIn("no device-wide counter", self._panel(self._snapshot(source)))
 
     def test_unknown_total_reads_n_a_and_free_is_left_out(self):
         from gputaskman.report import to_text
@@ -1973,15 +1970,15 @@ class IntelNoteTests(unittest.TestCase):
         self.assertNotRegex(panel, r"free \d")
         self.assertIn("free 12.00 GB", self._panel(self._snapshot("AMD sysfs")))  # AMD's total is a device counter
 
-    def test_json_says_unknown_and_carries_the_note(self):
-        from gputaskman.report import INTEL_MEMORY_NOTE, to_dict
+    def test_json_says_unknown_and_carries_no_note(self):
+        from gputaskman.report import to_dict
 
         unknown = to_dict(self._snapshot("Intel sysfs", vram_used=3 * GiB, vram_total=0))
         self.assertIsNone(unknown["vram_total"])  # unknown, not 0 bytes
         self.assertEqual(unknown["vram_used"], 3 * GiB)
-        self.assertEqual(unknown["memory_note"], INTEL_MEMORY_NOTE)
+        self.assertIsNone(unknown["memory_note"])
         window = to_dict(self._snapshot("Intel sysfs"))
-        self.assertEqual((window["vram_total"], window["memory_note"]), (16 * GiB, INTEL_MEMORY_NOTE))
+        self.assertEqual((window["vram_total"], window["memory_note"]), (16 * GiB, None))
         amd = to_dict(self._snapshot("AMD sysfs"))
         self.assertEqual((amd["vram_total"], amd["memory_note"]), (16 * GiB, None))
 

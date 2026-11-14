@@ -11,7 +11,14 @@ except ImportError:  # pragma: no cover
 
 
 def format_metric(value: float | int | None, spec: str = "", unit: str = "") -> str:
-    return f"{format(value, spec)}{unit}" if value is not None else "N/A"
+    """Format a device metric for display. Values with no explicit format spec render as integers: NVML
+    utilization is already integer, and Intel's PMU-derived utilization (a float) shows as '98%' rather
+    than a full-precision fraction. Explicit specs ('.0f', '.1f') and the JSON data path are unaffected."""
+    if value is None:
+        return "N/A"
+    if not spec and isinstance(value, float) and not value.is_integer():
+        value = round(value)
+    return f"{format(value, spec)}{unit}"
 
 
 _THROTTLE = {

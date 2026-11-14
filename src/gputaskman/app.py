@@ -23,7 +23,7 @@ from .llm import gb, redact_cmdline, server_gauge_text
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_shared_counters, has_wddm_counters,
-                     inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
+                     inferred_note, vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -552,7 +552,7 @@ class GpuTaskManager(App):
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
             legend.append(f"unattributed {gb(other)}  ")
-        if s.vram_used is not None and s.vram_total and s.shared_is_spill and not intel_memory_note(s):
+        if s.vram_used is not None and s.vram_total and s.shared_is_spill and s.nv and s.nv.source != "Intel sysfs":
             legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
         if s.shared_used is not None and s.shared_used > 64 << 20:
             legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")
@@ -562,8 +562,6 @@ class GpuTaskManager(App):
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
             legend.append("\n     " + METAL_NOTE, style="grey62")
-        if intel_memory_note(s):
-            legend.append("\n     " + intel_memory_note(s), style="grey62")
         if s.counter_status:
             legend.append("\n     " + s.counter_status, style="grey62")
         if s.process_status:

@@ -309,7 +309,7 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
             # the window (the file is binary -- its contents are not a number): >= 1 GiB marks a
             # discrete card's local VRAM, ~256 MB is an iGPU's system-memory window. The window is an
             # estimate of the card's memory, not a reading of it: resizable BAR rounds to a power of two and
-            # a partial BAR can be smaller than the card (report.INTEL_MEMORY_NOTE says so).
+            # a partial BAR can be smaller than the card.
             bar = 0
             for bar_file in ("resource2_wc", "resource2"):
                 try:
@@ -926,7 +926,7 @@ class DrmCounters:
         """Intel cards expose no device-wide memory sysfs: used memory is the sum of the card's
         clients' resident bytes, counted once per client even when several processes share it
         (buffers shared between clients can double-count, and clients that can't be inspected are missing;
-        report.INTEL_MEMORY_NOTE says so). With no readable client the sum is None -- unknown, not 0."""
+        see the CLI help for the full caveat). With no readable client the sum is None -- unknown, not 0."""
         for card in self.cards:
             if not card.intel:
                 continue
