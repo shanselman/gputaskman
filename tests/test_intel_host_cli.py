@@ -31,6 +31,8 @@ class HostReaderCliTests(unittest.TestCase):
                 patch.object(Path, 'glob', return_value=[]), \
                 patch.object(drm, 'read_device', side_effect=read) as reads, \
                 patch.object(drm, 'DrmCounters') as counters, \
+                patch.object(audit.os, 'uname', return_value=Mock(release='test-kernel'), create=True), \
+                patch.object(audit.os, 'geteuid', return_value=1000, create=True), \
                 patch.object(audit.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()) as output:
             audit.main()
         import json
