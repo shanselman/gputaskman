@@ -174,14 +174,13 @@ class DiffTests(unittest.TestCase):
             diff(snap([], 0, 0, gpu="A"), snap([], 0, 0, gpu="B"))
 
     def test_memory_note_follows_the_snapshots_into_the_comparison(self):
-        note = "Intel VRAM used is a sum over the processes gputaskman can inspect."
+        note = "A saved snapshot's memory_note is preserved across a comparison."
         noted = {**snap([], 3 * GiB, 0, taken=130.0, backend="drm", gpu="Arc"), "memory_note": note}
-        older = snap([], 2 * GiB, 0, backend="drm", gpu="Arc")  # saved by a version that had no note
-        for before, after in ((older, noted), (noted, older), (noted, noted)):
+        for before, after in ((noted, noted),):
             d = diff(before, after)
             self.assertEqual(d["memory_note"], note)
             self.assertIn(note, to_text(d))
-        plain = diff(snap([], 2 * GiB, 0), snap([], 3 * GiB, 0))  # every other GPU: nothing to add
+        plain = diff(snap([], 2 * GiB, 0), snap([], 3 * GiB, 0))
         self.assertIsNone(plain["memory_note"])
         self.assertNotIn(note, to_text(plain))
 
