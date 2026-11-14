@@ -516,6 +516,7 @@ uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
 uv run --locked gputaskman diff before.json after.json   # compare two --json snapshots
 uv run --locked gputaskman record -o session.jsonl --duration 300   # append one --json snapshot per second for 5 minutes
+uv run --locked gputaskman replay session.jsonl                     # play that recording back, offline
 uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
 uv run --locked gputaskman --no-system  # don't sample system RAM/CPU: no panel, columns, or JSON section
 uv run --locked gputaskman --help
@@ -789,7 +790,32 @@ uv run --locked gputaskman diff first.json last.json
 ```
 
 On Linux, WSL, and macOS use `head -n 1 session.jsonl > first.json` and `tail -n 1 session.jsonl > last.json`.
-Replaying or summarizing a whole recording is not built yet.
+
+### Replaying a recording
+
+`replay` reads a file from `record` and shows it in the terminal. It does not sample the GPU, probe APIs, or write the file.
+
+```powershell
+uv run --locked gputaskman record -o session.jsonl --duration 60
+uv run --locked gputaskman replay session.jsonl
+```
+
+Playback starts paused on the first snapshot.
+
+| Key | Action |
+|---|---|
+| Space | Play / pause |
+| Right / Left | Next / previous snapshot |
+| Home / End | First / last snapshot |
+| `+` / `-` | Faster / slower: 0.5×, 1×, 2×, 4× (starts at 1×) |
+| `r` | Restart from the first snapshot and play |
+| `q` | Quit |
+
+The file is JSON Lines: each line is one `--json` snapshot, and `taken` is the sample time in Unix seconds. The screen shows that Unix time and, beside it, the same instant on this computer. When every snapshot has a finite `taken` and those times increase, play waits the recorded gap divided by the speed. The file does not store `--interval`. If a timestamp is missing or the times do not increase, play waits one second per snapshot at 1× and the screen says that interval is not recorded time. Play pauses on the last snapshot and does not loop. A long gap in `taken` (a recording that was stopped and later appended) is waited out; the arrow keys skip it.
+
+A last line cut short by a crash is skipped. Any other line that is not a snapshot is skipped and reported, and is not turned into a frame. An empty file, a missing file, or a file with no complete snapshot is an error. `null` device fields stay `N/A`. Process memory uses the recorded measured bytes, or the inferred bytes with the same `*` / `?` marks as the live view. Inferred rows are not added into the device total.
+
+`record` stores one GPU per snapshot. A file can still hold more than one when recordings were appended; the screen follows the snapshot on show and says how many GPUs the file contains. Replay does not draw the live history charts or the process inspector. It shows the file as it was when replay opened it, so samples appended later are not picked up until replay is started again. Summaries of a whole recording are still not built.
 
 ## How can it know what's inside?
 
@@ -1206,6 +1232,7 @@ downloads are bundled in this repository.
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
 | `diff.py` | Before/after comparison of two `--json` snapshots |
 | `record.py` | `gputaskman record`: appends one `--json` snapshot per interval to a JSON Lines file |
+| `replay.py` | `gputaskman replay`: offline playback of a `record` JSON Lines file |
 
 ## Next
 
@@ -1220,7 +1247,7 @@ downloads are bundled in this repository.
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
-- Replay and summaries of a `gputaskman record` file; today any one line works with `diff`.
+- Summaries of a `gputaskman record` file. `replay` plays one back; any one line still works with `diff`.
 - Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX
   app), correlated with the process's VRAM jump at load time.
 - Data-driven app adapters (settings path plus load/unload log patterns) once a second app needs one.

@@ -83,14 +83,38 @@ def record_main(argv: list[str]) -> None:
     print(f"Recorded {count} sample(s) to {args.output}", file=sys.stderr)
 
 
+def replay_main(argv: list[str]) -> None:
+    ap = argparse.ArgumentParser(prog="gputaskman replay",
+                                 description="Play a gputaskman record file in the terminal. Offline: nothing is read from the GPU.")
+    ap.add_argument("file", help="JSON Lines file written by gputaskman record")
+    args = ap.parse_args(argv)
+    from .replay import RecordingError, load_recording, run_replay
+
+    try:
+        recording = load_recording(args.file)
+    except RecordingError as error:
+        ap.error(str(error))
+    try:
+        run_replay(recording)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        recording.close()
+    for warning in recording.warnings:
+        print(warning, file=sys.stderr)
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "diff":
         return diff_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "record":
         return record_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "replay":
+        return replay_main(sys.argv[2:])
     ap = argparse.ArgumentParser(prog="gputaskman", description="What's inside your GPU: per-process VRAM, engines, and LLM weights/KV-cache breakdown.",
                                  epilog="gputaskman diff BEFORE.json AFTER.json compares two --json snapshots; "
-                                        "gputaskman record -o FILE appends one --json snapshot per interval to FILE.")
+                                        "gputaskman record -o FILE appends one --json snapshot per interval to FILE; "
+                                        "gputaskman replay FILE plays a recording back offline.")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit (no TUI)")
     ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit (implies --once)")
     ap.add_argument("--gpu", type=int, help="show only this GPU (TUI default: all; one-shot default: 0)")
