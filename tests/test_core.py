@@ -2480,5 +2480,19 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.paused)
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+class FormatMetricTests(unittest.TestCase):
+    """Device metrics render as integers by default; explicit specs and the JSON path are unaffected."""
+
+    def test_intel_style_float_shows_no_decimals(self):
+        from gputaskman.nvml import format_metric
+
+        self.assertEqual(format_metric(98.06775140236023, unit="%"), "98%")
+
+    def test_explicit_spec_and_n_none_untouched(self):
+        from gputaskman.nvml import format_metric
+
+        self.assertEqual(format_metric(98.06775140236023, ".1f", "%"), "98.1%")  # caller asked for a decimal
+        self.assertEqual(format_metric(3, unit="C"), "3C")  # int stays int
+        self.assertEqual(format_metric(None), "N/A")
+
