@@ -69,11 +69,47 @@ cli.py record ──► record.py: appends one --json snapshot per interval (Col
 
 The backend is chosen at import time in `collector.py`: `BACKEND` is `wddm` on Windows, `nvml` on
 native Linux, `wsl` under WSL, and `metal` on macOS. On native Linux, `Collector.backend` becomes `drm`
-when the selected GPU is an amdgpu or Intel i915 card (device readings from sysfs, processes from DRM
-fdinfo). An Intel card has no device-wide memory counter: its VRAM used is a sum over visible clients and
-its total is a PCI window size, so both carry `report.INTEL_MEMORY_NOTE`, and a total of 0 is unknown. One-shot
+when the selected GPU is an amdgpu or Intel i915/xe card (processes from DRM fdinfo). Xe adds the
+read-only device-query/PMU provider in `xe.py`: usable VRAM is driver-reported, and its used-memory
+estimate requires effective CAP_PERFMON or CAP_SYS_ADMIN (an unprivileged zero is unknown). Otherwise
+Intel VRAM used is a visible-client sum and total a PCI window estimate. Every case carries its
+`memory_note`; a total of 0 is unknown. Xe's fallback load covers visible clients only and must retain
+`util_kind`/`video_kind` labels. Partial scans or incomplete client intervals cannot supply fallback load. One-shot
 output (`--once`, `--json`) uses `scan_budget=None` to
 identify everything immediately; the TUI spreads scans across refreshes.
+
+Xe's optional traffic providers are `intel_pmt.py` (exact PCI-path/GUID-matched BMG G31 PMT)
+and `sysman.py` (native 64-bit Linux, system-installed Level Zero loader, `zesInit`, full PCI
+BDF match). Keep byte-rate families from one provider together, preserve first/reset/denied
+samples as unknown, and never substitute PCI advertised maxima or stale sysfs defaults for
+live Link Status. B65 (`8086:e222`) uses the host-facing Intel `e2ff` bridge above its `e2f0`
+downstream bridge; require those identities before reading its config, never fall back to its
+internal GPU endpoint. `mem_read_bps` / `mem_write_bps` are measured traffic, not allocation;
+`mem_bandwidth_max_bps` is reported and `mem_bandwidth_pct` is derived. They never populate
+NVML `util_mem` or process-memory totals. Retain `metric_sources` and optional-runtime failure
+reasons. Close PMT descriptors with the owning collector. `tools/check_intel_telemetry.py`
+performs a read-only two-sample host audit; it starts no model or process scan. A contributor's
+administrator-run 79.7B workload on B65 populated native PMT, Xe memory queries, PMU load and
+private per-process fdinfo bytes across 66 samples (README records the values). Absolute counter
+accuracy has no independent reference comparison; Sysman's success path still has synthetic
+coverage only. The v0.4.1 integration replayed the capture without starting a new live workload.
+
+`intel_host.py` optionally imports fresh device-only samples from an explicitly started
+`tools/intel_host_reader.py`. Require owner-controlled regular files, matching boot/full PCI/vendor/device
+identity and a sample age at most six seconds. Never import process rows or fabricate unsupported
+Intel equivalents. Prefer current native measurements; only stronger host memory/load provenance
+may replace visible-client estimates. Keep byte-rate families coherent. Writer publication is atomic,
+single-publisher, and device-only; full process records go only to the caller's private stdout trace.
+The publisher disables host imports to prevent feedback and publishes a stopped marker on clean exit.
+No monitor code may elevate itself or auto-start the privileged reader. Public files under
+`/run/gputaskman` contain device telemetry only. On 2026-11-14 the contributor started the reader
+on the same B65 (`xe`, Linux 7.0.0-43-generic); ten normal-user JSON reports consumed ten distinct,
+fresh samples and populated all supported device metrics, with protected counters labeled
+`via host reader`. This validates the live handoff, not independent counter accuracy or a new
+load test. Unit fixtures and recorded-sample UI integration do not validate additional hardware.
+Auxiliary Xe temperatures retain their hwmon labels in `temperature_sensors_c` (Celsius).
+Omit unreadable sensors, preserve measured zero, and summarize only the channels actually read;
+do not replace the driver's aggregate VRAM temperature with a derived channel maximum.
 
 ## Where to change things
 
@@ -149,9 +185,11 @@ RTX 3060 Ti, macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run 
 bare-metal Linux with an amdgpu Radeon RX 9070-series card plus a Radeon 610M (DRM path), and
 bare-metal Linux on a laptop with an RTX 4050 Laptop GPU plus an AMD Phoenix iGPU (NVML and DRM side by side).
 Intel i915 (an Arc A770 with resizable BAR plus a UHD 730) was validated by a contributor, not repeated by
-the maintainer.
+the maintainer. A contributor's Arc Pro B65 (`xe`, Linux 7.0.0-43-generic) ran a 79.7B Ollama
+workload with administrator monitoring: device and process counters populated in 66 samples.
 Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, NVIDIA TCC-mode GPUs
 (run `gputaskman --list-gpus` and `gputaskman --once --gpu N`, then compare device and per-process VRAM
-with `nvidia-smi`; the code path was exercised against a WDDM GPU only), Intel `xe` and Arc cards
-without resizable BAR, and GPU-backed WinML on Copilot+ PCs. Planned work is listed under **Next** in the
+with `nvidia-smi`; the code path was exercised against a WDDM GPU only), additional Intel `xe`
+cards/workloads beyond that B65 check, Arc cards without resizable BAR, and GPU-backed WinML on Copilot+ PCs.
+Planned work is listed under **Next** in the
 README.

@@ -389,14 +389,15 @@ class Collector:
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
-        used = int(a.dedicated) if a and a.dedicated is not None else (
-            int(nv.mem_used) if BACKEND != "wddm" and nv and nv.mem_used is not None else None)
+        used = (nv.mem_used if nv and nv.source == "Intel sysfs" and nv.memory_note else
+                int(a.dedicated) if a and a.dedicated is not None else
+                int(nv.mem_used) if BACKEND != "wddm" and nv and nv.mem_used is not None else None)
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
             driver=(self._mac_driver
                     or (self.amdsmi.driver if nv and nv.source == "AMD SMI" else "")
                     or (self.nvml.driver if nv and nv.source == "NVML" else "")
-                    or (f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else "")
+                    or (f"kernel {os.uname().release}" if nv and nv.source in ("AMD sysfs", "Intel sysfs") else "")
                     or getattr(self, "_windows_driver", "")),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
             vram_used=used,

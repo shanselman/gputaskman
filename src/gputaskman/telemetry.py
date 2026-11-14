@@ -38,3 +38,15 @@ class DeviceTelemetry:
     throttle: list[str] | None = field(default_factory=list)  # None = unreadable (unknown), [] = readable and idle
     compute_cap: str = ""
     source: str = "NVML"
+    fan_rpm: int | None = None
+    vram_temp: float | None = None
+    temperature_sensors_c: dict[str, float] = field(default_factory=dict)  # named auxiliary hwmon sensors, Celsius
+    util_kind: str = ""  # nonempty when load covers only the visible DRM clients
+    video_kind: str = ""
+    memory_note: str = ""  # provider-specific provenance of device memory figures
+    metric_status: dict[str, str] = field(default_factory=dict)  # unavailable metric -> reason
+    metric_sources: dict[str, str] = field(default_factory=dict)  # optional metric -> interface/provenance
+    mem_read_bps: float | None = None  # measured memory traffic, bytes/sec; not allocated bytes
+    mem_write_bps: float | None = None
+    mem_bandwidth_max_bps: int | None = None  # driver/firmware-reported current limit
+    mem_bandwidth_pct: float | None = None  # derived traffic / reported limit; not NVML's busy-time %

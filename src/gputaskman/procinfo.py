@@ -21,7 +21,8 @@ RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
     ("llama.cpp", ("llama.dll", "libllama*.dll", "llama-*.dll", "llm_engine*", "libllama*.so", "libllama*.dylib")),
     ("whisper.cpp", ("whisper*.dll", "libwhisper*.so", "libwhisper*.dylib")),
     ("ggml", ("ggml*.dll", "libggml*.so", "libggml*.dylib")),
-    ("PyTorch", ("torch_cuda*.dll", "torch_cpu.dll", "libtorch_cuda*.so", "libtorch_cpu.so", "libtorch_cpu.dylib")),
+    ("PyTorch", ("torch_cuda*.dll", "torch_xpu.dll", "torch_cpu.dll", "libtorch_cuda*.so", "libtorch_xpu*.so",
+                 "libtorch_cpu.so", "libtorch_cpu.dylib")),
     ("MLX", ("libmlx*.dylib",)),
     ("TensorRT", ("nvinfer*.dll", "libnvinfer*.so")),
     ("ONNX RT", ("onnxruntime*.dll", "libonnxruntime*.so", "libonnxruntime*.dylib")),
@@ -30,6 +31,8 @@ RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
     ("cuDNN", ("cudnn*.dll", "libcudnn*.so")),
     ("CUDA", ("nvcuda.dll", "nvcuda64.dll", "cudart64_*.dll", "cublas64_*.dll",
               "libcuda.so", "libcudart.so", "libcublas.so")),
+    ("SYCL", ("libsycl.so", "libsycl-preview.so")),
+    ("Level Zero", ("ze_loader.dll", "libze_loader.so")),
     ("Metal", ("agxmetal*",)),  # the Apple GPU's Metal driver bundle, mapped by every Metal process
     ("Vulkan", ("vulkan-1.dll", "libvulkan.so", "libmoltenvk.dylib")),
     ("D3D12", ("d3d12core.dll", "libd3d12core.so")),
@@ -608,7 +611,7 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "browser"
     if video or "NVENC" in d.runtimes:
         return "video"
-    if "CUDA" in d.runtimes or "HIP" in d.runtimes:
+    if any(runtime in d.runtimes for runtime in ("CUDA", "HIP", "SYCL")):
         return "compute"
     if ("D3D12" in d.runtimes or "Vulkan" in d.runtimes) and engines.get("3d", 0) > 10:
         return "3D/game"

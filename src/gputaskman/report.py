@@ -90,7 +90,7 @@ METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows 
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
 INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of memory resident in the processes gputaskman can inspect "
-                     "(the driver has no device-wide counter): local memory on a discrete card, system memory on "
+                     "(no usable device-wide memory query): local memory on a discrete card, system memory on "
                      "an integrated GPU. Buffers shared between processes can be counted twice, and kernel-owned "
                      "memory and processes it can't inspect are missing. The total is the size of the card's "
                      "local-memory PCI window, an estimate that can differ from its memory (0 on an integrated "
@@ -98,15 +98,62 @@ INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of memory resident in the proce
 
 
 def intel_memory_note(s: Snapshot) -> str:
-    """Intel's device VRAM used is a sum over visible DRM clients and its total a PCI window size: neither is a
-    device counter, so the output says so whenever it shows either."""
-    return INTEL_MEMORY_NOTE if (s.backend == "drm" and s.nv and s.nv.source == "Intel sysfs"
-                                 and (s.vram_used is not None or s.vram_total)) else ""
+    """Keep queried Xe memory and the visible-client/PCI-window fallback labelled in every output."""
+    if s.backend == "drm" and s.nv and s.nv.source == "Intel sysfs" and (s.vram_used is not None or s.vram_total):
+        return s.nv.memory_note or INTEL_MEMORY_NOTE
+    return ""
 
 
 def vram_total_label(s: Snapshot) -> str:
     """A total of 0 means unknown (an Intel iGPU, or a card whose memory window can't be read), not 0 bytes."""
     return gb(s.vram_total) if s.vram_total else "N/A"
+
+
+def device_metric_notes(nv) -> str:
+    """Group unavailable metrics by reason for the text and dashboard views."""
+    labels = {"util_mem": "memory activity", "enc": "encode", "dec": "decode",
+              "pstate": "P-state", "compute_cap": "CUDA capability", "fan": "fan %",
+              "pcie_rx_kbs": "PCIe RX", "pcie_tx_kbs": "PCIe TX", "pcie_gen": "PCIe gen",
+              "pcie_width": "PCIe width", "mem_clock": "memory clock", "memory_query": "memory query",
+              "util_gpu": "GPU load", "video": "video load"}
+    labels.update({"mem_read_bps": "memory reads", "mem_write_bps": "memory writes",
+                   "mem_bandwidth_pct": "bandwidth utilization", "mem_bandwidth_max_bps": "maximum bandwidth",
+                   "sysman": "optional Sysman", "host_feed": "host GPU reader"})
+    reasons: dict[str, list[str]] = {}
+    for metric, reason in nv.metric_status.items():
+        reasons.setdefault(reason, []).append(labels.get(metric, metric))
+    return "; ".join(f"{'/'.join(names)}: {reason}" for reason, names in reasons.items())
+
+
+def auxiliary_temperature_label(nv) -> str:
+    sensors = nv.temperature_sensors_c
+    parts = [f"{label} {sensors[key]:g}°C" for key, label in
+             (("mctrl", "Memory controller"), ("pcie", "PCIe")) if key in sensors]
+    channels = {key: value for key, value in sensors.items() if key.startswith("vram_ch_")}
+    if channels:
+        hottest = max(channels, key=channels.get)
+        parts.append(f"VRAM channels: hottest {hottest.removeprefix('vram_ch_')} {channels[hottest]:g}°C ({len(channels)} read)")
+    return "  ".join(parts)
+
+
+def memory_bandwidth_label(nv) -> str:
+    if nv.mem_read_bps is None or nv.mem_write_bps is None:
+        return ""
+    text = f"Memory BW read {nv.mem_read_bps / 1e9:.2f} / write {nv.mem_write_bps / 1e9:.2f} GB/s"
+    if nv.mem_bandwidth_max_bps is not None:
+        text += f" / max {nv.mem_bandwidth_max_bps / 1e9:.2f} GB/s"
+    if nv.mem_bandwidth_pct is not None:
+        text += f" ({nv.mem_bandwidth_pct:.1f}%)"
+    source = nv.metric_sources.get("mem_read_bps")
+    return text + (f" [{source}]" if source else "")
+
+
+def device_metric_sources(nv) -> str:
+    grouped = {}
+    for metric, source in nv.metric_sources.items():
+        if getattr(nv, metric, None) is not None:
+            grouped.setdefault(source, []).append(metric)
+    return "; ".join(f"{', '.join(metrics)}: {source}" for source, metrics in grouped.items())
 
 
 def to_dict(s: Snapshot) -> dict:
@@ -207,13 +254,42 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                  f"SM {format_metric(nv.sm_clock)}")
         power_kind = f" ({nv.power_kind})" if nv.power_kind else ""
         temp_label = f" ({nv.temp_kind})" if nv.temp_kind else ""
-        out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
+        util_kind = f" ({nv.util_kind})" if nv.util_kind else ""
+        activity = "" if is_intel else f"mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
+        state = "" if is_intel else f"{pstate}  "
+        traffic = (f"PCIe rx {format_metric(rx, '.1f')} MiB/s tx {format_metric(tx, '.1f')} MiB/s"
+                   if is_intel and (rx is not None or tx is not None) else "" if is_intel else
+                   f"PCIe rx {format_metric(rx, '.0f')} MB/s tx {format_metric(tx, '.0f')} MB/s")
+        out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}{util_kind}  {activity}"
                    f"{format_metric(nv.temp, unit='C')}{temp_label}  {format_metric(nv.power_w, '.0f')}/"
-                   f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
+                   f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {state}"
                    f"{clock} MHz  "
                    f"video {format_metric(nv.video_clock)} MHz  "
-                   f"PCIe rx {format_metric(rx, '.0f')} MB/s "
-                   f"tx {format_metric(tx, '.0f')} MB/s")
+                   f"{traffic}")
+        sensors = []
+        if nv.fan_rpm is not None:
+            sensors.append(f"fan {nv.fan_rpm} RPM")
+        if nv.vram_temp is not None:
+            sensors.append(f"VRAM temperature {format_metric(nv.vram_temp, unit='C')}")
+        if nv.video is not None:
+            kind = f" ({nv.video_kind})" if nv.video_kind else ""
+            sensors.append(f"video {format_metric(nv.video, unit='%')}{kind}")
+        if sensors:
+            out.append("  ".join(sensors))
+        if auxiliary_temperature_label(nv):
+            out.append(auxiliary_temperature_label(nv))
+        if memory_bandwidth_label(nv):
+            out.append(memory_bandwidth_label(nv))
+        if nv.mem_clock is not None and is_intel:
+            out.append(f"Memory clock {format_metric(nv.mem_clock)} MHz")
+        if nv.fan is not None and is_intel:
+            out.append(f"Fan {nv.fan}%")
+        if is_intel and nv.pcie_gen is not None and nv.pcie_width is not None:
+            out.append(f"PCIe gen{nv.pcie_gen} x{nv.pcie_width}")
+        if nv.metric_status:
+            out.append("Metric availability: " + device_metric_notes(nv))
+        if device_metric_sources(nv):
+            out.append("Metric sources: " + device_metric_sources(nv))
     out.append("")
     shown = s.procs[:limit]
     w = max([7] + [len(p.pid_label) for p in shown])  # host PIDs like W:120880 are wider

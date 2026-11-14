@@ -1299,13 +1299,13 @@ class IntelFdinfoTests(unittest.TestCase):
         text = "\n".join(line for line in I915_FDINFO.splitlines() if "stolen-local0" not in line)
         self.assertEqual(drm.parse_fdinfo(text)["vram"], 2048 * MiB)
 
-    def test_xe_client_reports_neither_memory_nor_load(self):
+    def test_xe_client_reports_memory_and_paired_gpu_ticks(self):
         info = drm.parse_fdinfo(XE_FDINFO)
         self.assertEqual((info["driver"], info["client_id"], info["pdev"]), ("xe", 3, "0000:03:00.0"))
-        # xe calls its regions system/gtt/vram0/stolen and reports drm-cycles-*; none of that is decoded yet.
-        for field in ("vram", "gtt", "shared", "engines"):
-            with self.subTest(field=field):
-                self.assertIsNone(info[field])
+        self.assertEqual((info["vram"], info["gtt"], info["cpu"], info["shared"]),
+                         (23992 * KiB, 192 * KiB, 0, 16 * MiB))
+        self.assertIsNone(info["engines"])  # GPU ticks must never masquerade as nanoseconds
+        self.assertEqual(info["cycles"]["rcs"], (28257900, 7655183225))
 
 
 class IntelBarTests(unittest.TestCase):
@@ -1407,7 +1407,7 @@ class IntelScanTests(unittest.TestCase):
             self.assertEqual(g.gpu_pct, 50.0)
             self.assertEqual((g.drm_reason, g.dedicated, g.shared), ("", 256 * MiB, 8 * MiB))
 
-    def test_xe_client_is_unknown_not_idle_and_not_empty(self):
+    def test_xe_shared_buffers_have_measured_residency_but_no_private_charge(self):
         with tempfile.TemporaryDirectory() as tmp:
             card, proc, counters = self._setup(tmp, driver="xe")
             _write_fd(proc, 100, 5, XE_FDINFO)
@@ -1415,11 +1415,11 @@ class IntelScanTests(unittest.TestCase):
             self.clock.tick()
             procs, adapters = counters.sample()
             g = procs[card.key][100]
-            self.assertEqual(g.drm_reason, drm.REASON_LEGACY)
-            self.assertNotIn("engine", g.available)  # drm-cycles-* is not decoded: unknown, not 0%
+            self.assertEqual(g.drm_reason, drm.REASON_SHARED_BUFFERS)
+            self.assertNotIn("engine", g.available)  # unchanged total ticks: no measured interval
             self.assertNotIn("dedicated", g.available)
-            self.assertIsNone(g.resident_vram)
-            self.assertIsNone(adapters[card.key].dedicated)  # and so is the card's used memory
+            self.assertEqual(g.resident_vram, 23992 * KiB)
+            self.assertEqual(adapters[card.key].dedicated, 23992 * KiB)
 
     def test_unknown_engine_load_does_not_hide_measured_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
