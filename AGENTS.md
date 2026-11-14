@@ -102,8 +102,11 @@ may replace visible-client estimates. Keep byte-rate families coherent. Writer p
 single-publisher, and device-only; full process records go only to the caller's private stdout trace.
 The publisher disables host imports to prevent feedback and publishes a stopped marker on clean exit.
 No monitor code may elevate itself or auto-start the privileged reader. Public files under
-`/run/gputaskman` contain device telemetry only. Live handoff validation is pending; unit fixtures
-and recorded-sample UI integration do not substitute for running the reader on hardware.
+`/run/gputaskman` contain device telemetry only. On 2026-11-14 the contributor started the reader
+on the same B65 (`xe`, Linux 7.0.0-43-generic); ten normal-user JSON reports consumed ten distinct,
+fresh samples and populated all supported device metrics, with protected counters labeled
+`via host reader`. This validates the live handoff, not independent counter accuracy or a new
+load test. Unit fixtures and recorded-sample UI integration do not validate additional hardware.
 
 ## Where to change things
 

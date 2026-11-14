@@ -381,9 +381,20 @@ sudo "$(command -v python)" tools/intel_host_reader.py --pci 0000:04:00.0 --reco
 ```
 
 For native-only diagnostics, set `GPUTASKMAN_DISABLE_HOST_FEED=1` on the monitor. The reader sets
-this itself so its output can never feed back into its own collection. The handoff's correctness
-and failure handling are fixture-tested; live end-to-end validation still requires starting this
-new reader on the GPU host.
+this itself so its output can never feed back into its own collection. Failure handling is
+fixture-tested, including stale/stopped output, wrong identities, unsafe files and measured zeros.
+
+Live handoff check on 2026-11-14: the contributor explicitly started the device-only host reader
+on the same Arc Pro B65 (`8086:e222`, `xe`, Linux 7.0.0-43-generic). Ten normal-user (UID 1000)
+`gputaskman --json --no-system` launches consumed ten distinct, fresh publisher samples. All ten
+reports populated GPU/video load, usable/device-used VRAM, memory read/write bandwidth and
+maximum/ratio, PCIe RX/TX and generation/width, GPU/memory/media clocks, GPU/VRAM temperatures,
+board power, power cap and fan RPM. Protected counters retained `via host reader` sources;
+memory frequency was 9500 MHz, reported maximum bandwidth 608 GB/s, and the host-facing link
+Gen4 x4 throughout. These observations validate the running reader-to-report connection, not a
+new load test or an independent calibration. Fan RPM included a zero readback, preserved as
+reported. Fan percentage remains unavailable without a maximum-RPM sensor; separate encode/decode
+load, NVIDIA memory busy time and NVIDIA-specific fields are not fabricated.
 
 Live check, reported by the contributor and not repeated by the maintainer: Linux 6.12, an Arc A770 (discrete, 16 GiB
 BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and selectable with `--gpu`; the Arc showed
