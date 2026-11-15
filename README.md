@@ -1290,6 +1290,13 @@ downloads are bundled in this repository.
 - Data-driven app adapters (settings path plus load/unload log patterns) once a second app needs one.
 - Optional ETW / runtime instrumentation for allocation lifetime and residency detail.
 
+## Companion tools
+
+- [gtm-pilot](https://github.com/Madhur-Prakash/gtm-pilot) (unofficial, `uv tool install gtm-pilot`):
+  a menu that runs gputaskman's commands for you. Pick a GPU and interval from lists, record with
+  progress, summarize and replay recordings, and measure a change with before/after snapshots and
+  `diff`. It reads nothing itself; every number comes from gputaskman.
+
 ## License
 
 [MIT](LICENSE).
