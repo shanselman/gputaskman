@@ -206,6 +206,8 @@ class ServerInfo:
     requests_running: int | None = None
     requests_waiting: int | None = None
     kv_cache_usage: float | None = None  # fraction 0-1 of KV-cache pool, not of GPU memory
+    # vLLM only: last token-counter reading, the baseline for the next probe's rates. Kept out of JSON.
+    token_sample: TokenSample | None = field(default=None, repr=False, compare=False, metadata={"json": False})
 
 
 def _metric(text: str, name: str) -> float | None:
@@ -237,34 +239,47 @@ def _prom_labels(text: str) -> dict[str, str] | None:
     return labels
 
 
-def vllm_metrics(text: str, model_ids: list[str]) -> dict[str, int | float | None]:
-    """Three server-level gauges from vLLM's Prometheus text, or unknown for each.
+def _vllm_series(text: str, model_ids: list[str],
+                 wanted) -> tuple[tuple[str, str], dict[str, list[float | None]]] | None:
+    """((engine, model_name), samples) for the wanted metric names, or None when identity can't be verified.
 
-    Accepted only for exactly one engine and one metric model identity. vLLM labels metrics with its first
-    --served-model-name, so that one label must be among the advertised /v1/models IDs (aliases allowed).
-    A reported 0 stays 0; a missing, duplicated, malformed or out-of-range sample stays None.
+    Every wanted sample must carry the same non-empty engine and model_name labels. vLLM labels metrics with
+    its first --served-model-name, so that one label must be among the advertised /v1/models IDs (aliases
+    allowed). Unparseable or non-finite values are kept as None so callers can reject them individually.
     """
-    out: dict[str, int | float | None] = dict.fromkeys(_VLLM_GAUGES.values())
     samples: dict[str, list[float | None]] = {}
-    engines, names = set(), set()
+    identities = set()
     for line in text.splitlines():
         if not line.startswith("vllm:"):
             continue
         m = _PROM_SAMPLE.fullmatch(line)
-        if not m or m[1] not in _VLLM_GAUGES:
+        if not m or m[1] not in wanted:
             continue
         labels = _prom_labels(m[2] or "")
         if labels is None or not labels.get("engine") or not labels.get("model_name"):
-            return out  # identity can't be checked
-        engines.add(labels.get("engine"))
-        names.add(labels.get("model_name"))
+            return None
+        identities.add((labels["engine"], labels["model_name"]))
         try:
             value = float(m[3])
         except ValueError:
             value = None
         samples.setdefault(m[1], []).append(value if value is not None and math.isfinite(value) else None)
-    if len(engines) != 1 or len(names) != 1 or next(iter(names)) not in model_ids:
+    if len(identities) != 1 or next(iter(identities))[1] not in model_ids:
+        return None
+    return next(iter(identities)), samples
+
+
+def vllm_metrics(text: str, model_ids: list[str]) -> dict[str, int | float | None]:
+    """Three server-level gauges from vLLM's Prometheus text, or unknown for each.
+
+    Accepted only for exactly one engine and one advertised metric model identity (see _vllm_series).
+    A reported 0 stays 0; a missing, duplicated, malformed or out-of-range sample stays None.
+    """
+    out: dict[str, int | float | None] = dict.fromkeys(_VLLM_GAUGES.values())
+    found = _vllm_series(text, model_ids, _VLLM_GAUGES)
+    if found is None:
         return out
+    samples = found[1]
     for metric, key in _VLLM_GAUGES.items():
         values = samples.get(metric, [])
         value = values[0] if len(values) == 1 else None
@@ -277,6 +292,48 @@ def vllm_metrics(text: str, model_ids: list[str]) -> dict[str, int | float | Non
     return out
 
 
+_VLLM_TOKENS = ("vllm:prompt_tokens_total", "vllm:generation_tokens_total")
+VLLM_RATE_MAX_GAP = 60.0  # seconds; an older baseline is stale and gives no rate
+
+
+@dataclass(frozen=True)
+class TokenSample:
+    """One vLLM token-counter reading, kept between probes to derive rates. Not serialized."""
+    taken: float  # time.monotonic()
+    identity: tuple[str, str]  # (engine, model_name) labels
+    prompt: float | None
+    generation: float | None
+
+
+def vllm_token_counters(text: str, model_ids: list[str], taken: float) -> TokenSample | None:
+    """Cumulative prompt/generation token counters for one verified engine and model, or None."""
+    found = _vllm_series(text, model_ids, _VLLM_TOKENS)
+    if found is None:
+        return None
+    identity, samples = found
+    counts = []
+    for name in _VLLM_TOKENS:
+        values = samples.get(name, [])
+        value = values[0] if len(values) == 1 else None
+        counts.append(value if value is not None and value >= 0 else None)
+    return TokenSample(taken, identity, *counts)
+
+
+def vllm_token_rates(before: TokenSample | None, now: TokenSample) -> tuple[float | None, float | None]:
+    """(prompt, generation) tokens per second between two readings of the same engine and model.
+
+    None until two usable readings exist, after a counter decrease (restart or reset), an identity change,
+    or a gap longer than VLLM_RATE_MAX_GAP. A real 0 rate stays 0.
+    """
+    if before is None or before.identity != now.identity:
+        return None, None
+    elapsed = now.taken - before.taken
+    if not 0 < elapsed <= VLLM_RATE_MAX_GAP:
+        return None, None
+    return tuple(None if a is None or b is None or b < a else (b - a) / elapsed
+                 for a, b in ((before.prompt, now.prompt), (before.generation, now.generation)))
+
+
 def server_gauge_text(s: ServerInfo) -> str | None:
     """One runtime-gauge line, or None when none is known. Unknown shows as n/a, 0 as 0."""
     if s.kind not in ("vllm", "llama-server") or all(
@@ -286,6 +343,14 @@ def server_gauge_text(s: ServerInfo) -> str | None:
     kv = "n/a" if s.kv_cache_usage is None else f"{s.kv_cache_usage * 100:.1f}%"
     source = "vLLM /metrics" if s.kind == "vllm" else "llama-server"
     return f"{source} (runtime-reported): requests running {running}, waiting {waiting}, KV-cache pool {kv}"
+
+
+def vllm_rate_text(s: ServerInfo) -> str | None:
+    """One line for vLLM's derived token rates, or None before two usable readings. 0 stays 0."""
+    if s.kind != "vllm" or (s.prompt_tok_s is None and s.gen_tok_s is None):
+        return None
+    prompt, gen = ("n/a" if v is None else f"{v:.1f}" for v in (s.prompt_tok_s, s.gen_tok_s))
+    return f"vLLM token rates (derived from /metrics counters): prompt {prompt} tok/s, generation {gen} tok/s"
 
 
 def _model_entry(name, type_=None, quant=None, ctx=None, size=None, size_vram=None, path=None) -> dict:
@@ -374,8 +439,14 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
         # Only after /v1/models succeeds. Never sends a key; a 401 or any failure leaves the gauges unknown.
         metrics = _get(base + "/metrics", redirects=False)
         if isinstance(metrics, str):
-            for key, value in vllm_metrics(metrics, [m["name"] for m in models]).items():
+            ids = [m["name"] for m in models]
+            for key, value in vllm_metrics(metrics, ids).items():
                 setattr(s, key, value)
+            # Rates need two fresh readings for the same probe identity; prev is that identity's last success.
+            s.token_sample = vllm_token_counters(metrics, ids, time.monotonic())
+            if s.token_sample is not None:
+                before = prev.token_sample if prev is not None and prev.kind == "vllm" else None
+                s.prompt_tok_s, s.gen_tok_s = vllm_token_rates(before, s.token_sample)
         return s
     props = _get(base + "/props", key=key)
     if props is UNAUTHORIZED:
@@ -561,6 +632,11 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
             v.notes.append("vLLM /metrics gauges describe the API server's engine as a whole, not this process "
                            "or one GPU; KV-cache pool usage is a share of vLLM's own KV-cache allocation, "
                            "not of GPU memory.")
+        if vllm_rate_text(server):
+            v.notes.append("vLLM token rates are derived from two /metrics counter readings for the API server's "
+                           "engine, not this process or one GPU. vllm:prompt_tokens_total counts prompt tokens per "
+                           "sequence (n parallel samples count n times) and includes prefix-cache hits, so the "
+                           "prompt rate is neither submitted nor computed prefill tokens.")
     elif server and server.kind == "llama-server" and server_gauge_text(server):
         v.notes.append("llama-server gauges are runtime-reported for the server as a whole, not one GPU; "
                        "KV-cache pool usage is a share of the server's KV-cache allocation, not of GPU memory. "

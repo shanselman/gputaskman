@@ -954,7 +954,7 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state, slots, and throughput; exercised live. New `/metrics` request and KV-cache pool gauges are runtime-reported and fixture-tested, **not validated live** |
 | Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
 | LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
-| vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Running/waiting requests and KV-cache pool usage from `/metrics`, labelled runtime-reported for the server's engine, not per worker, per GPU or GPU memory. Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
+| vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Running/waiting requests and KV-cache pool usage from `/metrics`, labelled runtime-reported for the server's engine, not per worker, per GPU or GPU memory. Prompt and generation token rates derived from two `/metrics` counter readings (null until then). Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
 | Foundry Local | Recognized `foundrylocald` daemon; `/models/loaded` IDs from its own listener, labelled API-reported. No catalog-as-loaded fallback, model byte estimates or per-GPU placement claim. Live-checked with Foundry Local 0.14 on Snapdragon; see below |
 | stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
@@ -1109,7 +1109,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | vLLM `/v1/models` | 1.32 ms median, 21.36 ms max in 30 loopback fixture GETs; cached lookup ~0.0004 ms (Windows 11 build 28000, ARM64; no vLLM runtime/GPU workload) | One GET, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects; actual Linux/vLLM latency unmeasured |
-| vLLM `/metrics` gauges | Whole probe (`/v1/models` + `/metrics` + parse) 1.37 ms median, 1.44 ms max in 30 loopback runs; `/metrics` GET alone 0.48 ms median; parsing a constructed 49 KB, 511-line exposition (all counters, 16 histograms) 0.41 ms median (Fedora Linux 45, i7-10850H, Python 3.13.18; no vLLM runtime/GPU workload) | One extra keyless GET inside the same cached probe, only after `/v1/models` succeeds; same timeout, cap, no redirects. Real vLLM payload size and latency unmeasured |
+| vLLM `/metrics` gauges and token counters | Whole probe (`/v1/models` + `/metrics` + both parses) 1.80 ms median, 1.92 ms max in 30 loopback runs; `/metrics` GET alone 0.48 ms median; on a constructed 49 KB, 511-line exposition (all counters, 16 histograms), the gauge parse is 0.41 ms and the token-counter parse 0.40 ms median (Fedora Linux 45, i7-10850H, Python 3.13.18; no vLLM runtime/GPU workload) | One extra keyless GET inside the same cached probe, only after `/v1/models` succeeds; same timeout, cap, no redirects. Token rates add no request. Real vLLM payload size and latency unmeasured |
 | Foundry Local `/models/loaded` | 7.37 ms median, 15.93 ms max in 10 warm reads; first read 9.04 ms (Windows 11 ARM64 build 28000.3231, Snapdragon X2 Elite / Adreno X2-85, driver 32.0.163.2, Foundry Local 0.14.0 with Phi-3.5-mini loaded) | One GET to the daemon's own listener, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects, catalog requests or inference |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
@@ -1174,7 +1174,24 @@ fraction of vLLM's own KV-cache pool, shown as a percent; not GPU memory). They 
 when every sample names one `engine` and one `model_name`, and that name is one of the `/v1/models`
 IDs: vLLM labels metrics with the first `--served-model-name`, while `/v1/models` lists every alias.
 A reported 0 stays 0; a missing, duplicated, malformed or out-of-range value, or a refused or
-unreadable `/metrics`, stays unknown (`null`) without affecting the model IDs. Parent-discovered
+unreadable `/metrics`, stays unknown (`null`) without affecting the model IDs.
+
+The same response also gives `vllm:prompt_tokens_total` and `vllm:generation_tokens_total`, with the
+same identity rules. Token rates (`prompt_tok_s`, `gen_tok_s`) are derived between two fresh probes of
+the same cached probe identity (port, own/parent origin and process creation times), using monotonic
+elapsed time, never between cached refreshes. They stay `null` on the first reading (so `--once` and
+`--json` always show `null`), after a counter decrease, after an `engine` or `model_name` change, or when
+the previous reading is more than 60 s old; an idle server shows 0. They are labelled as derived,
+server-level rates, not per worker or per GPU. `vllm:prompt_tokens_total` counts prompt tokens per
+sequence (with `n` parallel samples each prompt counts `n` times) and includes prefix-cache hits
+([vllm#56361](https://github.com/vllm-project/vllm/issues/56361)), so the prompt rate is neither the
+tokens clients submitted nor the prefill tokens actually computed.
+
+**Token rates need two fresh probes in the same running session.** The TUI and `gputaskman record`
+show them from the second probe onward; one-shot `--once` and `--json` output probe once, so their
+rates are always unavailable (`null`), not broken.
+
+Parent-discovered
 ports are **always unauthenticated**, even when parent and worker launch arguments match:
 the worker's key is never sent there. A 401 is shown as **Parent-process API locked**.
 Probe caches separate own/parent origins, process creation times, runtime and credentials, so

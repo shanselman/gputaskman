@@ -17,7 +17,8 @@ from textual.widgets import Static
 
 from gputaskman.app import GpuTaskManager
 from gputaskman.collector import Collector
-from gputaskman.llm import ServerProber, probe_server, vllm_metrics, vllm_models
+from gputaskman.llm import (ServerInfo, ServerProber, TokenSample, build_view, probe_server, vllm_metrics,
+                            vllm_models, vllm_rate_text, vllm_token_counters, vllm_token_rates)
 from gputaskman.pdh import AdapterGpu, ProcGpu
 from gputaskman.procinfo import ProcDetail, ProcInspector, classify
 from gputaskman.report import to_dict, to_text
@@ -61,7 +62,7 @@ def listener(*, locked=False, redirect=False, metrics=None):
         def do_GET(self):
             seen.append((self.path, self.headers.get("Authorization")))
             if self.path == "/metrics" and metrics is not None:
-                body = metrics.encode()
+                body = (metrics() if callable(metrics) else metrics).encode()
             else:
                 body = json.dumps({"data": [{"id": "org/model", "root": "/not/a/model/file",
                                              "max_model_len": 8192, "size": 999999}]}).encode()
@@ -324,6 +325,106 @@ class VllmTests(unittest.TestCase):
         text = to_text(snap)
         self.assertNotIn("vLLM /metrics", text)
         self.assertNotIn("KV-cache pool", text)
+        self.assertNotIn("token rates", text)
+        self.assertNotIn("token_sample", json.dumps(to_dict(snap)))
+
+    def test_token_counters_need_one_verified_identity(self):
+        gen = 'vllm:generation_tokens_total{engine="0",model_name="org/model"} 4000.0\n'
+        text = METRICS + gen
+        self.assertEqual(vllm_token_counters(text, ["org/model"], 5.0),
+                         TokenSample(5.0, ("0", "org/model"), 1234.0, 4000.0))
+        rejected = {
+            "second engine": text + gen.replace('engine="0"', 'engine="1"'),
+            "no engine": text.replace('vllm:generation_tokens_total{engine="0",', "vllm:generation_tokens_total{"),
+            "unadvertised model": text.replace('model_name="org/model"', 'model_name="other"'),
+            "no counters": METRICS.replace("vllm:prompt_tokens_total", "vllm:prompt_tokens_other"),
+        }
+        for reason, bad in rejected.items():
+            with self.subTest(reason=reason):
+                self.assertIsNone(vllm_token_counters(bad, ["org/model"], 5.0))
+        for bad_value in ("-1", "NaN", "abc"):
+            with self.subTest(value=bad_value):
+                sample = vllm_token_counters(text.replace("4000.0", bad_value), ["org/model"], 5.0)
+                self.assertEqual((sample.prompt, sample.generation), (1234.0, None))
+        sample = vllm_token_counters(text + gen, ["org/model"], 5.0)  # duplicated series
+        self.assertEqual((sample.prompt, sample.generation), (1234.0, None))
+
+    def test_token_rates_between_two_readings(self):
+        identity = ("0", "org/model")
+        before = TokenSample(100.0, identity, 10000.0, 4000.0)
+        self.assertEqual(vllm_token_rates(before, TokenSample(103.0, identity, 10600.0, 4300.0)), (200.0, 100.0))
+        self.assertEqual(vllm_token_rates(before, TokenSample(103.0, identity, 10000.0, 4000.0)), (0.0, 0.0))
+        cases = {
+            "first reading": (None, TokenSample(103.0, identity, 10600.0, 4300.0), (None, None)),
+            "other engine": (before, TokenSample(103.0, ("1", "org/model"), 10600.0, 4300.0), (None, None)),
+            "other model": (before, TokenSample(103.0, ("0", "other"), 10600.0, 4300.0), (None, None)),
+            "no time passed": (before, TokenSample(100.0, identity, 10600.0, 4300.0), (None, None)),
+            "clock backwards": (before, TokenSample(99.0, identity, 10600.0, 4300.0), (None, None)),
+            "stale baseline": (before, TokenSample(160.5, identity, 10600.0, 4300.0), (None, None)),
+            "prompt reset": (before, TokenSample(103.0, identity, 50.0, 4300.0), (None, 100.0)),
+            "missing generation": (before, TokenSample(103.0, identity, 10600.0, None), (200.0, None)),
+            "missing baseline": (TokenSample(100.0, identity, None, 4000.0),
+                                 TokenSample(103.0, identity, 10600.0, 4300.0), (None, 100.0)),
+        }
+        for reason, (a, b, expected) in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(vllm_token_rates(a, b), expected)
+
+    def test_token_rates_across_cached_probes(self):
+        counts = {"prompt": 10000, "generation": 4000}
+        clock = [100.0]
+
+        def metrics():
+            return (METRICS.replace("vllm:prompt_tokens_total{engine=\"0\",model_name=\"org/model\"} 1234.0",
+                                    f'vllm:prompt_tokens_total{{engine="0",model_name="org/model"}} {counts["prompt"]}')
+                    + f'vllm:generation_tokens_total{{engine="0",model_name="org/model"}} {counts["generation"]}\n')
+
+        def probe(origin=("process", 1, 100), step=3.0, **new_counts):
+            clock[0] += step
+            counts.update(new_counts)
+            return p.get([port], kind="vllm", origin=origin)
+
+        with listener(metrics=metrics) as (port, seen), \
+                patch("gputaskman.llm.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("gputaskman.llm.time.time", side_effect=lambda: clock[0]):
+            p = ServerProber()
+            first = probe(step=0.0)
+            self.assertEqual((first.prompt_tok_s, first.gen_tok_s), (None, None))  # one reading: --once stays null
+            self.assertIsNone(vllm_rate_text(first))
+            self.assertIs(probe(step=1.0), first)  # cached: no new reading, no rate from refreshes
+            busy = probe(step=2.0, prompt=10600, generation=4300)
+            self.assertEqual((busy.prompt_tok_s, busy.gen_tok_s), (200.0, 100.0))
+            idle = probe()
+            self.assertEqual((idle.prompt_tok_s, idle.gen_tok_s), (0.0, 0.0))
+            self.assertEqual(vllm_rate_text(idle), "vLLM token rates (derived from /metrics counters): "
+                                                   "prompt 0.0 tok/s, generation 0.0 tok/s")
+            reset = probe(prompt=50, generation=20)
+            self.assertEqual((reset.prompt_tok_s, reset.gen_tok_s), (None, None))
+            after = probe(prompt=350, generation=170)
+            self.assertEqual((after.prompt_tok_s, after.gen_tok_s), (100.0, 50.0))
+            restarted = probe(origin=("process", 1, 101), prompt=650, generation=320)
+            self.assertEqual((restarted.prompt_tok_s, restarted.gen_tok_s), (None, None))
+            stale = probe(step=61.0, prompt=950, generation=470)
+            self.assertEqual((stale.prompt_tok_s, stale.gen_tok_s), (None, None))
+        self.assertEqual(sum(path == "/metrics" for path, _ in seen), 7)
+
+    def test_token_rates_keep_provenance_and_stay_out_of_json(self):
+        server = ServerInfo("vllm", "http://127.0.0.1:8000", models=[{"name": "org/model"}],
+                            prompt_tok_s=200.0, gen_tok_s=None,
+                            token_sample=TokenSample(1.0, ("0", "org/model"), 10.0, None))
+        self.assertEqual(vllm_rate_text(server), "vLLM token rates (derived from /metrics counters): "
+                                                 "prompt 200.0 tok/s, generation n/a tok/s")
+        view = build_view(ProcDetail(10, "VLLM::EngineCore"), 512 * MiB, 0, server)
+        notes = " ".join(view.notes)
+        self.assertIn("derived from two /metrics counter readings", notes)
+        self.assertIn("neither submitted nor computed prefill tokens", notes)
+        self.assertEqual([(s.kind, s.bytes) for s in view.segments], [("unknown", 512 * MiB)])
+        from gputaskman.report import _server_dict
+        data = _server_dict(server)
+        self.assertNotIn("token_sample", data)
+        self.assertEqual((data["prompt_tok_s"], data["gen_tok_s"]), (200.0, None))
+        json.dumps(data)
+        self.assertIsNone(vllm_rate_text(ServerInfo("llama-server", "u", gen_tok_s=5.0)))
 
     def test_unauthenticated_parent_redirect_is_not_followed(self):
         with listener(redirect=True) as (port, seen):
