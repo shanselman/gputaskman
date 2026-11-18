@@ -588,6 +588,15 @@ and SM/GFX clock, throttling alerts, charts, processes, and process inspection r
 The header border names the active mode; press `m` again to restore the full details.
 This is a session-only display toggle, applies to every GPU, and does not change collection
 or one-shot text/JSON output.
+The TUI color scheme is one of [Textual's built-in
+themes](https://textual.textualize.io/guide/design/), chosen at startup by the `TEXTUAL_THEME`
+environment variable (default: `textual-dark`). For example, `TEXTUAL_THEME=ansi-dark gputaskman`
+(PowerShell: `$env:TEXTUAL_THEME = "ansi-dark"`) renders with the terminal's own colors instead:
+its default background and foreground and its ANSI palette, so the monitor blends into a custom
+terminal theme; `ansi-light` and named themes such as `nord` or `gruvbox` are also available.
+Set the variable in your shell profile to keep the choice across sessions; gputaskman stores no
+configuration itself. The theme affects the live TUI only, not one-shot text or JSON output.
+Chart series colors and the process-kind colors are explicit and do not follow the terminal palette.
 All eight history charts are shown by default: GPU, SM clock (GFX clock on AMD), VRAM, memory activity,
 temperature, power, encoder, and decoder. They stack in narrow terminals and share rows as
 the window widens. Click the **Charts** dropdown to focus on one metric or return to **All charts**.
