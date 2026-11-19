@@ -350,7 +350,9 @@ class LinuxCounters:
                 used = _value(getattr(p, "usedGpuMemory", None))
                 if used is None:
                     g.attributed = False
-                else:
+                    g.available.discard("dedicated")
+                    g.dedicated = 0.0
+                elif g.attributed:
                     # A process in both lists reports the same allocation twice; don't double count.
                     g.dedicated = max(g.dedicated, float(used))
             for pid, s in self._utilization(key, h).items():

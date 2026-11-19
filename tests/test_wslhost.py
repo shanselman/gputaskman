@@ -389,7 +389,9 @@ class HostRowTests(unittest.TestCase):
 
     def test_wsl_vm_and_windows_rows(self):
         snap = self.snap()
-        self.collector(FakeStream(parse_line(SAMPLE, now=time.time())))._add_host_rows(snap)
+        c = self.collector(FakeStream(parse_line(SAMPLE, now=time.time())))
+        c.tracker = None  # The host VM total is still known when no Linux split is available.
+        c._add_host_rows(snap)
         self.assertEqual(snap.host_status, "ok")
         rows = {r.key: r for r in snap.procs}
         # Linux PID 2744 and Windows dwm PID 2744 coexist: distinct keys
@@ -406,6 +408,10 @@ class HostRowTests(unittest.TestCase):
         data = to_dict(snap)
         self.assertEqual({p["host"] for p in data["processes"]}, {None, "windows"})
         self.assertEqual(data["host_status"], "ok")
+        child = next(p for p in data["processes"] if p["host"] is None)
+        self.assertIsNone(child["vram_bytes"])
+        self.assertIsNone(child["vram_inferred_bytes"])
+        self.assertEqual(data["attributed"], int(vm.gpu.dedicated + rows["w2744"].gpu.dedicated))
 
     def test_linux_process_gets_matched_vram(self):
         # contexts newest first: this monitor's own 0-byte NVML context, then the workload (3 GB)

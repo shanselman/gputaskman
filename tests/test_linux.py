@@ -160,11 +160,39 @@ class LinuxCountersTests(unittest.TestCase):
 
     def test_hidden_per_process_memory_is_unknown_not_zero(self):
         fake = FakeNvml(compute=[proc(100, NOT_AVAILABLE), proc(101, None)])
+        data = self.report(fake)
+        self.assertIsNone(data["attributed"])
+        self.assertEqual(data["vram_used"], 4 * GiB)
+        for row in data["processes"]:
+            self.assertFalse(row["vram_attributed"])
+            self.assertIsNone(row["vram_bytes"])
+
+    def test_conflicting_nvml_process_lists_do_not_supply_measured_vram(self):
+        for compute_memory, graphics_memory in ((2 * GiB, NOT_AVAILABLE), (NOT_AVAILABLE, 2 * GiB)):
+            with self.subTest(compute_memory=compute_memory, graphics_memory=graphics_memory):
+                fake = FakeNvml(compute=[proc(100, compute_memory)],
+                                graphics=[proc(100, graphics_memory), proc(300, GiB)],
+                                samples=[sample(100, 47, enc=3, dec=5)])
+                data = self.report(fake)
+                self.assertIsNone(data["attributed"])
+                hidden, measured = data["processes"]
+                self.assertIsNone(hidden["vram_bytes"])
+                self.assertEqual(hidden["engines"], {"compute": 47, "encode": 3, "decode": 5})
+                self.assertEqual(measured["vram_bytes"], GiB)
+
+    def test_measured_nvml_zero_counts_as_zero(self):
+        data = self.report(FakeNvml(compute=[proc(100, 0)], graphics=[proc(100, 0)]))
+        self.assertEqual(data["attributed"], 0)
+        self.assertEqual(data["processes"][0]["vram_bytes"], 0)
+
+    def report(self, fake):
         c = self.counters(fake, wsl=False)
         with patch.object(linux, "N", fake):
-            procs, _ = c.sample()
-        self.assertFalse(procs[KEY][100].attributed)
-        self.assertFalse(procs[KEY][101].attributed)
+            procs, adapters = c.sample()
+        rows = [ProcRow(pid, "gpu-client", "app", g, ProcDetail(pid, "gpu-client")) for pid, g in procs[KEY].items()]
+        return to_dict(Snapshot(taken=1, adapter=None, adapters=[], nv=None, driver="", cuda="",
+                                vram_total=24 * GiB, vram_used=int(adapters[KEY].dedicated), shared_used=None,
+                                backend="nvml", procs=rows))
 
     def test_utilization_for_unlisted_pids_is_ignored(self):
         fake = FakeNvml(compute=[proc(100, GiB)], samples=[sample(555, 50)])

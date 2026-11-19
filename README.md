@@ -171,8 +171,10 @@ equivalent of WDDM's shared-memory or commit counters, so Spill and Paged stay b
 showing zero. Only processes you can inspect are listed; other users' processes need `sudo`.
 
 JSON uses `null` for unavailable counters, not a measured zero: spill/commit/paged values on
-native Linux, and per-process engine load for WSL Linux rows. Native NVML engine readings remain
-available even if NVML hides that process's VRAM. Windows host rows retain their measured counters.
+native Linux, and per-process engine load for WSL Linux rows. If either NVML process list hides a
+process's VRAM, that row and the native Linux attributed total are unknown (`null`). Other measured
+rows, device-wide memory, and independently available engine readings are unaffected. Windows host
+rows retain their measured counters.
 
 **Containers** (Docker, Kubernetes, rented GPU boxes) need one more step: NVML reports *host*
 PIDs, which mean nothing in the container's `/proc`, and the container cannot see the host PID of
