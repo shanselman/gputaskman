@@ -24,7 +24,7 @@ from textual.widgets import Footer, Select, Static
 from gputaskman import amdsmi
 from gputaskman.amdsmi import AmdSmi, _read_vram_bytes
 from gputaskman.adl import Adl, _Metrics
-from gputaskman.app import GpuTaskManager, spark, stacked_bar
+from gputaskman.app import GpuTaskManager, explain, spark, stacked_bar
 from gputaskman.cli import main
 from gputaskman.collector import (Collector, ProcRow, Snapshot, _is_live, _llm_wanted, select_adapter,
                                 select_nv_device)
@@ -3126,6 +3126,28 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(app.screen_stack), 1)
                 self.assertFalse(app.paused)
 
+
+
+class ExplainTests(unittest.TestCase):
+    def row(self, name, kind, origin=""):
+        return ProcRow(1, name, kind, ProcGpu(), ProcDetail(1, name), host=bool(origin), origin=origin)
+
+    def test_windows_only_wording_stays_on_windows_rows(self):
+        for backend, row in (("wddm", self.row("dwm.exe", "compositor")),
+                             ("wsl", self.row("dwm.exe", "compositor", origin="windows"))):
+            with self.subTest(backend=backend), patch("gputaskman.app.BACKEND", backend):
+                self.assertIn("Local Usage", explain(row))
+                self.assertIn("PIX", explain(self.row("game.exe", "3D/game", row.origin)))
+
+    def test_linux_and_macos_compositors_get_no_windows_counter_story(self):
+        for backend, name in (("nvml", "Hyprland"), ("nvml", "Xwayland"), ("wsl", "weston"),
+                              ("metal", "WindowServer")):
+            with self.subTest(backend=backend, name=name), patch("gputaskman.app.BACKEND", backend):
+                for kind in ("compositor", "3D/game"):
+                    text = explain(self.row(name, kind))
+                    self.assertTrue(text)
+                    for windows_only in ("Windows", "dwm", "Dedicated Usage", "Local Usage", "PIX"):
+                        self.assertNotIn(windows_only, text)
 
 
 class FormatMetricTests(unittest.TestCase):

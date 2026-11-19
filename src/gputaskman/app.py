@@ -57,6 +57,23 @@ EXPLAIN = {
     "app": "UI surfaces: swap chains, window back-buffers, cached bitmaps/glyphs.",
 }
 
+# Linux and macOS compositors: the EXPLAIN wording above describes Windows counters (dwm, Dedicated/Local Usage, PIX).
+EXPLAIN_NON_WINDOWS = {
+    "compositor": "Display compositor: its own back buffers and the composed image for each monitor. "
+                  "App windows reach it as shared buffers, so its numbers and the apps' can overlap or be unknown.",
+    "3D/game": "Textures, meshes and render targets. The OS only sees opaque buffers; "
+               "per-resource names need a graphics debugger (RenderDoc, or Xcode's Metal debugger on macOS).",
+}
+
+
+def explain(r: ProcRow) -> str:
+    """The kind's one-paragraph explanation, in the wording that fits the OS the process runs on."""
+    on_windows = BACKEND == "wddm" or r.origin == "windows"
+    if not on_windows and r.kind in EXPLAIN_NON_WINDOWS:
+        return EXPLAIN_NON_WINDOWS[r.kind]
+    return EXPLAIN.get(r.kind, "")
+
+
 HELP_MD = """\
 # What can be known about GPU memory?
 
@@ -923,7 +940,7 @@ class GpuTaskManager(App):
             for n in v.notes:
                 out.append(Text("• " + n, style="bold red" if n.startswith("!") else "grey70"))
         else:
-            out.append(Text(EXPLAIN.get(r.kind, ""), style="grey70"))
+            out.append(Text(explain(r), style="grey70"))
             for m in r.detail.models:
                 kind = f", {m.kind_label}" if m.kind_label else ""
                 out.append(Text(f"file: {m.store_name or m.path}  ({gb(m.size)}, {m.evidence}{kind})", style="magenta"))
