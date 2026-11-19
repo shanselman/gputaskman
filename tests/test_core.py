@@ -1727,7 +1727,7 @@ class IdentityTests(unittest.TestCase):
             self.assertIsNone(server.requests_waiting)
             self.assertIsNone(server.kv_cache_usage)
 
-    def test_api_key_is_not_forwarded_by_a_redirect(self):
+    def test_keyed_and_unkeyed_requests_do_not_follow_redirects(self):
         import http.server
         seen: dict[str, list[str | None]] = {"first": [], "other": []}
 
@@ -1753,12 +1753,11 @@ class IdentityTests(unittest.TestCase):
             threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             url = f"http://127.0.0.1:{first.server_address[1]}/props"
-            self.assertIsNone(_get(url, key="s3cret"))
-            self.assertEqual(len(seen["first"]), 1)
-            self.assertIsNotNone(seen["first"][0])  # the server the key belongs to did get it
-            self.assertEqual(seen["other"], [])  # the redirect target was never contacted
-            self.assertEqual(_get(url), {})  # requests without a key behave as before
-            self.assertEqual(seen["other"], [None])
+            self.assertIsNone(_get(url, key="test-key"))
+            self.assertEqual(seen["other"], [])
+            self.assertIsNone(_get(url))
+            self.assertEqual(seen["first"], ["Bearer test-key", None])
+            self.assertEqual(seen["other"], [])
         finally:
             for server in (other, first):
                 server.shutdown()

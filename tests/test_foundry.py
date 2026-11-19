@@ -163,7 +163,7 @@ class FoundryTests(unittest.TestCase):
         p = ServerProber()
         with patch("gputaskman.llm._get", return_value=UNAUTHORIZED) as get:
             self.assertIsNone(p.get([12345], kind="foundry-local"))
-        get.assert_called_once_with("http://127.0.0.1:12345/models/loaded", redirects=False)
+        get.assert_called_once_with("http://127.0.0.1:12345/models/loaded")
         self.assertEqual(p.locked_port([12345], kind="foundry-local"), 12345)
 
 

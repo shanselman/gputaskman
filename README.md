@@ -1139,12 +1139,13 @@ working directories.
 
 The collector probes existing local listening ports with GET requests to `/props`, `/slots`,
 `/metrics`, `/v1/models`, `/api/ps`, `/api/v1/models`, and `/api/v0/models`. Endpoints may be
-absent, disabled, or authenticated; other evidence is still useful. It does not launch `ollama`,
-`lms`, or an inference request. Throughput may update only after a request completes.
+absent, disabled, or authenticated; other evidence is still useful. Probes never follow redirects,
+even without an API key. The collector does not launch `ollama`, `lms`, or send an inference request.
+Throughput may update only after a request completes.
 
-If llama-server was started with `--api-key`, the probe sends that key as a bearer token to the same
-server's own port, and never follows a redirect with it. The key is never stored, printed, or written
-to JSON, and the inspector shows it as `***`. A key in `--api-key-file` or `LLAMA_API_KEY` is not used:
+If llama-server was started with `--api-key`, the probe sends that key as a bearer token only to that
+server's own port. The key is never stored, printed, or written to JSON, and the inspector shows it
+as `***`. A key in `--api-key-file` or `LLAMA_API_KEY` is not used:
 gputaskman does not open a path taken from another process's command line, and an environment variable
 can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
 one rejected request every 30 seconds, and the inspector says why server details are missing.

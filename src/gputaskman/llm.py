@@ -125,9 +125,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-# urllib forwards the Authorization header across redirects, so a request that carries a key never follows one.
-_keyed_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+# Stay on the selected listener, with or without credentials.
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 UNAUTHORIZED = object()  # _get result for HTTP 401: the server wants a key
@@ -171,13 +170,12 @@ def redact_cmdline(cmd: list[str]) -> list[str]:
     return out
 
 
-def _get(url: str, timeout: float = 0.5, key: str | None = None, redirects: bool = True):
+def _get(url: str, timeout: float = 0.5, key: str | None = None):
     headers = {"Accept": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     try:
-        with (_keyed_opener if key or not redirects else _opener).open(urllib.request.Request(url, headers=headers),
-                                                       timeout=timeout) as r:
+        with _opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
             if r.status != 200:
                 return None
             body = r.read(4 << 20)
@@ -358,13 +356,13 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
     """
     base = f"http://127.0.0.1:{port}"
     if kind == "foundry-local":
-        response = _get(base + "/models/loaded", redirects=False)
+        response = _get(base + "/models/loaded")
         if response is UNAUTHORIZED:
             return UNAUTHORIZED
         models = foundry_models(response)
         return ServerInfo("foundry-local", base, models=models) if models is not None else None
     if kind == "vllm":
-        response = _get(base + "/v1/models", key=key, redirects=False)
+        response = _get(base + "/v1/models", key=key)
         if response is UNAUTHORIZED:
             return UNAUTHORIZED
         models = vllm_models(response)
@@ -372,7 +370,7 @@ def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = No
             return None
         s = ServerInfo("vllm", base, models=models)
         # Only after /v1/models succeeds. Never sends a key; a 401 or any failure leaves the gauges unknown.
-        metrics = _get(base + "/metrics", redirects=False)
+        metrics = _get(base + "/metrics")
         if isinstance(metrics, str):
             for key, value in vllm_metrics(metrics, [m["name"] for m in models]).items():
                 setattr(s, key, value)
