@@ -323,6 +323,18 @@ Live check: Arc Pro B65 (`8086:e222`), xe, Linux 7.0.0-43-generic, 2026-11-15: m
 or throttling induced. Active throttle reasons and missing-node handling are fixture-tested;
 other Xe cards, integrated Xe, multiple tiles and active hardware throttling are not validated.
 
+Intel GPU temperature lookup also recognizes GPU-owned `pkg` and `gpu` hwmon labels before
+`edge` and the legacy `temp1_input` fallback. This does not borrow CPU or another GPU's sensors.
+A contributor's ASUS Arc Pro B70 (`8086:e223`, subsystem `1043:8020`) on `xe`, Linux
+7.0.0-43-generic, exposed `temp2_label=pkg` with no `temp1_input`; the previous lookup returned
+`N/A` despite that readable sensor. On 2026-11-19, 71 captured device samples after this fix were
+within 1°C of the same driver sensor read immediately afterward. This validates the sensor
+handoff, not absolute temperature accuracy. The capture included a planned 60-second, 2 GiB
+Vulkan memory check at unchanged 400–2800 MHz requests and a pre-existing 310 W cap: no reported
+memory errors, new kernel entries or PCIe AER increments. It was not the tool's standard
+five-minute run or a full-VRAM stability test. The same run observed 2800 MHz in 59/60 load
+samples and private process VRAM of 2,174,844,928 bytes, agreeing with that process's Xe fdinfo.
+
 **Intel `xe` per-process counters** use the same ownership and sharing rules. Resident `vram*` regions
 supply local memory and `gtt` supplies GPU-accessible system memory; CPU-only `system` memory and the
 distinct `stolen` region are not charged. Every reported region must have a valid zero `drm-shared-*`
@@ -1171,6 +1183,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | AMD on WSL: AMD SMI discovery and device telemetry | Radeon 860M, WSL AMD SMI/ROCDXG 1.2.2, Windows driver 32.0.22050.1003: 71.87 ms first discovery; 30 warm device samples, median 6.27 ms, max 9.09 ms, no failures | Startup discovery and per-refresh telemetry; host attribution reuses the current `/dev/dxg` holder scan. Shared sessions keep later discovery/collectors from shutting down live handles; multiple physical adapters unmeasured |
 | Ascend on Linux: `npu-smi` | Contributor reports ~0.5 s per command on an Atlas 300I Duo; not independently measured | Discovery is cached for 120 s. Each selected chip runs one `info` and one `proc-mem` command every 10 s and owns a watch process; multiple selected chips add their synchronous command costs |
 | Xe primary-GT frequency/throttle | B65, Linux 7.0.0-43-generic, 2026-11-15, 100 successful reads: 0.037 ms median / 0.383 ms max; whole `read_device`: 0.194 / 0.533 ms | Selected card per refresh; three frequency reads plus aggregate throttle snapshot. Idle hardware check; legacy per-flag fallback and active reasons have fixture coverage only |
+| Intel GPU hwmon temperature | ASUS B70, Linux 7.0.0-43-generic, 2026-11-19, 100 successful reads: 0.129 ms median / 0.324 ms max | Selected GPU's existing hwmon directory per refresh; label-priority lookup only, no new vendor library or privilege requirement |
 | Intel on Linux: performance counters + RAPL uncore (root only) | ~0.04 ms for the counters, ~0.11 ms for RAPL per refresh on the Vivobook (30 reads each) | Every refresh, only when an Intel card is shown and the counters opened; first refresh arms the baselines |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |

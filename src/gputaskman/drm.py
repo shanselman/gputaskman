@@ -406,14 +406,19 @@ def _microwatts(path: str) -> float | None:
     return None if value is None else value / 1_000_000
 
 
-def _hwmon_temp(hwmon: str) -> int | None:
+def _hwmon_temp(hwmon: str, *, intel: bool = False) -> int | None:
     try:
         names = sorted(os.listdir(hwmon))
     except OSError:
         names = []
-    for name in names:
-        if name.startswith("temp") and name.endswith("_label") and _read(os.path.join(hwmon, name)) == "edge":
-            return _milli(os.path.join(hwmon, f"{name[:-len('_label')]}_input"))
+    # Xe exposes its GPU package as "pkg", which need not be temp1.
+    # Only use labels within this GPU's own hwmon directory.
+    for label in (("pkg", "gpu", "edge") if intel else ("edge",)):
+        for name in names:
+            if name.startswith("temp") and name.endswith("_label") and _read(os.path.join(hwmon, name)) == label:
+                value = _milli(os.path.join(hwmon, f"{name[:-len('_label')]}_input"))
+                if value is not None or not intel:
+                    return value
     return _milli(os.path.join(hwmon, "temp1_input"))
 
 
@@ -531,7 +536,7 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
         util_mem=None if card.intel else _int(os.path.join(d, "mem_busy_percent")),
     )
     if hwmon:
-        dev.temp = _hwmon_temp(hwmon)
+        dev.temp = _hwmon_temp(hwmon, intel=card.intel)
         if card.intel:
             # Intel hwmon has no instantaneous power node, but energy1_input is a cumulative uJ counter;
             # its rate over the interval between samples is the card's average power draw.
