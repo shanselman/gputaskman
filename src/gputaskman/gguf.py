@@ -24,6 +24,9 @@ FILE_TYPES = {
 }
 
 _BLK_RE = re.compile(r"^blk\.(\d+)\.")
+# Longest string kept from a header. Keys and tensor names are far shorter, so a longer one is corruption;
+# a longer value (an embedded tokenizer.json, say) is skipped, never read into memory.
+_MAX_STRING = 1 << 20
 
 
 @dataclass
@@ -143,17 +146,23 @@ class _Reader:
         self.v = version
 
     def unpack(self, fmt: str):
-        size = struct.calcsize(fmt)
-        data = self.f.read(size)
-        if len(data) != size:
-            raise EOFError("truncated GGUF header")
-        return struct.unpack(fmt, data)[0]
+        return struct.unpack(fmt, self.read(struct.calcsize(fmt)))[0]
 
     def length(self) -> int:
         return self.unpack("<Q" if self.v >= 2 else "<I")
 
+    def read(self, n: int) -> bytes:
+        data = self.f.read(n)
+        if len(data) != n:
+            raise EOFError("truncated GGUF header")
+        return data
+
     def string(self) -> str:
-        return self.f.read(self.length()).decode("utf-8", "replace")
+        """A key or tensor name."""
+        n = self.length()
+        if n > _MAX_STRING:
+            raise ValueError(f"GGUF string length {n} is not plausible")
+        return self.read(n).decode("utf-8", "replace")
 
     def skip_string(self) -> None:
         self.f.seek(self.length(), 1)
@@ -162,14 +171,18 @@ class _Reader:
         if vtype in _SCALARS:
             return self.unpack(_SCALARS[vtype])
         if vtype == _STRING:
-            return self.string()
+            n = self.length()
+            if n > _MAX_STRING:
+                self.f.seek(n, 1)
+                return f"<string[{n} bytes]>"
+            return self.read(n).decode("utf-8", "replace")
         if vtype == _ARRAY:
             etype = self.unpack("<I")
             n = self.length()
             if etype in _SCALARS:
                 size = struct.calcsize(_SCALARS[etype])
                 if n <= 4096:
-                    raw = self.f.read(size * n)
+                    raw = self.read(size * n)
                     return list(struct.unpack("<" + _SCALARS[etype][1] * n, raw))
                 self.f.seek(size * n, 1)
                 return f"<array[{n}]>"
