@@ -12,10 +12,15 @@ from gputaskman.cli import main
 from gputaskman.summary import load, split_runs, summarize, to_text
 
 GiB = 1 << 30
+MiB = 1 << 20
+_MISSING = object()
 
 
-def proc(name, vram=None, pct=None, host=None):
-    return {"pid": 1, "host": host, "name": name, "vram_bytes": vram, "gpu_pct": pct}
+def proc(name, vram=None, pct=None, host=None, swapped=_MISSING):
+    row = {"pid": 1, "host": host, "name": name, "vram_bytes": vram, "gpu_pct": pct}
+    if swapped is not _MISSING:
+        row["graphics_swapped_bytes"] = swapped
+    return row
 
 
 def snap(taken, procs=(), used=None, gpu="RTX", backend="wddm", device=None, system=None):
@@ -56,6 +61,45 @@ class SummaryTests(unittest.TestCase):
         text = to_text(summarize(samples))
         self.assertIn("W:llama", text)
         self.assertRegex(text, r"wsl\s+n/a\s+5\.0%")
+        self.assertNotIn("COMPRESSED", text)  # no swapped readings: the column stays out
+
+    def test_compressed_graphics_peaks_on_its_own_and_a_missing_value_stays_unknown(self):
+        samples = [snap(0, [proc("app", GiB, 10, swapped=512 * MiB), proc("app", GiB, 5, swapped=0),
+                            proc("blank", GiB, 1, swapped=None), proc("bad", 0, 0, swapped=True),
+                            proc("host", GiB, 1, host="windows", swapped=64 * MiB)]),
+                   snap(1, [proc("app", 0, 1, swapped=None), proc("zero", 0, 0, swapped=0),
+                            proc("bad", 0, 0, swapped=float("nan"))])]
+        windows = proc("paged", GiB, 1)
+        windows["paged_out_bytes"] = 8 * GiB
+        samples[1]["processes"].append(windows)
+        procs = summarize(samples)["runs"][0]["processes"]
+        by = {(p["host"], p["name"]): p for p in procs}
+        self.assertEqual(by[(None, "app")]["peak_vram_bytes"], 2 * GiB)  # swapped is not added in
+        self.assertEqual(by[(None, "app")]["peak_graphics_swapped_bytes"], 512 * MiB)  # 512 + a measured 0
+        self.assertIsNone(by[(None, "blank")]["peak_graphics_swapped_bytes"])  # null is not a 0
+        self.assertEqual(by[(None, "zero")]["peak_graphics_swapped_bytes"], 0)
+        self.assertIsNone(by[(None, "bad")]["peak_graphics_swapped_bytes"])  # bool and nan are not byte counts
+        self.assertIsNone(by[(None, "paged")]["peak_graphics_swapped_bytes"])  # Windows paged estimate is a different field
+        self.assertEqual(by[("windows", "host")]["peak_graphics_swapped_bytes"], 64 * MiB)  # host rows stay apart
+        self.assertEqual(procs[0]["name"], "app")  # its VRAM is the larger peak
+        text = to_text(summarize(samples))
+        self.assertIn("COMPRESSED", text)
+        self.assertRegex(text, r"app\s+2\.00 GB\s+512 MB\s+15\.0%")
+        self.assertRegex(text, r"zero\s+0 MB\s+0 MB")
+        self.assertRegex(text, r"blank\s+1\.00 GB\s+n/a")
+        self.assertIn("not added to peak VRAM", text)
+
+    def test_the_larger_memory_peak_ranks_a_process_and_the_peaks_stay_separate(self):
+        samples = [snap(0, [proc("vram", 2 * GiB, 1), proc("compressed", 0, 1, swapped=4 * GiB),
+                            proc("unknown", None, 90)])]
+        procs = summarize(samples)["runs"][0]["processes"]
+        self.assertEqual([p["name"] for p in procs], ["compressed", "vram", "unknown"])
+        self.assertEqual(procs[0]["peak_vram_bytes"], 0)  # the swapped peak does not replace it
+        self.assertEqual(procs[0]["peak_graphics_swapped_bytes"], 4 * GiB)
+        text = to_text(summarize(samples), top=1)
+        self.assertRegex(text, r"compressed\s+0 MB\s+4\.00 GB")
+        self.assertIn("2 more process(es)", text)
+        self.assertNotRegex(text, r"(?m)^vram\s")
 
     def test_process_vram_peaks_ignore_inferred_and_shared_resident_bytes(self):
         samples = [

@@ -2,7 +2,9 @@
 
 Like `diff`, this only reads a saved file and collects nothing. Readings are taken as recorded: a `null` is
 skipped (never counted as 0), a metric with no readings is left out, and values are never capped or adjusted.
-Per-process memory comes only from the measured `vram_bytes`, so nothing inferred is summed.
+Per-process VRAM comes only from the measured `vram_bytes`, so nothing inferred is summed. Recorded
+`graphics_swapped_bytes` (macOS footprint swapped) is a separate peak, never added to VRAM, and the list
+is ordered by whichever peak is larger.
 
 `record` appends, so one file can hold several recordings. A new run starts when the adapter or backend changes,
 when `taken` goes backwards, or when two samples are further apart than RUN_GAP_FACTOR times the file's
@@ -125,13 +127,21 @@ def _kind(run: list[dict], key: str) -> str:
     return next((k for k in (_dev(s, key) for s in run) if isinstance(k, str) and k), "")
 
 
+def _larger_peak(p: dict) -> float | None:
+    """Whichever measured peak is larger. A missing one is skipped, not taken as 0."""
+    peaks = [v for v in (p["peak_vram_bytes"], p["peak_graphics_swapped_bytes"]) if v is not None]
+    return max(peaks) if peaks else None
+
+
 def _processes(run: list[dict]) -> list[dict]:
-    """Per (host, name): the peak of the per-sample sum of measured VRAM, and the peak per-sample GPU%."""
+    """Per (host, name): peaks of measured VRAM and footprint swapped, and peak GPU%, ordered by the larger peak."""
     seen: dict[tuple, int] = {}
     vram: dict[tuple, list] = {}
+    swapped: dict[tuple, list] = {}
     busy: dict[tuple, list] = {}
     for s in run:
         v_sample: dict[tuple, float] = {}
+        c_sample: dict[tuple, float] = {}
         l_sample: dict[tuple, float] = {}
         keys = set()
         for p in s["processes"]:
@@ -141,18 +151,23 @@ def _processes(run: list[dict]) -> list[dict]:
             keys.add(key)
             if (v := _number(p.get("vram_bytes"))) is not None:
                 v_sample[key] = v_sample.get(key, 0) + v
+            if (c := _number(p.get("graphics_swapped_bytes"))) is not None:
+                c_sample[key] = c_sample.get(key, 0) + c
             if (g := _number(p.get("gpu_pct"))) is not None:
                 l_sample[key] = l_sample.get(key, 0) + g
         for key in keys:
             seen[key] = seen.get(key, 0) + 1
         for key, v in v_sample.items():
             vram.setdefault(key, []).append(v)
+        for key, c in c_sample.items():
+            swapped.setdefault(key, []).append(c)
         for key, g in l_sample.items():
             busy.setdefault(key, []).append(g)
     out = [{"name": name, "host": host, "samples_seen": n,
             "peak_vram_bytes": max(vram.get((host, name), ()), default=None),
+            "peak_graphics_swapped_bytes": max(swapped.get((host, name), ()), default=None),
             "peak_gpu_pct": max(busy.get((host, name), ()), default=None)} for (host, name), n in seen.items()]
-    out.sort(key=lambda p: (p["peak_vram_bytes"] is None, -(p["peak_vram_bytes"] or 0), -(p["peak_gpu_pct"] or 0)))
+    out.sort(key=lambda p: ((rank := _larger_peak(p)) is None, -(rank or 0), -(p["peak_gpu_pct"] or 0)))
     return out
 
 
@@ -228,12 +243,20 @@ def to_text(d: dict, top: int = TOP) -> str:
             out.append(r["memory_note"])
         procs = r["processes"][:top]
         if procs:
-            out += ["", f"{'TOP PROCESSES (same name summed)':<34}{'PEAK VRAM':>11}{'PEAK GPU':>10}{'SEEN':>11}"]
+            compressed = any(p["peak_graphics_swapped_bytes"] is not None for p in r["processes"])
+            head = f"{'TOP PROCESSES (same name summed)':<34}{'PEAK VRAM':>11}"
+            if compressed:
+                head += f"{'COMPRESSED':>11}"
+            out += ["", head + f"{'PEAK GPU':>10}{'SEEN':>11}"]
             for p in procs:
                 name = (f"{'W' if p['host'] == 'windows' else 'H'}:" if p["host"] else "") + p["name"]
-                out.append(f"{name[:33]:<34} {_fmt(p['peak_vram_bytes'], 'bytes'):>10}"
+                swapped = (f" {_fmt(p['peak_graphics_swapped_bytes'], 'bytes'):>10}" if compressed else "")
+                out.append(f"{name[:33]:<34} {_fmt(p['peak_vram_bytes'], 'bytes'):>10}{swapped}"
                            f" {_fmt(p['peak_gpu_pct'], 'pct'):>9} {p['samples_seen']:>5}/{r['samples']:<4}")
             if len(r["processes"]) > top:
                 out.append(f"{len(r['processes']) - top} more process(es); --json lists all.")
             out.append("Peak VRAM counts measured bytes only (vram_bytes); n/a means none were measured.")
+            if compressed:
+                out.append("Compressed counts recorded graphics_swapped_bytes only (footprint swapped) "
+                           "and is not added to peak VRAM.")
     return "\n".join(out)

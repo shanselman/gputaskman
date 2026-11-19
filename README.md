@@ -899,10 +899,12 @@ negative, or above-1000% Windows process-engine counter is instead unavailable (
 `engines` are `null`, with `engine_unavailable_reason`); device load derived from those counters is
 also unavailable for that adapter. A `null` is
 skipped, not counted as 0, and the `READINGS` column says how many samples had a value; a metric
-with no readings is left out. The top processes are ranked by peak VRAM, using only the measured
-`vram_bytes` (rows with the same name are added together within each sample; WSL host rows stay
-separate), with their peak GPU load. A process that never had measured bytes shows `n/a`. Lines that
-do not parse, such as a last line cut short, are skipped and counted.
+with no readings is left out. The top processes are ranked by the larger of peak VRAM and peak
+compressed graphics; the two are not added. VRAM uses only the measured `vram_bytes` (rows with the
+same name are added together within each sample; WSL host rows stay separate), then peak GPU load.
+A process with no measured peak shows `n/a`. When a recording includes `graphics_swapped_bytes`,
+those rows show that peak too (macOS footprint swapped). A run with no such readings leaves the
+column out. Lines that do not parse, such as a last line cut short, are skipped and counted.
 
 Because `record` appends, one file can hold several recordings, and `summary` reports each run on its own.
 A new run starts when the GPU or backend changes, when `taken` goes backwards (a clock change), or when

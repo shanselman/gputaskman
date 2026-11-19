@@ -32,7 +32,7 @@ def summary_main(argv: list[str]) -> None:
 
     ap = argparse.ArgumentParser(prog="gputaskman summary",
                                  description="Summarize a gputaskman record file: average and peak readings per run, "
-                                             "and the top processes by peak measured VRAM.")
+                                             "and the top processes by the larger of peak VRAM and compressed graphics.")
     ap.add_argument("file", help="JSON Lines file written by gputaskman record")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     args = ap.parse_args(argv)
