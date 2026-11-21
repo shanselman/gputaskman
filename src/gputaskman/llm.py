@@ -25,7 +25,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from .gguf import GgufInfo, is_gguf, read_gguf
-from .procinfo import SECRET_FLAGS, MappedModel, ProcDetail, file_key, make_model
+from .procinfo import SECRET_FLAGS, MappedModel, ProcDetail, file_key, make_model, target_path
 
 MiB = 1 << 20
 KV_TYPE_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 34 / 32, "q4_0": 18 / 32, "q4_1": 20 / 32,
@@ -645,17 +645,20 @@ def log_buffer_text(record: LoggedBuffer, process_start: float) -> str:
 _SIDE_KINDS = ("vision projector", "LoRA adapter")
 
 
-def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: ServerInfo | None) -> list[dict]:
+def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: ServerInfo | None,
+               pid: int | None = None) -> list[dict]:
     """Mark files a runtime API also reports; return the API entries that matched this process."""
     matched: list[dict] = []
-    if server and server.kind == "llama-server" and server.model_path:
-        key = file_key(server.model_path)
+    # llama-server reports -m as it was typed, so a relative path belongs to the server's cwd, not ours.
+    path = target_path(pid, server.model_path) if server and server.kind == "llama-server" and server.model_path \
+        else None
+    if path:
+        key = file_key(path)
         hit = next((f for f in files if file_key(f.path) == key), None)
         if hit:
             hit.add_source("api")
-        elif os.path.isfile(server.model_path):  # loaded without mmap or via the router: API-only evidence
-            files.insert(0, make_model(server.model_path, os.path.getsize(server.model_path), None,
-                                       is_gguf(server.model_path), "api"))
+        elif os.path.isfile(path):  # loaded without mmap or via the router: API-only evidence
+            files.insert(0, make_model(path, os.path.getsize(path), None, is_gguf(path), "api"))
     for front in (s for s in (server, host) if s and s.kind == "ollama"):
         for f in files:
             if not f.has_model_evidence:
@@ -700,7 +703,7 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
     elif d.foundry_local and not server:
         v.notes.append("Foundry Local daemon signature only; no unambiguous loaded-model API report is available.")
     files = [dataclasses.replace(m, sources=list(m.sources)) for m in d.models]  # cached details stay untouched
-    matched = _merge_api(files, server, host)
+    matched = _merge_api(files, server, host, d.pid)
     for m in files:
         if not m.has_model_evidence:
             v.other_files.append(m)
@@ -712,7 +715,8 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
         else:
             v.other_files.append(m)
 
-    log_path = log_path or v.flags.get("log_file")
+    if not log_path and v.flags.get("log_file"):
+        log_path = target_path(d.pid, v.flags["log_file"])  # --log-file is relative to the server's cwd
     if log_path:
         v.log = parse_load_log(log_path)
         v.log_source = log_path if v.log else None

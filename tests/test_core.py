@@ -1472,6 +1472,34 @@ class PathArgumentTests(unittest.TestCase):
         self.assertEqual(view.files[0].evidence, "reported (api)")
         self.assertEqual(detail.models[0].sources, ["path-arg"])
 
+    def test_relative_api_model_path_and_log_file_resolve_against_target_cwd(self):
+        with tempfile.TemporaryDirectory() as target, tempfile.TemporaryDirectory() as monitor:
+            (Path(target) / "model.gguf").write_bytes(b"GGUF" + bytes(20))
+            (Path(target) / "server.log").write_text("load_tensors: Vulkan0 model buffer size = 10 MiB\n",
+                                                     encoding="utf-8")
+            (Path(monitor) / "model.gguf").write_bytes(b"GGUF" + bytes(20))
+            detail = ProcDetail(123, "llama-server", cmdline=["llama-server", "--log-file", "server.log"])
+            server = ServerInfo("llama-server", "http://local", model_path="model.gguf")
+            model = gguf("qwen3", block_count=1, context_length=4096)
+            old = os.getcwd()
+            os.chdir(monitor)
+            try:
+                with patch("gputaskman.procinfo.psutil.Process") as process, \
+                        patch("gputaskman.llm.read_gguf", return_value=model):
+                    process.return_value.cwd.return_value = target
+                    view = build_view(detail, GiB, 0, server)
+                self.assertEqual([f.path for f in view.files], [str(Path(target) / "model.gguf")])
+                self.assertEqual(view.log_source, str(Path(target) / "server.log"))
+                # Unknown cwd: neither path is guessed from the monitor's own directory.
+                with patch("gputaskman.procinfo.psutil.Process") as process, \
+                        patch("gputaskman.llm.read_gguf", return_value=model):
+                    process.return_value.cwd.side_effect = PermissionError("protected")
+                    view = build_view(detail, GiB, 0, server)
+                self.assertEqual(view.files, [])
+                self.assertIsNone(view.log_source)
+            finally:
+                os.chdir(old)
+
     def test_mixed_files_keep_stronger_selection_and_estimates(self):
         strong = MappedModel("real.gguf", 1000, 0, True, ["cmdline"], kind="LLM")
         weak = MappedModel(str(self.path), GiB, None, True, ["path-arg"])
@@ -1666,7 +1694,7 @@ class IdentityTests(unittest.TestCase):
             "general.name": "Snapshot_Cfg", "attention.head_count": 4,
             "attention.head_count_kv": 2, "embedding_length": 16})
         with patch("gputaskman.procinfo.read_gguf", return_value=g):
-            m = make_model("OpenJev-Q4_K_M.gguf", 1000, 0, True, "mapped", "")
+            m = make_model(os.path.abspath("OpenJev-Q4_K_M.gguf"), 1000, 0, True, "mapped", "")
         d = ProcDetail(10, "llama-server.exe", models=[m])
         self.assertEqual(classify(d, {}), "decision?")
         self.assertIn("decision?", AI_KINDS)
@@ -2158,9 +2186,10 @@ class IdentityTests(unittest.TestCase):
 
     def test_decision_model_has_no_kv_cache_and_api_evidence(self):
         laya = gguf("modern-bert", **LAYA)
-        d = ProcDetail(5, "llama-server.exe", models=[MappedModel("laya.gguf", 1000, 0, True, kind="decision model")])
+        path = os.path.abspath("laya.gguf")  # mapped paths are absolute; a relative API path is tested elsewhere
+        d = ProcDetail(5, "llama-server.exe", models=[MappedModel(path, 1000, 0, True, kind="decision model")])
         self.assertEqual(classify(d, {}), "decision")
-        server = ServerInfo("llama-server", "http://127.0.0.1:1", n_ctx=8192, model_path="laya.gguf")
+        server = ServerInfo("llama-server", "http://127.0.0.1:1", n_ctx=8192, model_path=path)
         with patch("gputaskman.llm.read_gguf", return_value=laya):
             v = build_view(d, 1000, 0, server)
         self.assertEqual(v.files[0].evidence, "confirmed (api+mapped)")

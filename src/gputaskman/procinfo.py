@@ -244,6 +244,16 @@ def _process_cwd(pid: int | None) -> str:
     return cwd if cwd and os.path.isabs(cwd) else ""
 
 
+def target_path(pid: int | None, path: str) -> str | None:
+    """A path another process gave or reported, made absolute against that process's cwd.
+    None when it is relative and the cwd is unknown: the monitor's own cwd is never a fallback."""
+    if os.path.isabs(path):
+        return path
+    cwd = _process_cwd(pid)
+    joined = os.path.join(cwd, path) if cwd else ""
+    return joined if os.path.isabs(joined) else None
+
+
 def _models_from_cmdline(cmd: list[str], pid: int | None = None) -> list[str]:
     """Model paths given to known model flags. A relative path is resolved against the target's cwd
     (looked up once, only when needed), never the monitor's; it is skipped when that cwd is unknown."""
