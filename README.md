@@ -732,8 +732,14 @@ exception details are not printed. To validate a real TCC card, run `gputaskman 
 `nvidia-smi` under the same workload. Record the GPU, driver and workload. The same code path was run
 against a WDDM GPU (RTX 4080 SUPER, NVIDIA 630.20: adapter VRAM matched
 `nvidia-smi` to the MiB with and without a 1 GiB CUDA allocation, and every per-process number stayed
-`n/a`, as NVML documents for WDDM). It is **not validated on TCC hardware**, so per-process VRAM on a
-real TCC card is expected, not confirmed.
+`n/a`, as NVML documents for WDDM).
+
+Live check, reported by the contributor and not repeated by the maintainer: Windows, an NVIDIA
+P102-100 in TCC mode (driver 582.78, CUDA 13.0) beside two adapters Windows lists, gputaskman v0.4.2.
+The card appeared as GPU 2 (NVML index 1) with device telemetry. With `llama-server.exe` loaded,
+`nvidia-smi` and `--gpu 2 --once`, read at the same time, agreed on its per-process VRAM: 9652 MiB
+and 9.43 GB (GiB). Engine load, shared and paged memory were `n/a`, as expected.
+([#14](https://github.com/shanselman/gputaskman/issues/14))
 
 MCDM adapters use this same NVML path. Device pairing preserves the full PCI domain;
 JSON includes `adapter.pci_domain` for TCC/MCDM adapters even when telemetry is unavailable,
@@ -1443,7 +1449,7 @@ downloads are bundled in this repository.
 - Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
-- NVIDIA TCC-mode GPUs: validation on TCC hardware, then per-process load and model breakdowns, which
+- NVIDIA TCC-mode GPUs: per-process load and model breakdowns, which
   the Windows counters would supply for a WDDM GPU.
 - Intel `xe` device-wide telemetry and controlled-load/shared-buffer validation of its per-process
   counters; Intel validation beyond the Arc A770 / UHD 730 pair.

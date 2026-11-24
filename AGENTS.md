@@ -156,9 +156,8 @@ RTX 3060 Ti, macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run 
 bare-metal Linux with an amdgpu Radeon RX 9070-series card plus a Radeon 610M (DRM path), and
 bare-metal Linux on a laptop with an RTX 4050 Laptop GPU plus an AMD Phoenix iGPU (NVML and DRM side by side).
 Intel i915 (an Arc A770 with resizable BAR plus a UHD 730) was validated by a contributor, not repeated by
-the maintainer.
-Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, NVIDIA TCC-mode GPUs
-(run `gputaskman --list-gpus` and `gputaskman --once --gpu N`, then compare device and per-process VRAM
-with `nvidia-smi`; the code path was exercised against a WDDM GPU only), Intel `xe` and Arc cards
+the maintainer. So was an NVIDIA P102-100 in TCC mode on Windows (detection, telemetry, and per-process
+VRAM matching `nvidia-smi`).
+Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, Intel `xe` and Arc cards
 without resizable BAR, and GPU-backed WinML on Copilot+ PCs. Planned work is listed under **Next** in the
 README.
