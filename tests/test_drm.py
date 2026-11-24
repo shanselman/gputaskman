@@ -499,6 +499,56 @@ class ReadDeviceTests(unittest.TestCase):
                 d = drm.read_device(card, 0)
             self.assertEqual((d.temp, d.temp_kind), (55, "CPU package"))
 
+    def test_amd_cpu_die_temp_prefers_tdie_then_tctl_then_unlabelled_k10temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            k10 = root / "hwmon0"
+            k10.mkdir()
+            (k10 / "name").write_text("k10temp\n")
+            (k10 / "temp1_label").write_text("Tctl\n")
+            (k10 / "temp1_input").write_text("61000\n")
+            (k10 / "temp2_label").write_text("Tccd1\n")
+            (k10 / "temp2_input").write_text("70000\n")
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (61, "CPU Tctl"))
+
+            (k10 / "temp3_label").write_text("Tdie\n")
+            (k10 / "temp3_input").write_text("54000\n")
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (54, "CPU Tdie"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "hwmon0"
+            legacy.mkdir()
+            (legacy / "name").write_text("k10temp\n")
+            (legacy / "temp1_input").write_text("47000\n")  # pre-Zen GCN4/Polaris APUs expose no temp1_label
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (47, "CPU Tctl"))
+
+    def test_read_device_amd_igpu_falls_back_to_cpu_die_temp_only_without_gpu_sensor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp) / "card0" / "device"
+            hwmon = dev / "hwmon" / "hwmon2"
+            hwmon.mkdir(parents=True)
+            (hwmon / "power1_average").write_text("12000000\n")  # power exists, but no GPU temp*_input
+            igpu = drm.DrmCard(key=16, pdev="0000:65:00.0", sysfs=str(dev), driver="amdgpu",
+                               vendor_id=0x1002, device_id=0x1681, name="AMD Radeon 680M",
+                               vram_total=512 << 20, integrated=True, intel=False)
+            with patch.object(drm, "_amd_cpu_die_temp", return_value=(52, "CPU Tctl")):
+                d = drm.read_device(igpu, 0)
+            self.assertEqual((d.temp, d.temp_kind), (52, "CPU Tctl"))
+
+            # Discrete AMD GPUs never borrow CPU die temperature.
+            dgpu = drm.DrmCard(key=17, pdev="0000:03:00.0", sysfs=str(dev), driver="amdgpu",
+                               vendor_id=0x1002, device_id=0x744C, name="AMD Radeon RX 7900 XTX",
+                               vram_total=24 << 30, integrated=False, intel=False)
+            with patch.object(drm, "_amd_cpu_die_temp", return_value=(52, "CPU Tctl")):
+                self.assertEqual((drm.read_device(dgpu, 0).temp, drm.read_device(dgpu, 0).temp_kind), (None, ""))
+
+            # If the iGPU has its own temp sensor whose reading is torn, keep None instead of substituting CPU temp.
+            (hwmon / "temp1_label").write_text("edge\n")
+            (hwmon / "temp1_input").write_text("unreadable\n")
+            with patch.object(drm, "_amd_cpu_die_temp", return_value=(52, "CPU Tctl")):
+                self.assertIsNone(drm.read_device(igpu, 0).temp)
+
     def test_read_device_intel_clock_and_throttle(self):
         with tempfile.TemporaryDirectory() as tmp:
             card_sysfs = Path(tmp) / "card1"
