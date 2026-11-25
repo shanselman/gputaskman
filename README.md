@@ -239,7 +239,10 @@ GTT is GPU-accessible system RAM, so it fills the Shared column (and `shared (in
 the device), like WDDM's non-local usage. On an APU (an integrated GPU, detected by amdgpu not
 reporting a VRAM vendor, a heuristic validated on one APU) GTT is the GPU's normal memory and "VRAM"
 is only a RAM carve-out, so GTT is still shown but never flagged as spill, and an LLM's memory is its
-VRAM plus GTT. The SDMA engine (`dma`) fills the COPY column. Paged stays blank: there is no commit
+VRAM plus GTT. The experimental AMD CPU-temperature fallback uses the same heuristic, which does not
+prove that a CPU sensor belongs to the GPU: it can show an unrelated CPU reading. It has not been
+validated on AMD APU hardware and must not be relied on as a GPU temperature.
+The SDMA engine (`dma`) fills the COPY column. Paged stays blank: there is no commit
 counter. VRAM and Shared are charged to a process only when nothing else can hold its bytes: each of
 its DRM clients has a usable `drm-client-id` and exactly one visible holder, was opened through a
 render node (`/dev/dri/renderD*`), and reports zero bytes in every `drm-shared-*` region.
@@ -295,7 +298,7 @@ covered by unit tests only and **not yet validated on AMD hardware**.
 
 | | Source |
 |---|---|
-| Device temperature, power, GT clock, throttle, load and video | `hwmon`, `gt/gt0`, the i915 performance counters and RAPL's uncore zone. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first: the hwmon counter on a discrete card, the uncore RAPL zone on an integrated GPU (root-only). Without a GPU temperature sensor, an integrated GPU falls back to the CPU package sensor (`coretemp`), labelled as shared with the CPU. The GT clock is the actual frequency (`rps_act_freq_mhz`, the requested one as fallback); throttle reasons come from `throttle_reason_*`. GPU % is the busiest engine's busy share from the performance counters and video is the video engine's share (unified decode+encode, so `enc`/`dec` stay unset); both need root (`perf_event_paranoid=2` here blocks normal users), otherwise `N/A` with a reason |
+| Device temperature, power, GT clock, throttle, load and video | `hwmon`, `gt/gt0`, the i915 performance counters and RAPL's uncore zone. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first: the hwmon counter on a discrete card, the uncore RAPL zone on an integrated GPU (root-only). When GPU temperature is unavailable, an integrated GPU falls back to the CPU package sensor (`coretemp`), labelled as shared with the CPU. The GT clock is the actual frequency (`rps_act_freq_mhz`, the requested one as fallback); throttle reasons come from `throttle_reason_*`. GPU % is the busiest engine's busy share from the performance counters and video is the video engine's share (unified decode+encode, so `enc`/`dec` stay unset); both need root (`perf_event_paranoid=2` here blocks normal users), otherwise `N/A` with a reason |
 | Device VRAM total | The size of the local-memory PCI window (`resource2`), an **estimate**: kernel-owned memory is missing from the sysfs view, resizable BAR rounds to a power of two, and a partial window can be smaller than the card, so the total can differ from the card's memory. A window under 1 GiB (an integrated GPU, or a discrete card without resizable BAR) shows `N/A` (`null` in JSON). Free memory is never shown for Intel |
 | Device VRAM used | The sum of its clients' resident memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice, and kernel-owned memory and processes gputaskman can't inspect are missing. Local memory on a discrete card, system memory on an integrated GPU. The UI, `--once`, `--json` (`memory_note`) and `gputaskman diff` all say so. `n/a` when any client's memory is unknown |
 | Integrated or discrete | An iGPU has no `local0`, so a card with a local-memory window of 1 GiB or more is discrete, and so is any card whose fdinfo reports local memory, even when its window is smaller |

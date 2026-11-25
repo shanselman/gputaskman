@@ -499,29 +499,60 @@ class ReadDeviceTests(unittest.TestCase):
                 d = drm.read_device(card, 0)
             self.assertEqual((d.temp, d.temp_kind), (55, "CPU package"))
 
-    def test_amd_cpu_die_temp_prefers_tdie_then_tctl_then_unlabelled_k10temp(self):
+    def test_amd_cpu_die_temp_prefers_labelled_tdie_then_tctl(self):
+        for driver in ("k10temp", "zenpower", "zenpower3"):
+            with self.subTest(driver=driver), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cpu = root / "hwmon0"
+                cpu.mkdir()
+                (cpu / "name").write_text(f"{driver}\n")
+                (cpu / "temp1_label").write_text("Tctl\n")
+                (cpu / "temp1_input").write_text("61000\n")
+                (cpu / "temp2_label").write_text("Tccd1\n")
+                (cpu / "temp2_input").write_text("70000\n")
+                self.assertEqual(drm._amd_cpu_die_temp(str(root)), (61, "CPU Tctl"))
+
+                (cpu / "temp3_label").write_text("Tdie\n")
+                (cpu / "temp3_input").write_text("54000\n")
+                self.assertEqual(drm._amd_cpu_die_temp(str(root)), (54, "CPU Tdie"))
+
+                (cpu / "temp3_input").write_text("unreadable\n")
+                (cpu / "temp1_input").write_text("0\n")
+                self.assertEqual(drm._amd_cpu_die_temp(str(root)), (0, "CPU Tctl"))
+
+    def test_amd_cpu_die_temp_rejects_unlabelled_and_ccd_readings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             k10 = root / "hwmon0"
             k10.mkdir()
             (k10 / "name").write_text("k10temp\n")
-            (k10 / "temp1_label").write_text("Tctl\n")
-            (k10 / "temp1_input").write_text("61000\n")
+            (k10 / "temp1_input").write_text("47000\n")
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (None, ""))
             (k10 / "temp2_label").write_text("Tccd1\n")
             (k10 / "temp2_input").write_text("70000\n")
-            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (61, "CPU Tctl"))
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (None, ""))
 
-            (k10 / "temp3_label").write_text("Tdie\n")
-            (k10 / "temp3_input").write_text("54000\n")
-            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (54, "CPU Tdie"))
-
+    def test_amd_cpu_die_temp_requires_one_identifiable_cpu_hwmon(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            legacy = root / "hwmon0"
-            legacy.mkdir()
-            (legacy / "name").write_text("k10temp\n")
-            (legacy / "temp1_input").write_text("47000\n")  # pre-Zen GCN4/Polaris APUs expose no temp1_label
-            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (47, "CPU Tctl"))
+            first = root / "hwmon2"
+            first.mkdir()
+            (first / "name").write_text("k10temp\n")
+            (first / "temp1_label").write_text("Tctl\n")
+            (first / "temp1_input").write_text("61000\n")
+            second = root / "hwmon10"
+            second.mkdir()
+            (second / "name").write_text("zenpower\n")
+            (second / "temp1_label").write_text("Tdie\n")
+            (second / "temp1_input").write_text("54000\n")
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (None, ""))
+
+            (second / "temp1_input").unlink()
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (None, ""))
+            (second / "name").write_text("nvme\n")
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (61, "CPU Tctl"))
+            (second / "name").unlink()
+            self.assertEqual(drm._amd_cpu_die_temp(str(root)), (None, ""))
 
     def test_read_device_amd_igpu_falls_back_to_cpu_die_temp_only_without_gpu_sensor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -630,6 +661,19 @@ class ReadDeviceTests(unittest.TestCase):
             with patch.object(drm, "_cpu_package_temp", return_value=55):
                 d = drm.read_device(card, 0)
             self.assertEqual((d.temp, d.temp_kind), (61, ""))
+
+    def test_read_device_intel_unreadable_gpu_sensor_keeps_cpu_package_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp) / "card1" / "device"
+            hwmon = dev / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            (hwmon / "temp1_input").write_text("unreadable\n")
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (55, "CPU package"))
 
     def test_read_device_intel_reports_pmu_and_rapl(self):
         with tempfile.TemporaryDirectory() as tmp:
