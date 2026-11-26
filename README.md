@@ -933,7 +933,9 @@ negative, or above-1000% Windows process-engine counter is instead unavailable (
 `engines` are `null`, with `engine_unavailable_reason`); device load derived from those counters is
 also unavailable for that adapter. A `null` is
 skipped, not counted as 0, and the `READINGS` column says how many samples had a value; a metric
-with no readings is left out. The top processes are ranked by the larger of peak VRAM and peak
+with no readings is left out. When VRAM used has a peak, the text and `peak_at` in `--json` give the
+recorded `taken` of the earliest sample at that peak. The time is not part of the byte count. The top
+processes are ranked by the larger of peak VRAM and peak
 compressed graphics; the two are not added. VRAM uses only the measured `vram_bytes` (rows with the
 same name are added together within each sample; WSL host rows stay separate), then peak GPU load.
 A process with no measured peak shows `n/a`. When a recording includes `graphics_swapped_bytes`,

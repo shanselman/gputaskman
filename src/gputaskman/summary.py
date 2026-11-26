@@ -35,6 +35,7 @@ METRICS = (
     ("system_ram_used", "system RAM used", "bytes", lambda s: _sys(s, "ram", "used")),
     ("system_cpu", "system CPU", "pct", lambda s: _sys(s, "cpu", "pct")),
 )
+_VRAM_USED = next(reader for key, _label, _kind, reader in METRICS if key == "vram_used")
 
 
 def _number(v) -> float | None:
@@ -122,6 +123,19 @@ def _stats(values: list) -> dict | None:
     return {"avg": sum(vs) / len(vs), "peak": max(vs), "readings": len(vs)}
 
 
+def _vram_peak_at(run: list[dict]) -> float | None:
+    """Recorded ``taken`` of the earliest sample at the peak ``vram_used``, or None."""
+    best = None
+    at = None
+    for s in run:
+        value = _number(_VRAM_USED(s))
+        if value is None or (best is not None and value <= best):
+            continue
+        best = value
+        at = _number(s.get("taken"))
+    return at
+
+
 def _kind(run: list[dict], key: str) -> str:
     """Where a fallback temperature or power reading comes from (for example "CPU package"), if any sample says."""
     return next((k for k in (_dev(s, key) for s in run) if isinstance(k, str) and k), "")
@@ -177,6 +191,8 @@ def summarize_run(run: list[dict]) -> dict:
         st = _stats([read(s) for s in run])
         if st:
             metrics[key] = {"label": label, "unit": kind, **st}
+    if "vram_used" in metrics and (at := _vram_peak_at(run)) is not None:
+        metrics["vram_used"]["peak_at"] = at
     if "temperature" in metrics and (k := _kind(run, "temp_kind")):
         metrics["temperature"]["source"] = k
     if "power" in metrics and (k := _kind(run, "power_kind")):
@@ -239,6 +255,9 @@ def to_text(d: dict, top: int = TOP) -> str:
                 # A space before each column keeps an oversized value (shown as recorded) from fusing with its neighbour.
                 out.append(f"{label[:23]:<24} {_fmt(m['avg'], m['unit']):>10} {_fmt(m['peak'], m['unit']):>10}"
                            f" {m['readings']:>5}/{r['samples']:<4}")
+            vram = r["metrics"].get("vram_used")
+            if vram and (at := vram.get("peak_at")) is not None:
+                out.append(f"VRAM used peaked at {_when(at)} ({at:.3f} unix).")
         if r["memory_note"]:
             out.append(r["memory_note"])
         procs = r["processes"][:top]
