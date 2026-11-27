@@ -79,6 +79,15 @@ During desktop/browser activity, WDDM reported per-process VRAM and AMD ADL repo
 clocks, and ASIC power; temperature, memory activity, and PCIe readings were unavailable. Vulkan/ROCm
 workloads were not tested on this machine.
 
+Windows 10 live check, reported by a contributor and not repeated by the maintainer: Windows 10 Pro 22H2
+(build 19045, Korean display language), GeForce RTX 2080 SUPER (Turing, WDDM), NVIDIA driver 610.74,
+gputaskman 0.4.5 from PyPI. Every process row used `Local Usage` / `Non Local Usage`; no fallback counter
+was selected. A D3D12 test process holding four committed 256 MiB default-heap buffers appeared as a new
+1.01 GB row; `diff` reported dedicated +1.02 GB and attributed +1.03 GB, `nvidia-smi` rose by 1036 MiB, and
+both returned to baseline after the process exited. `nvidia-smi` listed every process's memory as `[N/A]`.
+In the same session, DWM's `Dedicated Usage` read 1.34 GiB against 275 MiB of `Local Usage`.
+The interactive TUI was not exercised.
+
 Intel and Qualcomm adapters on Windows can use WDDM's per-process memory and engine counters. When those
 counters are available, device GPU activity is the busiest WDDM engine after combining its process counters.
 An Intel or Qualcomm adapter reporting at most 512 MiB of dedicated memory and more shared system memory is

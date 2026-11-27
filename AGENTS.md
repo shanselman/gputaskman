@@ -157,7 +157,8 @@ bare-metal Linux with an amdgpu Radeon RX 9070-series card plus a Radeon 610M (D
 bare-metal Linux on a laptop with an RTX 4050 Laptop GPU plus an AMD Phoenix iGPU (NVML and DRM side by side).
 Intel i915 (an Arc A770 with resizable BAR plus a UHD 730) was validated by a contributor, not repeated by
 the maintainer. So was an NVIDIA P102-100 in TCC mode on Windows (detection, telemetry, and per-process
-VRAM matching `nvidia-smi`).
+VRAM matching `nvidia-smi`), and Windows 10 22H2 with an RTX 2080 SUPER (WDDM; a fixed 1 GiB D3D12
+allocation moved the adapter counter, `nvidia-smi`, and its own process row by that amount).
 Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, Intel `xe` and Arc cards
 without resizable BAR, and GPU-backed WinML on Copilot+ PCs. Planned work is listed under **Next** in the
 README.
