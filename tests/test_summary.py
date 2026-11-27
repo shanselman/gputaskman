@@ -36,11 +36,39 @@ class SummaryTests(unittest.TestCase):
                    snap(2, used=3 * GiB, device=None)]
         m = summarize(samples)["runs"][0]["metrics"]
         self.assertEqual(m["vram_used"], {"label": "VRAM used", "unit": "bytes", "avg": 2 * GiB, "peak": 3 * GiB,
-                                          "readings": 2})
+                                          "readings": 2, "peak_at": 2})
         self.assertEqual(m["gpu_load"]["peak"], 122.3)  # never capped
         self.assertNotIn("temperature", m)  # no readings: left out, not shown as 0
         self.assertNotIn("shared_used", m)
         self.assertNotIn("system_cpu", m)
+        self.assertNotIn("peak_at", m["gpu_load"])
+
+    def test_vram_peak_time_is_the_earliest_sample_and_stays_out_of_the_bytes(self):
+        samples = [snap(10, used=GiB, device={"util_gpu": 99}),
+                   snap(20, used=None),
+                   snap(30, used=GiB),
+                   snap(40, used=0)]
+        samples[1]["shared_used"] = 9 * GiB
+        samples[1]["processes"] = [proc("big", 9 * GiB, 1)]
+        metric = summarize(samples)["runs"][0]["metrics"]["vram_used"]
+        self.assertEqual(metric["peak"], GiB)
+        self.assertEqual(metric["peak_at"], 10)
+        self.assertIn("10.000 unix", to_text(summarize(samples)))
+        self.assertNotIn("peak_at", summarize(samples)["runs"][0]["metrics"]["gpu_load"])
+
+    def test_a_recorded_vram_zero_still_has_a_peak_time(self):
+        metric = summarize([snap(5, used=None), snap(8, used=0)])["runs"][0]["metrics"]["vram_used"]
+        self.assertEqual((metric["peak"], metric["peak_at"]), (0, 8))
+
+    def test_no_vram_reading_omits_the_peak_time(self):
+        run = summarize([snap(1, used=None), snap(2, used=float("nan"))])["runs"][0]
+        self.assertNotIn("vram_used", run["metrics"])
+        self.assertNotIn("peaked at", to_text(summarize([snap(1, used=None)])))
+
+    def test_each_run_keeps_its_own_vram_peak_time(self):
+        samples = [snap(0, used=GiB), snap(1, used=2 * GiB), snap(500, used=4 * GiB), snap(501, used=GiB)]
+        runs = summarize(samples)["runs"]
+        self.assertEqual([r["metrics"]["vram_used"]["peak_at"] for r in runs], [1, 500])
 
     def test_system_section_is_used_when_present(self):
         sys_ok = {"cpu": {"pct": 10.0}, "ram": {"used": 8 * GiB}}
