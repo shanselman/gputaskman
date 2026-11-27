@@ -422,6 +422,15 @@ def _hwmon_temp(hwmon: str, *, intel: bool = False) -> int | None:
     return _milli(os.path.join(hwmon, "temp1_input"))
 
 
+def _has_temp_sensor(hwmon: str) -> bool:
+    if not hwmon:
+        return False
+    try:
+        return any(n.startswith("temp") and n.endswith("_input") for n in os.listdir(hwmon))
+    except OSError:
+        return False
+
+
 def _cpu_package_temp(hwmon_root: str = "/sys/class/hwmon") -> int | None:
     """The CPU package temperature from coretemp, for an integrated GPU with no sensor of its own.
 
@@ -452,6 +461,50 @@ def _cpu_package_temp(hwmon_root: str = "/sys/class/hwmon") -> int | None:
                 if label is not None and label.startswith("Package id") and fallback is None:
                     fallback = value
     return fallback
+
+
+def _amd_cpu_die_temp(hwmon_root: str = "/sys/class/hwmon") -> tuple[int | None, str]:
+    """Read a labelled CPU temperature from a single k10temp/zenpower hwmon.
+
+    Requires exactly one CPU hwmon and prefers labelled Tdie over Tctl. Pre-Zen k10temp readings
+    are unlabelled and use a non-physical scale; per-CCD readings are not substitutes.
+    """
+    try:
+        names = os.listdir(hwmon_root)
+    except OSError:
+        return None, ""
+    hwmons = []
+    for name in names:
+        path = os.path.join(hwmon_root, name)
+        driver = _read(os.path.join(path, "name"))
+        if not driver:
+            return None, ""
+        if driver in ("k10temp", "zenpower", "zenpower3"):
+            hwmons.append(path)
+    if len(hwmons) != 1:
+        return None, ""
+    path = hwmons[0]
+    try:
+        names = sorted(os.listdir(path))
+    except OSError:
+        return None, ""
+    tctl: int | None = None
+    for name in names:
+        if not name.startswith("temp") or not name.endswith("_label"):
+            continue
+        label = _read(os.path.join(path, name))
+        if label not in ("Tdie", "Tctl"):
+            continue
+        value = _milli(os.path.join(path, f"{name[:-len('_label')]}_input"))
+        if value is None:
+            continue
+        if label == "Tdie":
+            return value, "CPU Tdie"
+        if tctl is None:
+            tctl = value
+    if tctl is not None:
+        return tctl, "CPU Tctl"
+    return None, ""
 
 
 def _hwmon_clock(hwmon: str, label: str) -> int | None:
@@ -598,13 +651,19 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
                 pass
         dev.pcie_width = _int(os.path.join(d, "current_link_width"))
     if card.intel and card.integrated and dev.temp is None:
-        # No GPU temperature sensor (an integrated GPU has no hwmon of its own): the CPU package shares
-        # the die, so its temperature stands in, labelled as such (temp_kind), never presented as the
-        # GPU's own reading. A discrete card keeps N/A: the package is not its temperature.
+        # If the GPU temperature is unavailable, the CPU package shares the die, so its temperature
+        # stands in, labelled as such (temp_kind), never presented as the GPU's own reading.
+        # A discrete card keeps N/A: the package is not its temperature.
         package = _cpu_package_temp()
         if package is not None:
             dev.temp = package
             dev.temp_kind = "CPU package"
+    elif not card.intel and card.integrated and dev.temp is None and not _has_temp_sensor(hwmon):
+        # An AMD iGPU whose own sensor exists but gave a torn reading stays unknown.
+        die_temp, die_kind = _amd_cpu_die_temp()
+        if die_temp is not None:
+            dev.temp = die_temp
+            dev.temp_kind = die_kind
     return dev
 
 
